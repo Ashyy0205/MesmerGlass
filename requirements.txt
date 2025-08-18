@@ -1,0 +1,6 @@
+pyqt6
+opencv-python
+pygame
+websockets
+numpy
+

@@ -1,0 +1,27 @@
+﻿# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.dll
+
+# Environments
+.venv/
+venv/
+env/
+ENV/
+
+# Editors/OS
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Packaging / build
+dist/
+build/
+*.egg-info/
+*.log
+
+# Jupyter
+.ipynb_checkpoints/
