@@ -548,16 +548,50 @@ class Launcher(QMainWindow):
             self.list_displays.item(0).setCheckState(Qt.CheckState.Checked)
             checked_idx = [0]
 
+        # Use a shared start time for all overlays to synchronize flashing
+        shared_start_time = time.time()
+
         for i in checked_idx:
             sc = screens[i] if i < len(screens) else screens[0]
             ov = OverlayWindow(sc, self.primary_path or None, self.secondary_path or None,
                                self.primary_op, self.secondary_op, self.text, self.text_color, self.font,
                                self.text_scale_pct, self.flash_interval_ms, self.flash_width_ms,
                                self.fx_mode, self.fx_intensity)
-            self._wire_flash_timer(ov); self.overlays.append(ov)
+            # Override the individual start_time with shared one for synchronization
+            ov.start_time = shared_start_time
+            self.overlays.append(ov)
+
+        # Create a single synchronized flash timer for all overlays
+        if self.overlays and self.enable_device_sync and self.enable_buzz_on_flash:
+            self._wire_shared_flash_timer(shared_start_time)
 
         if self.enable_device_sync and self.enable_bursts:
             self._start_burst_scheduler()
+
+    def _wire_shared_flash_timer(self, shared_start_time: float):
+        """Create a single synchronized flash timer for all overlays to prevent double-speed flashing."""
+        self._shared_flash_timer = QTimer(self)
+        self._prev_flash_show = False
+        
+        def on_shared_tick():
+            if not self.overlays:
+                return
+                
+            # Use the first overlay's settings for timing (they should all be the same)
+            first_overlay = self.overlays[0]
+            now_ms = int((time.time() - shared_start_time) * 1000.0)
+            show = (now_ms % first_overlay.flash_interval_ms) < first_overlay.flash_width_ms
+            
+            # Only trigger device pulse on flash transition (not continuously)
+            if self.enable_device_sync and self.enable_buzz_on_flash and show and not self._prev_flash_show:
+                ms = first_overlay.flash_width_ms
+                lvl = float(clamp(self.buzz_intensity, 0.0, 1.0))
+                self.pulse.pulse(lvl, ms)
+            
+            self._prev_flash_show = show
+        
+        self._shared_flash_timer.timeout.connect(on_shared_tick)
+        self._shared_flash_timer.start(15)  # 15ms interval for smooth detection
 
     def _wire_flash_timer(self, ov: OverlayWindow):
         ov._prev_show = False
@@ -591,11 +625,26 @@ class Launcher(QMainWindow):
     def stop_all(self):
         if not self.running: return
         self.running = False; self._refresh_status()
+        
+        # Stop shared flash timer
+        if hasattr(self, "_shared_flash_timer") and self._shared_flash_timer:
+            self._shared_flash_timer.stop()
+            self._shared_flash_timer = None
+            
+        # Stop burst timer
+        if hasattr(self, "_burst_timer") and self._burst_timer:
+            self._burst_timer.stop()
+            self._burst_timer = None
+            
         for ov in self.overlays:
             try:
                 if hasattr(ov, "_flash_sync_timer"): ov._flash_sync_timer.stop()
                 ov.close()
             except Exception: pass
+            
+        # Stop audio and pulse engines
+        self.audio.stop()
+        self.pulse.stop()
                 
     def toggle_dev_mode(self):
         """Toggle development mode with virtual toy support."""
