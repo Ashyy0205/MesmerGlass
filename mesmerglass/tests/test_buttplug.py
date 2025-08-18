@@ -191,4 +191,3 @@ async def test_device_scanning():
     await toy.disconnect()
     server.stop()
     await asyncio.sleep(0.1)  # Allow cleanup to complete
-    listen_task.cancel()

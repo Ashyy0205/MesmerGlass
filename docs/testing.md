@@ -15,13 +15,22 @@ python -m pytest -v
 
 # Run with coverage
 python -m pytest --cov=mesmerglass
+
+# Run tests in parallel (faster)
+python -m pytest -n auto
+
+# Stop on first failure
+python -m pytest -x
+
+# Show brief output
+python -m pytest -q
 ```
 
 ### Specific Tests
 ```powershell
 # Test categories
 python -m pytest mesmerglass/tests/test_buttplug.py
-python -m pytest mesmerglass/tests/test_device_scan.py
+python -m pytest mesmerglass/tests/test_ui.py
 
 # Single test function
 python -m pytest mesmerglass/tests/test_buttplug.py::test_server_startup
@@ -29,7 +38,7 @@ python -m pytest mesmerglass/tests/test_buttplug.py::test_server_startup
 
 ## Test Categories
 
-### 1. Core Server Tests
+### 1. Core Server Tests (`test_buttplug.py`)
 - Server startup/shutdown
 - Device detection
 - Command handling
@@ -48,6 +57,54 @@ python -m pytest mesmerglass/tests/test_buttplug.py::test_server_startup
 - Error handling
 
 ### 4. Virtual Device Tests
+- Connection
+- Command handling
+- State synchronization
+- Error recovery
+
+### 5. UI Tests (`test_ui.py`)
+- Media Controls
+  - Video file selection
+  - Opacity controls
+  - Display settings
+- Text Effects
+  - Text input
+  - Font selection
+  - Effect modes
+  - Effect intensity
+- Audio Controls
+  - Audio file selection
+  - Volume controls
+  - Playback state
+- Launch/Display
+  - Overlay window creation
+  - Display selection
+  - Window management
+- Dev Tools
+  - Virtual toy creation
+  - Virtual toy removal
+  - Intensity control
+  - Multiple toy handling
+
+## Writing Tests
+
+### UI Test Guidelines
+1. Use `QTest.qWait()` after UI operations to ensure state updates
+2. Clean up windows and overlays properly
+3. Use proper widget hierarchy for finding controls
+4. Handle async operations with pytest-asyncio
+
+### Virtual Device Test Guidelines
+1. Clean up connections and servers
+2. Use appropriate timeouts for operations
+3. Handle async device discovery properly
+4. Verify device state after commands
+
+### Common Issues
+1. **Window Cleanup**: Always ensure windows are properly closed and deleted
+2. **Async Operations**: Use proper await/async patterns
+3. **Widget Finding**: Navigate widget hierarchy correctly
+4. **Test Independence**: Each test should work in isolation
 - Connection handling
 - Command processing
 - State management
