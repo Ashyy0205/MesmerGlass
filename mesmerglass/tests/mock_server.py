@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import threading
 import websockets
 from typing import Optional, Dict
 
@@ -14,26 +15,41 @@ class MockServer:
         self._devices: Dict[int, Dict] = {}
         self._stop = False
         
-    async def start(self):
+    def start(self):
         """Start the WebSocket server."""
-        print(f"[mock] Starting server on port {self.port}")
-        async with websockets.serve(self._handle_client, "127.0.0.1", self.port):
-            # Add a mock device
-            self._devices[0] = {
-                "DeviceIndex": 0,
-                "DeviceName": "Test Vibrator",
-                "DeviceMessages": {
-                    "ScalarCmd": [
-                        {"StepCount": 100, "ActuatorType": "Vibrate", "Features": [{"Index": 0, "StepCount": 100}]}
-                    ],
-                    "StopDeviceCmd": {}
+        # Run the async server in a new thread
+        self._thread = threading.Thread(target=self._run_server, daemon=True)
+        self._thread.start()
+        
+    def _run_server(self):
+        """Run the WebSocket server in a separate thread."""
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        async def run_server():
+            print(f"[mock] Starting server on port {self.port}")
+            async with websockets.serve(self._handle_client, "127.0.0.1", self.port):
+                # Add a mock device
+                self._devices[0] = {
+                    "DeviceIndex": 0,
+                    "DeviceName": "Test Vibrator",
+                    "DeviceMessages": {
+                        "ScalarCmd": [
+                            {"StepCount": 100, "ActuatorType": "Vibrate", "Features": [{"Index": 0, "StepCount": 100}]}
+                        ],
+                        "StopDeviceCmd": {}
+                    }
                 }
-            }
-            print("[mock] Ready with Test Vibrator device")
-            
-            # Keep running until stopped
-            while not self._stop:
-                await asyncio.sleep(1)
+                print("[mock] Ready with Test Vibrator device")
+                
+                # Keep running until stopped
+                while not self._stop:
+                    await asyncio.sleep(1)
+                    
+        try:
+            loop.run_until_complete(run_server())
+        finally:
+            loop.close()
                 
     async def _handle_client(self, websocket):
         """Handle client connection."""
@@ -100,6 +116,11 @@ class MockServer:
         """Generate the next message ID."""
         self._msg_id += 1
         return self._msg_id
+        
+    def stop(self):
+        """Stop the server."""
+        self._stop = True
+        print("[mock] Stopping server...")
 
 async def main():
     """Run the mock server."""

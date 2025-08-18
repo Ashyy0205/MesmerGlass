@@ -10,7 +10,33 @@ QSS = r"""
 }
 QWidget     { background: #0B0F14; }
 QMainWindow { background: #0B0F14; }
-QScrollArea { background: transparent; border: none; }
+QScrollArea { 
+    background: transparent; 
+    border: none; 
+}
+QScrollArea > QWidget > QWidget { 
+    background: transparent; 
+}
+QScrollBar:vertical {
+    border: none;
+    background: rgba(255, 255, 255, 0.05);
+    width: 10px;
+    margin: 0;
+    border-radius: 5px;
+}
+QScrollBar::handle:vertical {
+    background: rgba(255, 255, 255, 0.2);
+    min-height: 20px;
+    border-radius: 5px;
+}
+QScrollBar::handle:vertical:hover {
+    background: rgba(255, 255, 255, 0.3);
+}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+    border: none;
+    background: none;
+    height: 0;
+}
 
 /* No native focus glow */
 *:focus { outline: 0; }
@@ -27,6 +53,10 @@ QGroupBox {
   border-radius: 14px;
   margin-top: 14px;
   padding: 12px 12px 14px 12px;
+}
+QGroupBox:hover {
+  background: rgba(20, 26, 34, 0.72);
+  border: 1px solid rgba(255,255,255,0.12);
 }
 QGroupBox::title {
   subcontrol-origin: margin;
@@ -105,19 +135,32 @@ QCheckBox::indicator:checked {
   background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #FF8A00, stop:1 #FFD36B);
 }
 
-/* -------- Sidebar (nav) -------- */
-#Nav {
-  min-width: 200px; max-width: 200px;
+/* -------- Tabs -------- */
+QTabWidget::pane {
   border: 1px solid rgba(255,255,255,0.06);
   border-radius: 12px;
   background: rgba(13, 18, 26, 0.6);
-  padding: 4px;
+  padding: 8px;
 }
-QListWidget#Nav::item {
-  padding: 10px 10px;
+
+QTabWidget::tab-bar {
+  alignment: left;
+  left: 12px;
+}
+
+QTabBar::tab {
+  padding: 8px 16px;
+  margin-right: 4px;
   border-radius: 8px;
+  background: rgba(255,255,255,0.08);
+  border: 1px solid transparent;
 }
-QListWidget#Nav::item:selected {
+
+QTabBar::tab:hover {
+  background: rgba(255,255,255,0.12);
+}
+
+QTabBar::tab:selected {
   background: rgba(255,168,76,0.18);
   color: #FFE6C7;
   border: 1px solid rgba(255,168,76,0.35);

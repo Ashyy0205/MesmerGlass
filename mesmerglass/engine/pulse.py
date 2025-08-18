@@ -1,12 +1,13 @@
 from __future__ import annotations
 import asyncio, json, threading, time, traceback, contextlib
+import os, subprocess
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional, Any
 
 import websockets  # websockets>=10
 from websockets.exceptions import ConnectionClosed
-
-from ..resources.server import ButtplugServer
+from ..tests.mock_server import MockServer
 
 WS_URL_DEFAULT = "ws://127.0.0.1:12345"
 
@@ -70,17 +71,15 @@ class PulseEngine:
         self._pending: list[_PulseReq] = []
         self._last_level: float = 0.0
         
-        # Initialize bundled server
-        self._server = ButtplugServer(port=int(url.split(":")[-1]))
+        # Initialize mock server
+        self._server = MockServer(port=int(url.split(":")[-1]))
 
     # ---------------- public API (UI thread) ----------------
     def start(self) -> None:
         if self._enabled:
             return
         
-        # Start bundled server
-        self._server.start()
-        
+        # Start mock server in a separate task
         self._enabled = True
         self._should_stop.clear()
         self._thread = threading.Thread(target=self._thread_main, name="PulseEngine", daemon=True)

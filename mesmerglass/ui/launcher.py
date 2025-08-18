@@ -5,8 +5,8 @@ from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QColor, QFont, QGuiApplication, QShortcut, QKeySequence
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QListWidget, QListWidgetItem, QSlider, QFileDialog, QStackedWidget,
-    QGroupBox, QScrollArea, QFrame
+    QSlider, QFileDialog, QTabWidget, QGroupBox, QScrollArea, QFrame,
+    QListWidget, QListWidgetItem
 )
 
 from ..engine.audio import Audio2
@@ -68,39 +68,42 @@ class Launcher(QMainWindow):
         root = QWidget(); self.setCentralWidget(root)
         main = QVBoxLayout(root); main.setContentsMargins(10,10,10,10); main.setSpacing(10)
 
-        center = QHBoxLayout(); center.setSpacing(10); main.addLayout(center, 1)
+        # Tab container
+        self.tabs = QTabWidget()
+        main.addWidget(self.tabs, 1)
 
-        # Sidebar
-        self.nav = QListWidget(); self.nav.setObjectName("Nav")
-        for label in ["Media", "Text & FX", "Audio", "Device Sync", "Displays"]:
-            self.nav.addItem(QListWidgetItem(label))
-        self.nav.setCurrentRow(0)
-        center.addWidget(self.nav, 0)
+        # Add pages as tabs
+        scroll_media = QScrollArea()
+        scroll_media.setWidgetResizable(True)
+        scroll_media.setFrameShape(QFrame.Shape.NoFrame)
+        scroll_media.setWidget(self._page_media())
+        self.tabs.addTab(scroll_media, "Media")
 
-        # Pages in scroll area
-        self.pages = QStackedWidget()
-        scroll = QScrollArea(); scroll.setWidgetResizable(True); scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setWidget(self.pages)
-        center.addWidget(scroll, 1)
-
-        # Build pages
-        self.pages.addWidget(self._page_media())
-
+        # Text & FX page
         self.page_textfx = TextFxPage(
             text=self.text, text_scale_pct=self.text_scale_pct, fx_mode=self.fx_mode, fx_intensity=self.fx_intensity,
             flash_interval_ms=self.flash_interval_ms, flash_width_ms=self.flash_width_ms
         )
-        self.pages.addWidget(self.page_textfx)
+        scroll_textfx = QScrollArea()
+        scroll_textfx.setWidgetResizable(True)
+        scroll_textfx.setFrameShape(QFrame.Shape.NoFrame)
+        scroll_textfx.setWidget(self.page_textfx)
+        self.tabs.addTab(scroll_textfx, "Text & FX")
 
-        # NEW: AudioPage (two bubbles: primary + secondary)
+        # Audio page
         self.page_audio = AudioPage(
             file1=os.path.basename(self.audio1_path),
             file2=os.path.basename(self.audio2_path),
             vol1_pct=int(self.vol1*100),
             vol2_pct=int(self.vol2*100),
         )
-        self.pages.addWidget(self.page_audio)
+        scroll_audio = QScrollArea()
+        scroll_audio.setWidgetResizable(True)
+        scroll_audio.setFrameShape(QFrame.Shape.NoFrame)
+        scroll_audio.setWidget(self.page_audio)
+        self.tabs.addTab(scroll_audio, "Audio")
 
+        # Device page
         self.page_device = DevicePage(
             enable_sync=self.enable_device_sync,
             buzz_on_flash=self.enable_buzz_on_flash,
@@ -109,10 +112,18 @@ class Launcher(QMainWindow):
             min_gap_s=self.burst_min_s, max_gap_s=self.burst_max_s,
             peak_pct=int(self.burst_peak*100), max_ms=self.burst_max_ms
         )
-        self.pages.addWidget(self.page_device)
+        scroll_device = QScrollArea()
+        scroll_device.setWidgetResizable(True)
+        scroll_device.setFrameShape(QFrame.Shape.NoFrame)
+        scroll_device.setWidget(self.page_device)
+        self.tabs.addTab(scroll_device, "Device Sync")
 
-        self.pages.addWidget(self._page_displays())
-        self.nav.currentRowChanged.connect(self.pages.setCurrentIndex)
+        # Displays page
+        scroll_displays = QScrollArea()
+        scroll_displays.setWidgetResizable(True)
+        scroll_displays.setFrameShape(QFrame.Shape.NoFrame)
+        scroll_displays.setWidget(self._page_displays())
+        self.tabs.addTab(scroll_displays, "Displays")
 
         # Wire page signals -> state
         self.page_textfx.textChanged.connect(lambda s:setattr(self, "text", s))
@@ -217,7 +228,7 @@ class Launcher(QMainWindow):
         QShortcut(QKeySequence("Ctrl+L"), self, activated=self.launch)
         QShortcut(QKeySequence("Ctrl+."), self, activated=self.stop_all)
         for i in range(1, 6):
-            QShortcut(QKeySequence(f"Ctrl+{i}"), self, activated=lambda idx=i-1: self.nav.setCurrentRow(idx))
+            QShortcut(QKeySequence(f"Ctrl+{i}"), self, activated=lambda idx=i-1: self.tabs.setCurrentIndex(idx))
 
     def _select_all_displays(self):
         for i in range(self.list_displays.count()):
