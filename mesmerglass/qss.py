@@ -50,7 +50,7 @@ QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {
 }
 QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus {
   border: 1px solid rgba(255,168,76,0.55);
-  box-shadow: 0 0 0 2px rgba(255,168,76,0.18) inset;
+  background: rgba(16, 21, 28, 0.98);  /* slightly darker when focused */
 }
 
 /* SpinBox buttons: make arrows area visible */
