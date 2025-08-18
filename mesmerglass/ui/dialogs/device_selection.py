@@ -33,13 +33,16 @@ class DeviceSelectionDialog(QDialog):
         layout.addWidget(self.list_widget)
         
         # Populate list
-        for device in device_list.devices:
+        list_position = 0
+        for device_idx, device in enumerate(device_list.devices):
             if self._device_supports_vibration(device):
                 item = QListWidgetItem(f"{device.name}")
                 item.setData(Qt.ItemDataRole.UserRole, device.index)
                 self.list_widget.addItem(item)
-                if device.index == device_list.selected_index:
+                # Check if this device (at device_idx in the original list) is selected
+                if device_idx == device_list.selected_idx:
                     item.setSelected(True)
+                list_position += 1
         
         # Buttons
         button_box = QDialogButtonBox()

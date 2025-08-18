@@ -1,7 +1,7 @@
 import os, time, random, threading
 from typing import List
 
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject
 from PyQt6.QtGui import QColor, QFont, QGuiApplication, QShortcut, QKeySequence
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
@@ -17,6 +17,11 @@ from .pages.textfx import TextFxPage
 from .pages.device import DevicePage
 from .pages.audio import AudioPage  # <-- NEW
 from .devtools import DevToolsWindow  # <-- Dev Tools
+
+
+class ScanCompleteSignaler(QObject):
+    """Thread-safe signaler for scan completion."""
+    scan_completed = pyqtSignal(object)  # Emits device_list
 
 
 # ---- tiny helpers used by pages built in this file ----
@@ -43,6 +48,10 @@ class Launcher(QMainWindow):
     def __init__(self, app_title="Mesmer Glass — 0.7.0"):
         super().__init__()
         self.setWindowTitle(app_title)
+        
+        # Create thread-safe signaler for scan completion
+        self.scan_signaler = ScanCompleteSignaler()
+        self.scan_signaler.scan_completed.connect(self._update_device_list_ui)
         self.resize(980, 620)
 
         # ---------- state ----------
@@ -62,7 +71,7 @@ class Launcher(QMainWindow):
         self.audio = Audio2(); self.audio1_path = ""; self.audio2_path = ""; self.vol1 = 0.6; self.vol2 = 0.5
 
         self.pulse = PulseEngine(quiet=True)
-        self.enable_device_sync = False
+        self.enable_device_sync = True  # Enable device sync by default
         self.enable_buzz_on_flash = True; self.buzz_intensity = 0.6
         self.enable_bursts = False; self.burst_min_s = 25; self.burst_max_s = 60; self.burst_peak = 0.9; self.burst_max_ms = 2000
 
@@ -306,8 +315,32 @@ class Launcher(QMainWindow):
                 
         elif not b and self.mesmer_server:
             try:
+                # Synchronously shutdown the server
                 import asyncio
-                asyncio.create_task(self.mesmer_server.shutdown())
+                loop = None
+                try:
+                    loop = asyncio.get_event_loop()
+                    if loop.is_running():
+                        # If loop is running, create a new one for shutdown
+                        def shutdown_sync():
+                            shutdown_loop = asyncio.new_event_loop()
+                            asyncio.set_event_loop(shutdown_loop)
+                            shutdown_loop.run_until_complete(self.mesmer_server.shutdown())
+                            shutdown_loop.close()
+                        
+                        import threading
+                        shutdown_thread = threading.Thread(target=shutdown_sync)
+                        shutdown_thread.start()
+                        shutdown_thread.join(timeout=5.0)  # Wait max 5 seconds
+                    else:
+                        loop.run_until_complete(self.mesmer_server.shutdown())
+                except RuntimeError:
+                    # No event loop, create new one
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    loop.run_until_complete(self.mesmer_server.shutdown())
+                    loop.close()
+                    
                 self.mesmer_server = None
                 print("🛑 MesmerIntiface server stopped")
             except Exception as e:
@@ -343,9 +376,14 @@ class Launcher(QMainWindow):
                         # Get device list and update UI
                         device_list = self.mesmer_server.get_device_list()
                         
-                        # Update UI on main thread
-                        from PyQt6.QtCore import QTimer
-                        QTimer.singleShot(0, lambda: self._update_device_list_ui(device_list))
+                        # Debug: Print device list info
+                        print(f"🔍 Device list contains {len(device_list.devices)} devices:")
+                        for i, device in enumerate(device_list.devices):
+                            print(f"  {i}: {device.name} (index={device.index})")
+                        
+                        # Update UI using thread-safe signal
+                        print("📡 Emitting scan_completed signal...")
+                        self.scan_signaler.scan_completed.emit(device_list)
                         
                         print(f"✅ Scan completed - found {len(device_list.devices)} device(s)")
                     else:
@@ -359,15 +397,28 @@ class Launcher(QMainWindow):
                 print(f"❌ Scan error: {e}")
                 from PyQt6.QtCore import QTimer
                 QTimer.singleShot(0, lambda: self._scan_completed(None))
+                
+        def scan_wrapper():
+            try:
+                scan_task()
             finally:
+                # Ensure scan state is reset even if there's an exception
                 self.device_scan_in_progress = False
                 
-        threading.Thread(target=scan_task, daemon=True).start()
+        threading.Thread(target=scan_wrapper, daemon=True).start()
     
     def _update_device_list_ui(self, device_list):
         """Update UI with scan results (called on main thread)."""
-        self.page_device.update_device_list(device_list)
+        # Always reset scan state first
         self.device_scan_in_progress = False
+        
+        print(f"🖥️ Updating UI with device list containing {len(device_list.devices)} devices")
+        for device in device_list.devices:
+            print(f"   - {device.name} (index: {device.index})")
+        
+        # Update the device page
+        self.page_device.update_device_list(device_list)
+        print("✅ Called update_device_list on device page")
         
         # Also tell pulse engine about devices if sync is enabled
         if self.enable_device_sync and device_list.devices:
@@ -384,13 +435,16 @@ class Launcher(QMainWindow):
         self.device_scan_in_progress = False
         if device_list:
             self._update_device_list_ui(device_list)
+        else:
+            # Failed scan - reset button state
+            self.page_device.reset_scan_button()
     
     def _on_device_selected(self, device_idx: int):
         """Handle device selection."""
         if not self.mesmer_server:
             return
             
-        print(f"🎯 Selecting device index {device_idx}")
+        print(f"🎯 Selecting device with Buttplug index {device_idx}")
         
         # Update pulse engine selection
         if hasattr(self.pulse, 'select_device_by_index'):
@@ -398,9 +452,23 @@ class Launcher(QMainWindow):
         elif hasattr(self.pulse, 'device_manager'):
             self.pulse.device_manager.select_device(device_idx)
             
-        # Update UI
+        # Find the list index for this device
         device_list = self.mesmer_server.get_device_list()
-        device_list.selected_index = device_idx
+        list_idx = None
+        for i, device in enumerate(device_list.devices):
+            if device.index == device_idx:
+                list_idx = i
+                break
+                
+        if list_idx is not None:
+            # Update server device selection using list index
+            self.mesmer_server.select_device(list_idx)
+            print(f"✅ Selected device at list index {list_idx} (Buttplug index {device_idx})")
+        else:
+            print(f"❌ Could not find device with Buttplug index {device_idx}")
+        
+        # Get updated device list and refresh UI
+        device_list = self.mesmer_server.get_device_list()
         self.page_device.update_device_list(device_list)
 
     def _refresh_status(self):

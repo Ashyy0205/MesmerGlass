@@ -31,6 +31,7 @@ class BluetoothDeviceScanner:
         # Lovense devices
         "0000fff0-0000-1000-8000-00805f9b34fb": "lovense",
         "6e400001-b5a3-f393-e0a9-e50e24dcca9e": "lovense_uart",
+        "5a300001-0023-4bd4-bbd5-a6920e4c5653": "lovense_v2",  # Lovense Hush and newer devices
         
         # We-Vibe devices  
         "f000aa80-0451-4000-b000-000000000000": "we_vibe",
@@ -52,10 +53,24 @@ class BluetoothDeviceScanner:
     
     def __init__(self):
         self._scanning = False
+        self._scanner = None
         self._discovered_devices: Dict[str, BluetoothDeviceInfo] = {}
         self._device_callbacks: List[Callable[[List[BluetoothDeviceInfo]], None]] = []
         self._connected_clients: Dict[str, BleakClient] = {}
+        
+        # Setup logging with console output
         self._logger = logging.getLogger(__name__)
+        self._logger.setLevel(logging.INFO)
+        
+        # Add console handler if not already present
+        if not self._logger.handlers:
+            console_handler = logging.StreamHandler()
+            console_handler.setLevel(logging.INFO)
+            formatter = logging.Formatter('[bluetooth] %(message)s')
+            console_handler.setFormatter(formatter)
+            self._logger.addHandler(console_handler)
+            
+        self._shutdown = False
         
     def add_device_callback(self, callback: Callable[[List[BluetoothDeviceInfo]], None]) -> None:
         """Add callback for device discovery updates."""
@@ -83,19 +98,21 @@ class BluetoothDeviceScanner:
             self._logger.info("Starting Bluetooth LE device scan")
             
             # Start scanning with device detection callback
-            scanner = BleakScanner(detection_callback=self._on_device_detected)
-            await scanner.start()
+            self._scanner = BleakScanner(detection_callback=self._on_device_detected)
+            await self._scanner.start()
             
             if duration:
                 await asyncio.sleep(duration)
-                await scanner.stop()
+                await self._scanner.stop()
                 self._scanning = False
+                self._scanner = None
             
             return True
             
         except Exception as e:
             self._logger.error(f"Failed to start scanning: {e}")
             self._scanning = False
+            self._scanner = None
             return False
             
     async def stop_scanning(self) -> None:
@@ -103,8 +120,17 @@ class BluetoothDeviceScanner:
         if not self._scanning:
             return
             
-        self._scanning = False
-        self._logger.info("Stopped Bluetooth LE device scan")
+        try:
+            self._scanning = False
+            if self._scanner:
+                await self._scanner.stop()
+                self._scanner = None
+            self._logger.info("Stopped Bluetooth LE device scan")
+        except Exception as e:
+            self._logger.error(f"Error stopping scanner: {e}")
+        finally:
+            self._scanning = False
+            self._scanner = None
         
     def is_scanning(self) -> bool:
         """Check if currently scanning."""
@@ -221,6 +247,10 @@ class BluetoothDeviceScanner:
             
     def _on_device_detected(self, device: BLEDeviceType, advertisement_data) -> None:
         """Handle detected Bluetooth device."""
+        # Skip if shutting down
+        if self._shutdown:
+            return
+            
         try:
             # Extract device information
             device_info = BluetoothDeviceInfo(
@@ -231,6 +261,13 @@ class BluetoothDeviceScanner:
                 service_uuids=[str(uuid) for uuid in advertisement_data.service_uuids]
             )
             
+            # Log all detected devices for debugging
+            self._logger.info(f"Detected BLE device: {device.name or 'Unknown'} ({device.address}) RSSI: {advertisement_data.rssi}")
+            if device_info.service_uuids:
+                self._logger.info(f"  Service UUIDs: {device_info.service_uuids}")
+            if device_info.manufacturer_data:
+                self._logger.info(f"  Manufacturer data: {device_info.manufacturer_data}")
+            
             # Check if this looks like a sex toy
             device_type, protocol = self._identify_device(device_info)
             if device_type:
@@ -240,13 +277,24 @@ class BluetoothDeviceScanner:
                 # Store/update device
                 self._discovered_devices[device.address] = device_info
                 
-                self._logger.info(f"Discovered {device_type} device: {device.name or device.address}")
+                self._logger.info(f"✅ Identified {device_type} device: {device.name or device.address}")
                 
-                # Notify callbacks
-                self._notify_device_callbacks()
+                # Notify callbacks (but not if shutting down)
+                if not self._shutdown:
+                    self._notify_device_callbacks()
+            else:
+                # For debugging: store unidentified devices too
+                device_info.device_type = "unknown"
+                device_info.protocol = "unknown"
+                self._discovered_devices[device.address] = device_info
+                
+                # Notify callbacks for all devices during development
+                if not self._shutdown:
+                    self._notify_device_callbacks()
                 
         except Exception as e:
-            self._logger.error(f"Error processing detected device: {e}")
+            if not self._shutdown:  # Don't log errors during shutdown
+                self._logger.error(f"Error processing detected device: {e}")
             
     def _identify_device(self, device_info: BluetoothDeviceInfo) -> tuple[Optional[str], Optional[str]]:
         """Identify device type and protocol from advertisement data.
@@ -270,11 +318,27 @@ class BluetoothDeviceScanner:
                 protocol = self.KNOWN_MANUFACTURERS[company_id]
                 return ("sex_toy", protocol)
                 
-        # Check device name patterns
+        # Check device name patterns (more comprehensive)
         if device_info.name:
             name_lower = device_info.name.lower()
-            if any(brand in name_lower for brand in ["lovense", "we-vibe", "kiiroo", "satisfyer"]):
-                return ("sex_toy", "generic")
+            
+            # Known brands
+            brand_patterns = [
+                "lovense", "we-vibe", "kiiroo", "satisfyer", "lelo", "wevibe",
+                "fleshlight", "ohmibod", "mysteryvibe", "magic motion", "svakom",
+                "calor", "edge", "hush", "lush", "nora", "max", "osci", "sync",
+                "pivot", "nova", "domi", "ferri", "diamo", "mission", "ambi"
+            ]
+            
+            for pattern in brand_patterns:
+                if pattern in name_lower:
+                    return ("sex_toy", "generic")
+                    
+            # Generic patterns that might indicate adult toys
+            generic_patterns = ["vibe", "toy", "pulse", "intimate", "pleasure"]
+            for pattern in generic_patterns:
+                if pattern in name_lower:
+                    return ("potential_sex_toy", "generic")
                 
         return (None, None)
         
@@ -306,15 +370,22 @@ class BluetoothDeviceScanner:
             
     def _notify_device_callbacks(self) -> None:
         """Notify all callbacks of device list changes."""
+        if self._shutdown:
+            return
+            
         devices = self.get_discovered_devices()
         for callback in self._device_callbacks:
             try:
                 callback(devices)
             except Exception as e:
-                self._logger.error(f"Error in device callback: {e}")
+                if not self._shutdown:  # Don't log errors during shutdown
+                    self._logger.error(f"Error in device callback: {e}")
                 
     async def shutdown(self) -> None:
         """Shutdown scanner and disconnect all devices."""
+        self._shutdown = True
+        
+        # Stop scanning first
         await self.stop_scanning()
         
         # Disconnect all connected devices

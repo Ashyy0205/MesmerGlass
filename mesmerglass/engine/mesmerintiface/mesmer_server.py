@@ -276,12 +276,17 @@ class MesmerIntifaceServer(ButtplugServer):
             # Update our device tracking
             self._bluetooth_devices = {dev.address: dev for dev in devices}
             
+            # Debug: Print discovered devices
+            print(f"🔍 Processing {len(devices)} Bluetooth devices:")
+            for dev in devices:
+                print(f"  - {dev.name or 'Unknown'} ({dev.address}) type={dev.device_type}")
+            
             # Convert to Buttplug devices and update device manager
             buttplug_devices = []
             
             for device in devices:
-                # Skip devices that aren't sex toys
-                if not device.device_type:
+                # Skip devices that aren't sex toys or unknown devices for now
+                if not device.device_type or device.device_type == "unknown":
                     continue
                     
                 # Assign Buttplug device index if new
@@ -290,6 +295,8 @@ class MesmerIntifaceServer(ButtplugServer):
                     self._next_device_index += 1
                     
                 device_index = self._device_index_map[device.address]
+                
+                print(f"✅ Converting device: {device.name} -> Buttplug index {device_index}")
                 
                 # Identify device capabilities
                 device_def = self._device_database.identify_device(
@@ -349,6 +356,8 @@ class MesmerIntifaceServer(ButtplugServer):
             # Update device manager
             self._device_manager._device_list.devices = buttplug_devices
             
+            print(f"📱 Final device list has {len(buttplug_devices)} devices")
+            
             # Notify callbacks
             self._notify_device_callbacks()
             
@@ -397,7 +406,7 @@ class MesmerIntifaceServer(ButtplugServer):
             
     def get_device_list(self) -> "DeviceList":
         """Get the current device list."""
-        return self._device_manager._device_list
+        return self._device_manager.get_device_list()
     
     def _add_virtual_device(self, device_info: Dict) -> None:
         """Add a virtual device for testing purposes."""

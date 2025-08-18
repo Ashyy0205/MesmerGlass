@@ -155,7 +155,8 @@ class PulseEngine:
         if loop and self._enabled:
             try:
                 asyncio.run_coroutine_threadsafe(coro, loop)
-            except RuntimeError:
+            except (RuntimeError, ValueError):
+                # Event loop closed or invalid - ignore
                 pass
 
     # ---------------- core async flow ----------------
