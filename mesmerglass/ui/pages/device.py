@@ -1,6 +1,7 @@
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QLabel, QGroupBox, QSlider, QHBoxLayout, QWidget as QW
+    QWidget, QVBoxLayout, QLabel, QGroupBox, QSlider, QHBoxLayout, QWidget as QW,
+    QPushButton
 )
 from ..widgets import ToggleSwitch, UnitSpin
 
@@ -47,6 +48,7 @@ class DevicePage(QWidget):
     burstMaxChanged     = pyqtSignal(int)       # seconds
     burstPeakChanged    = pyqtSignal(int)       # 0..100
     burstMaxMsChanged   = pyqtSignal(int)
+    launchIntifaceRequested = pyqtSignal()
 
     def __init__(
         self,
@@ -76,6 +78,12 @@ class DevicePage(QWidget):
             enable_sync,
         )
         cv.addWidget(row_en)
+        
+        # Add launch button
+        launch_btn = QPushButton("Launch Intiface")
+        launch_btn.setToolTip("Launch Intiface Central if not already running")
+        launch_btn.clicked.connect(self.launchIntifaceRequested.emit)
+        cv.addWidget(launch_btn)
         root.addWidget(card_enable)
 
         # 2) Buzz-on-flash bubble (toggle + intensity on separate lines)

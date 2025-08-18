@@ -1,5 +1,8 @@
 from __future__ import annotations
 import asyncio, json, threading, time, traceback, contextlib
+import subprocess
+import os
+from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional, Any
 
@@ -30,6 +33,27 @@ class PulseEngine:
     - Queues pulses while no device is ready.
     """
 
+    @staticmethod
+    def launch_intiface() -> bool:
+        """Launch Intiface Central if not already running"""
+        # Common install locations
+        program_files = os.environ.get('PROGRAMFILES', 'C:\\Program Files')
+        locations = [
+            Path(program_files) / "Intiface" / "Intiface Central" / "Intiface Central.exe",
+            Path(program_files) / "IntifaceCentral" / "Intiface Central.exe",
+            Path(os.environ.get('LOCALAPPDATA', '')) / "Programs" / "Intiface Central" / "Intiface Central.exe"
+        ]
+        
+        # Try to find and launch Intiface
+        for path in locations:
+            if path.exists():
+                try:
+                    subprocess.Popen([str(path)])
+                    return True
+                except Exception:
+                    continue
+        return False
+
     def __init__(self, url: str = WS_URL_DEFAULT, quiet: bool = False) -> None:
         self.url = url
         self.quiet = quiet
@@ -51,6 +75,10 @@ class PulseEngine:
     def start(self) -> None:
         if self._enabled:
             return
+            
+        # Try to launch Intiface if needed
+        self.launch_intiface()
+        
         self._enabled = True
         self._should_stop.clear()
         self._thread = threading.Thread(target=self._thread_main, name="PulseEngine", daemon=True)
