@@ -238,7 +238,7 @@ class BluetoothDeviceScanner:
             
         try:
             client = self._connected_clients[address]
-            await client.write_gatt_characteristic(characteristic_uuid, data)
+            await client.write_gatt_char(characteristic_uuid, data)
             return True
             
         except Exception as e:
@@ -357,7 +357,7 @@ class BluetoothDeviceScanner:
     async def _discover_device_services(self, client: BleakClient, device_info: BluetoothDeviceInfo) -> None:
         """Discover and log device services and characteristics."""
         try:
-            services = await client.get_services()
+            services = client.services
             self._logger.info(f"Device {device_info.address} services:")
             
             for service in services:

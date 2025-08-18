@@ -118,13 +118,18 @@ class MesmerIntifaceServer(ButtplugServer):
             return True  # Already disconnected
             
         try:
+            # Clean up protocol first
+            if address in self._device_protocols:
+                protocol = self._device_protocols[address]
+                try:
+                    await protocol.cleanup()
+                except Exception as e:
+                    self._logger.warning(f"Error cleaning up protocol for {address}: {e}")
+                del self._device_protocols[address]
+            
             # Disconnect via Bluetooth scanner
             success = await self._bluetooth_scanner.disconnect_device(address)
             
-            # Clean up protocol
-            if address in self._device_protocols:
-                del self._device_protocols[address]
-                
             return success
             
         except Exception as e:
@@ -357,6 +362,11 @@ class MesmerIntifaceServer(ButtplugServer):
             self._device_manager._device_list.devices = buttplug_devices
             
             print(f"📱 Final device list has {len(buttplug_devices)} devices")
+            
+            # Auto-stop scanning if we found sex toy devices
+            if buttplug_devices and self.is_real_scanning():
+                print("🛑 Auto-stopping scan - found sex toy devices")
+                asyncio.create_task(self.stop_real_scanning())
             
             # Notify callbacks
             self._notify_device_callbacks()

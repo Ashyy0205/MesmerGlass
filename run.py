@@ -3,11 +3,44 @@
 import sys
 import argparse
 import asyncio
+import logging
+import warnings
 from typing import Optional
 from mesmerglass.app import run
 from mesmerglass.engine.pulse import PulseEngine
 from mesmerglass.engine.buttplug_server import ButtplugServer
 from mesmerglass.tests.virtual_toy import VirtualToy
+
+# Monkey patch to suppress Bleak event loop closure errors
+def patch_bleak_errors():
+    """Patch asyncio to suppress event loop closure errors during shutdown."""
+    try:
+        import asyncio
+        
+        # Store the original call_soon_threadsafe method
+        original_call_soon_threadsafe = asyncio.BaseEventLoop.call_soon_threadsafe
+        
+        def safe_call_soon_threadsafe(self, callback, *args, context=None):
+            """Wrapper that catches and suppresses event loop closure errors."""
+            try:
+                return original_call_soon_threadsafe(self, callback, *args, context=context if context is not None else None)
+            except RuntimeError as e:
+                if "Event loop is closed" in str(e):
+                    # Silently ignore event loop closure errors during shutdown
+                    return None
+                else:
+                    # Re-raise other runtime errors
+                    raise
+        
+        # Replace the method
+        asyncio.BaseEventLoop.call_soon_threadsafe = safe_call_soon_threadsafe
+        
+    except Exception:
+        # If patching fails, just continue without it
+        pass
+
+# Apply the patch
+patch_bleak_errors()
 
 async def cli_test_device(intensity: float = 0.5, duration_ms: int = 1000, server_port: int = 12345):
     """Test a device with specific intensity."""

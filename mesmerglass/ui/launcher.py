@@ -83,6 +83,10 @@ class Launcher(QMainWindow):
 
         self._build_ui()
         self._bind_shortcuts()
+        
+        # Auto-start MesmerIntiface server if device sync is enabled
+        if self.enable_device_sync:
+            self._start_mesmer_server()
 
     # ============================== UI ==============================
     def _build_ui(self):
@@ -300,6 +304,19 @@ class Launcher(QMainWindow):
             self.audio.load2(f); self._set_vols(self.vol1, self.vol2); self._refresh_status()
 
     def _set_vols(self, v1, v2): self.vol1, self.vol2 = v1, v2; self.audio.set_vols(v1, v2)
+    
+    def _start_mesmer_server(self):
+        """Start MesmerIntiface server if not already running."""
+        if not self.mesmer_server:
+            try:
+                self.mesmer_server = MesmerIntifaceServer(port=12350)
+                self.mesmer_server.start()
+                print("🚀 MesmerIntiface server started automatically on port 12350")
+                self._refresh_status()
+            except Exception as e:
+                print(f"❌ Failed to start MesmerIntiface server: {e}")
+                self.mesmer_server = None
+    
     def _on_toggle_device_sync(self, b: bool): 
         self.enable_device_sync = b
         
@@ -420,6 +437,12 @@ class Launcher(QMainWindow):
         self.page_device.update_device_list(device_list)
         print("✅ Called update_device_list on device page")
         
+        # Auto-select single device
+        if len(device_list.devices) == 1:
+            device = device_list.devices[0]
+            print(f"🎯 Auto-selecting single device: {device.name} (index {device.index})")
+            self._on_device_selected(device.index)
+        
         # Also tell pulse engine about devices if sync is enabled
         if self.enable_device_sync and device_list.devices:
             # Update pulse engine's device manager
@@ -464,6 +487,35 @@ class Launcher(QMainWindow):
             # Update server device selection using list index
             self.mesmer_server.select_device(list_idx)
             print(f"✅ Selected device at list index {list_idx} (Buttplug index {device_idx})")
+            
+            # Automatically connect to the selected device
+            import threading
+            import asyncio
+            
+            def connect_device():
+                try:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    
+                    async def do_connect():
+                        print(f"🔗 Attempting to connect to device {device_idx}...")
+                        success = await self.mesmer_server.connect_real_device(device_idx)
+                        if success:
+                            print(f"✅ Successfully connected to device {device_idx}")
+                        else:
+                            print(f"❌ Failed to connect to device {device_idx}")
+                        return success
+                    
+                    result = loop.run_until_complete(do_connect())
+                    loop.close()
+                    
+                except Exception as e:
+                    print(f"❌ Error connecting to device {device_idx}: {e}")
+                    
+            # Run connection in background thread
+            connect_thread = threading.Thread(target=connect_device, daemon=True)
+            connect_thread.start()
+            
         else:
             print(f"❌ Could not find device with Buttplug index {device_idx}")
         

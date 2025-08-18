@@ -70,6 +70,7 @@ class PulseEngine:
         self._ws: Optional[websockets.WebSocketClientProtocol] = None
         self._msg_id = 0
         self._device_idx: Optional[int] = None
+        self._devices_found = False  # Track if devices have been discovered
 
         self._pending: list[_PulseReq] = []
         self._last_level: float = 0.0
@@ -252,9 +253,18 @@ class PulseEngine:
                 # Some servers may send an Error before ServerInfo; keep looping.
 
     async def _rescan_until_device(self) -> None:
-        while self._device_idx is None and self._ws:
+        while not self._devices_found and self._ws:
             await asyncio.sleep(5.0)
+            
+            # Check if we have available devices before starting more scans
+            device_list = self.device_manager.get_device_list()
+            if device_list and device_list.devices:
+                print(f"[pulse] Found {len(device_list.devices)} devices, stopping auto-scan")
+                self._devices_found = True  # Set flag to prevent further scanning
+                break
+                
             try:
+                print("[pulse] Starting scan for devices...")
                 await self._send({"StartScanning": {"Id": self._next_id()}})
                 await self._send({"RequestDeviceList": {"Id": self._next_id()}})
             except Exception:
@@ -280,10 +290,19 @@ class PulseEngine:
                 if not self.quiet:
                     print(f"[pulse] server error: {msg.get('Error')}")
             elif "DeviceList" in msg:
-                for dev in msg["DeviceList"].get("Devices", []):
+                devices = msg["DeviceList"].get("Devices", [])
+                if devices and not self._devices_found:
+                    self._devices_found = True  # Mark that devices have been found
+                    print(f"[pulse] Device list received with {len(devices)} devices, stopping auto-scan")
+                    
+                for dev in devices:
                     self._maybe_select_device(dev)
                 await self._drain_pending()
             elif "DeviceAdded" in msg:
+                if not self._devices_found:
+                    self._devices_found = True  # Mark that devices have been found
+                    print("[pulse] New device added, stopping auto-scan")
+                    
                 self._maybe_select_device(msg["DeviceAdded"])
                 await self._drain_pending()
             elif "DeviceRemoved" in msg:
@@ -329,6 +348,7 @@ class PulseEngine:
             if not self.quiet:
                 if device_idx is not None:
                     print(f"[pulse] manually selected device idx={device_idx}")
+                    print(f"[pulse] stopping auto-scan due to device selection")
                 else:
                     print(f"[pulse] cleared device selection")
             return True

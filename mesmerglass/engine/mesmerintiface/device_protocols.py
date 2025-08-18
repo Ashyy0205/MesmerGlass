@@ -61,16 +61,28 @@ class DeviceProtocol(ABC):
 class LovenseProtocol(DeviceProtocol):
     """Protocol implementation for Lovense devices."""
     
-    # Lovense service and characteristic UUIDs
-    SERVICE_UUID = "0000fff0-0000-1000-8000-00805f9b34fb"
-    TX_CHAR_UUID = "0000fff2-0000-1000-8000-00805f9b34fb"  # Write
-    RX_CHAR_UUID = "0000fff1-0000-1000-8000-00805f9b34fb"  # Notify
+    # Lovense v1 service and characteristic UUIDs (older devices)
+    SERVICE_UUID_V1 = "0000fff0-0000-1000-8000-00805f9b34fb"
+    TX_CHAR_UUID_V1 = "0000fff2-0000-1000-8000-00805f9b34fb"  # Write
+    RX_CHAR_UUID_V1 = "0000fff1-0000-1000-8000-00805f9b34fb"  # Notify
+    
+    # Lovense v2 service and characteristic UUIDs (newer devices like LVS-Hush)
+    SERVICE_UUID_V2 = "5a300001-0023-4bd4-bbd5-a6920e4c5653"
+    TX_CHAR_UUID_V2 = "5a300002-0023-4bd4-bbd5-a6920e4c5653"  # Write
+    RX_CHAR_UUID_V2 = "5a300003-0023-4bd4-bbd5-a6920e4c5653"  # Notify
     
     def __init__(self, device_address: str, device_name: str):
         super().__init__(device_address, device_name)
         self._client = None
         self._device_type = self._identify_device_type(device_name)
         self._setup_capabilities()
+        self._notification_active = False
+        
+        # Protocol version detection
+        self._protocol_version = None
+        self.SERVICE_UUID = None
+        self.TX_CHAR_UUID = None
+        self.RX_CHAR_UUID = None
         
     def _identify_device_type(self, name: str) -> str:
         """Identify specific Lovense device type from name."""
@@ -124,13 +136,43 @@ class LovenseProtocol(DeviceProtocol):
         try:
             self._client = client
             
+            # Detect protocol version by checking available services
+            services = client.services
+            v2_service = None
+            v1_service = None
+            
+            for service in services:
+                if service.uuid.lower() == self.SERVICE_UUID_V2.lower():
+                    v2_service = service
+                elif service.uuid.lower() == self.SERVICE_UUID_V1.lower():
+                    v1_service = service
+                    
+            # Prefer v2 if available, fall back to v1
+            if v2_service:
+                self._logger.info(f"Detected Lovense v2 protocol for {self.device_name}")
+                self.is_v2_protocol = True
+                self.SERVICE_UUID = self.SERVICE_UUID_V2
+                self.TX_CHAR_UUID = self.TX_CHAR_UUID_V2
+                self.RX_CHAR_UUID = self.RX_CHAR_UUID_V2
+            elif v1_service:
+                self._logger.info(f"Detected Lovense v1 protocol for {self.device_name}")
+                self.is_v2_protocol = False
+                self.SERVICE_UUID = self.SERVICE_UUID_V1
+                self.TX_CHAR_UUID = self.TX_CHAR_UUID_V1
+                self.RX_CHAR_UUID = self.RX_CHAR_UUID_V1
+            else:
+                self._logger.error(f"No compatible Lovense service found for {self.device_name}")
+                return False
+            
             # Subscribe to notifications if available
             try:
                 await client.start_notify(self.RX_CHAR_UUID, self._on_notification)
+                self._notification_active = True
+                self._logger.info(f"Subscribed to notifications on {self.RX_CHAR_UUID}")
             except Exception as e:
                 self._logger.warning(f"Could not subscribe to notifications: {e}")
                 
-            self._logger.info(f"Initialized Lovense protocol for {self.device_name}")
+            self._logger.info(f"Initialized Lovense protocol for {self.device_name} using {'v2' if self.is_v2_protocol else 'v1'} UUIDs")
             return True
             
         except Exception as e:
@@ -161,7 +203,7 @@ class LovenseProtocol(DeviceProtocol):
                 command = f"Vibrate:{level};"
                 
             # Send command
-            await self._client.write_gatt_characteristic(
+            await self._client.write_gatt_char(
                 self.TX_CHAR_UUID, 
                 command.encode('utf-8')
             )
@@ -187,7 +229,7 @@ class LovenseProtocol(DeviceProtocol):
             direction = "True" if clockwise else "False"
             command = f"Rotate:{level},{direction};"
             
-            await self._client.write_gatt_characteristic(
+            await self._client.write_gatt_char(
                 self.TX_CHAR_UUID,
                 command.encode('utf-8')
             )
@@ -215,7 +257,7 @@ class LovenseProtocol(DeviceProtocol):
                 
             # Send all stop commands
             for command in commands:
-                await self._client.write_gatt_characteristic(
+                await self._client.write_gatt_char(
                     self.TX_CHAR_UUID,
                     command.encode('utf-8')
                 )
@@ -227,6 +269,27 @@ class LovenseProtocol(DeviceProtocol):
             self._logger.error(f"Failed to send stop command: {e}")
             return False
             
+    async def cleanup(self) -> bool:
+        """Clean up the protocol, stopping notifications."""
+        if not self._client:
+            return True
+            
+        try:
+            # Stop notifications if they were started
+            if self._notification_active and self.RX_CHAR_UUID:
+                try:
+                    await self._client.stop_notify(self.RX_CHAR_UUID)
+                    self._notification_active = False
+                    self._logger.debug("Stopped notifications")
+                except Exception as e:
+                    self._logger.warning(f"Could not stop notifications: {e}")
+                    
+            return True
+            
+        except Exception as e:
+            self._logger.error(f"Failed to cleanup protocol: {e}")
+            return False
+            
     async def get_battery_level(self) -> Optional[int]:
         """Get battery level from Lovense device."""
         if not self._client:
@@ -235,7 +298,7 @@ class LovenseProtocol(DeviceProtocol):
         try:
             # Request battery level
             command = "Battery;"
-            await self._client.write_gatt_characteristic(
+            await self._client.write_gatt_char(
                 self.TX_CHAR_UUID,
                 command.encode('utf-8')
             )
@@ -249,6 +312,10 @@ class LovenseProtocol(DeviceProtocol):
             
     def _on_notification(self, sender, data: bytearray):
         """Handle notifications from Lovense device."""
+        # Completely silent callback during shutdown to avoid event loop errors
+        if not self._notification_active:
+            return
+            
         try:
             message = data.decode('utf-8')
             self._logger.debug(f"Received notification: {message}")
@@ -258,8 +325,10 @@ class LovenseProtocol(DeviceProtocol):
                 battery_level = int(message.split(":")[1])
                 self._logger.info(f"Battery level: {battery_level}%")
                 
-        except Exception as e:
-            self._logger.error(f"Error processing notification: {e}")
+        except Exception:
+            # Completely silent - ignore all errors during notification processing
+            # This prevents the "Event loop is closed" errors from showing up
+            pass
 
 class WeVibeProtocol(DeviceProtocol):
     """Protocol implementation for We-Vibe devices."""

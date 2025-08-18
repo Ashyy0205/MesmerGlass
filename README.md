@@ -85,23 +85,47 @@ MesmerGlass includes **MesmerIntiface** - a pure Python implementation for direc
 - [🎬 Video Engine](docs/technical/video-engine.md) - Video overlay architecture
 - [📡 Device Control](docs/technical/device-control.md) - Communication protocols
 
-## 🎯 Examples
+## 🧪 Testing
 
-Explore our example scripts in the [`examples/`](examples/) directory:
+Run the comprehensive test suite to validate functionality:
 
-### Device Control
+### Quick Testing
 ```bash
-# Full MesmerIntiface demonstration
-python examples/device_control/demo_mesmer_intiface.py
+# Run all tests
+python run_tests.py
 
-# Basic device testing
-python examples/device_control/basic_device_test.py
+# Run only fast tests (excludes slow integration tests)
+python run_tests.py fast
+
+# Run with verbose output
+python run_tests.py -v
+
+# Run with coverage report
+python run_tests.py -c
 ```
 
-### Testing & Validation
+### Test Categories
 ```bash
-# Integration validation
-python examples/testing/integration_validation.py
+# Unit tests only
+python run_tests.py unit
+
+# Integration tests
+python run_tests.py integration
+
+# Bluetooth functionality tests
+python run_tests.py bluetooth
+
+# Slow tests only
+python run_tests.py slow
+```
+
+### Manual Testing
+```bash
+# Test device control directly
+python -m pytest mesmerglass/tests/test_device_control.py -v
+
+# Test Bluetooth functionality
+python -m pytest mesmerglass/tests/test_bluetooth.py -v
 ```
 
 ## 🏗️ Project Structure
@@ -115,14 +139,12 @@ MesmerGlass/
 │   │   ├── video.py               # Video overlay
 │   │   └── pulse.py               # Device synchronization
 │   ├── ui/                        # User interface
-│   └── tests/                     # Test suite
+│   └── tests/                     # Comprehensive test suite
 ├── docs/                          # Documentation
 │   ├── user-guide/               # User documentation
 │   ├── development/              # Developer guides  
 │   └── technical/                # Technical references
-├── examples/                      # Example scripts
-│   ├── device_control/           # Device control examples
-│   └── testing/                  # Testing utilities
+├── run_tests.py                   # Test runner script
 └── requirements.txt              # Dependencies
 ```
 
