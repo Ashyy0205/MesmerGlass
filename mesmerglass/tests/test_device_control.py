@@ -35,7 +35,9 @@ class TestMesmerIntifaceDeviceControl:
         device = BluetoothDeviceInfo(
             address="88:1A:14:38:08:D0",
             name="LVS-Hush",
-            rssi=-40
+            rssi=-40,
+            manufacturer_data={},
+            service_uuids=["5a300001-0023-4bd4-bbd5-a6920e4c5653"]
         )
         device.device_type = "sex_toy"
         device.protocol = "lovense"
@@ -97,7 +99,7 @@ class TestMesmerIntifaceDeviceControl:
             mock_bleak_client.return_value = mock_client
             
             # Attempt connection (this tests the connection logic)
-            connection_result = await mesmer_server._bluetooth_scanner.connect_to_device(
+            connection_result = await mesmer_server._bluetooth_scanner.connect_device(
                 mock_device_info.address
             )
             
@@ -199,4 +201,4 @@ class TestMesmerIntifaceDeviceControl:
             
             # Both operations should complete
             assert scan_result is True or scan_result is False
-            assert stop_result is True or stop_result is False
+            assert stop_result is None  # stop_real_scanning returns None

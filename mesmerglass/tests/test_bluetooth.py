@@ -7,8 +7,6 @@ from unittest.mock import MagicMock, patch, AsyncMock
 from ..engine.mesmerintiface.bluetooth_scanner import BluetoothDeviceScanner, BluetoothDeviceInfo
 from ..engine.mesmerintiface.device_protocols import LovenseProtocol, WeVibeProtocol
 
-pytestmark = pytest.mark.asyncio
-
 
 class TestBluetoothFunctionality:
     """Test Bluetooth scanning and device communication."""
@@ -24,7 +22,9 @@ class TestBluetoothFunctionality:
         device = BluetoothDeviceInfo(
             address="88:1A:14:38:08:D0",
             name="LVS-Hush",
-            rssi=-40
+            rssi=-40,
+            manufacturer_data={},
+            service_uuids=["5a300001-0023-4bd4-bbd5-a6920e4c5653"]
         )
         device.device_type = "sex_toy"
         device.protocol = "lovense"
@@ -35,12 +35,16 @@ class TestBluetoothFunctionality:
         device = BluetoothDeviceInfo(
             address="88:1A:14:38:08:D0",
             name="LVS-Hush",
-            rssi=-40
+            rssi=-40,
+            manufacturer_data={},
+            service_uuids=["5a300001-0023-4bd4-bbd5-a6920e4c5653"]
         )
         
         assert device.address == "88:1A:14:38:08:D0"
         assert device.name == "LVS-Hush"
         assert device.rssi == -40
+        assert device.manufacturer_data == {}
+        assert device.service_uuids == ["5a300001-0023-4bd4-bbd5-a6920e4c5653"]
         assert device.is_connected is False
 
     def test_bluetooth_scanner_initialization(self, bluetooth_scanner):
@@ -49,6 +53,7 @@ class TestBluetoothFunctionality:
         assert hasattr(bluetooth_scanner, '_discovered_devices')
         assert hasattr(bluetooth_scanner, '_connected_clients')
 
+    @pytest.mark.asyncio
     async def test_device_identification(self, bluetooth_scanner, mock_lovense_device):
         """Test device identification logic."""
         # Mock the device identification
@@ -60,6 +65,10 @@ class TestBluetoothFunctionality:
             assert device_type == "sex_toy"
             assert protocol == "lovense"
 
+    # Should detect device properly
+        assert True  # Basic test to verify no exceptions
+
+    @pytest.mark.asyncio
     async def test_scanning_lifecycle(self, bluetooth_scanner):
         """Test scanning start/stop lifecycle."""
         # Mock bleak scanner
@@ -71,12 +80,13 @@ class TestBluetoothFunctionality:
             
             # Test start scanning
             result = await bluetooth_scanner.start_scanning()
-            assert result is True or result is False
+            assert isinstance(result, bool)
             
-            # Test stop scanning
+            # Test stop scanning (returns None)
             result = await bluetooth_scanner.stop_scanning()
-            assert result is True or result is False
+            assert result is None
 
+    @pytest.mark.asyncio
     async def test_device_connection_logic(self, bluetooth_scanner, mock_lovense_device):
         """Test device connection logic."""
         # Mock BleakClient
@@ -88,7 +98,7 @@ class TestBluetoothFunctionality:
             mock_client_class.return_value = mock_client
             
             # Test connection
-            result = await bluetooth_scanner.connect_to_device(mock_lovense_device.address)
+            result = await bluetooth_scanner.connect_device(mock_lovense_device.address)
             
             # Should complete (success or failure both acceptable)
             assert result is True or result is False
@@ -119,6 +129,7 @@ class TestBluetoothFunctionality:
         assert edge_protocol.capabilities.has_vibrator is True
         assert edge_protocol.capabilities.vibrator_count == 2  # Edge has 2 vibrators
 
+    @pytest.mark.asyncio
     async def test_protocol_initialization_logic(self):
         """Test protocol initialization with mock client."""
         protocol = LovenseProtocol("88:1A:14:38:08:D0", "LVS-Hush")
@@ -139,6 +150,7 @@ class TestBluetoothFunctionality:
         assert protocol.TX_CHAR_UUID == protocol.TX_CHAR_UUID_V2
         assert protocol.RX_CHAR_UUID == protocol.RX_CHAR_UUID_V2
 
+    @pytest.mark.asyncio
     async def test_vibration_command_generation(self):
         """Test vibration command generation."""
         protocol = LovenseProtocol("88:1A:14:38:08:D0", "LVS-Hush")
@@ -160,6 +172,7 @@ class TestBluetoothFunctionality:
             assert "Vibrate:" in command_str
             assert command_str.endswith(";")
 
+    @pytest.mark.asyncio
     async def test_stop_command_generation(self):
         """Test stop command generation."""
         protocol = LovenseProtocol("88:1A:14:38:08:D0", "LVS-Hush")
@@ -188,6 +201,7 @@ class TestBluetoothFunctionality:
         assert protocol.device_name == "We-Vibe Test"
         assert protocol.capabilities is not None
 
+    @pytest.mark.asyncio
     async def test_device_discovery_callback_simulation(self, bluetooth_scanner):
         """Test device discovery callback handling."""
         # Mock advertisement data
@@ -200,11 +214,12 @@ class TestBluetoothFunctionality:
         
         # Test callback (should not raise exceptions)
         try:
-            bluetooth_scanner._on_device_discovered(mock_device, mock_advertisement)
+            bluetooth_scanner._on_device_detected(mock_device, mock_advertisement)
             assert True
         except Exception as e:
             pytest.fail(f"Device discovery callback failed: {e}")
 
+    @pytest.mark.asyncio
     async def test_notification_error_handling(self):
         """Test notification callback error handling."""
         protocol = LovenseProtocol("88:1A:14:38:08:D0", "LVS-Hush")
@@ -226,6 +241,7 @@ class TestBluetoothFunctionality:
             except Exception as e:
                 pytest.fail(f"Notification callback failed with data {test_data}: {e}")
 
+    @pytest.mark.asyncio
     async def test_concurrent_operations(self, bluetooth_scanner):
         """Test concurrent scanning and connection operations."""
         # Mock multiple concurrent operations
@@ -241,7 +257,7 @@ class TestBluetoothFunctionality:
             tasks = [
                 bluetooth_scanner.start_scanning(),
                 bluetooth_scanner.stop_scanning(),
-                bluetooth_scanner.connect_to_device("88:1A:14:38:08:D0"),
+                bluetooth_scanner.connect_device("88:1A:14:38:08:D0"),
                 bluetooth_scanner.disconnect_device("88:1A:14:38:08:D0")
             ]
             
