@@ -8,8 +8,10 @@ from typing import Optional, Any
 import websockets  # websockets>=10
 from websockets.exceptions import ConnectionClosed
 from .buttplug_server import ButtplugServer
+from .device_manager import DeviceManager
 
 WS_URL_DEFAULT = "ws://127.0.0.1:12345"
+MESMER_URL_DEFAULT = "ws://127.0.0.1:12350"
 
 
 def clamp(v: float, lo: float, hi: float) -> float:
@@ -54,9 +56,10 @@ class PulseEngine:
                     continue
         return False
 
-    def __init__(self, url: str = WS_URL_DEFAULT, quiet: bool = False, server: Optional[ButtplugServer] = None) -> None:
+    def __init__(self, url: str = WS_URL_DEFAULT, quiet: bool = False, server: Optional[ButtplugServer] = None, use_mesmer: bool = True) -> None:
         self.url = url
         self.quiet = quiet
+        self.use_mesmer = use_mesmer  # Use MesmerIntiface instead of external Intiface
 
         self._thread: Optional[threading.Thread] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -71,21 +74,33 @@ class PulseEngine:
         self._pending: list[_PulseReq] = []
         self._last_level: float = 0.0
         
+        # Device manager for tracking connected devices
+        self.device_manager = DeviceManager()
+        
         # Use provided server or create a new one
         self._server = server or ButtplugServer(port=int(url.split(":")[-1]))
+        
+        # Use MesmerIntiface URL if enabled
+        if self.use_mesmer:
+            self.url = MESMER_URL_DEFAULT
 
     # ---------------- public API (UI thread) ----------------
     def start(self) -> None:
         if self._enabled:
             return
         
-        # Start mock server in a separate task
+        # Start mock server only if not using MesmerIntiface
         self._enabled = True
         self._should_stop.clear()
+        
+        if not self.use_mesmer:
+            # Only start bundled server if using classic mode
+            pass  # Server should be started by launcher
+            
         self._thread = threading.Thread(target=self._thread_main, name="PulseEngine", daemon=True)
         self._thread.start()
         if not self.quiet:
-            print("[pulse] started")
+            print(f"[pulse] started ({'MesmerIntiface' if self.use_mesmer else 'Classic'} mode)")
 
     def stop(self, quiet: Optional[bool] = None) -> None:
         if quiet is not None:
@@ -100,8 +115,9 @@ class PulseEngine:
             t.join(timeout=1.5)
         self._thread = None
         
-        # Stop bundled server
-        self._server.stop()
+        # Stop bundled server only if not using MesmerIntiface
+        if not self.use_mesmer:
+            self._server.stop()
         
         if not self.quiet:
             print("[pulse] stopped")
@@ -270,12 +286,31 @@ class PulseEngine:
                 self._maybe_select_device(msg["DeviceAdded"])
                 await self._drain_pending()
             elif "DeviceRemoved" in msg:
-                if msg["DeviceRemoved"].get("DeviceIndex") == self._device_idx:
-                    self._device_idx = None
+                removed_idx = msg["DeviceRemoved"].get("DeviceIndex")
+                if removed_idx is not None:
+                    self.device_manager.remove_device(removed_idx)
+                    if removed_idx == self._device_idx:
+                        self._device_idx = None
+                        if not self.quiet:
+                            print(f"[pulse] device idx={removed_idx} disconnected")
 
     def _maybe_select_device(self, dev: dict) -> None:
+        # Add device to device manager
+        self.device_manager.add_device(dev)
+        
+        # Only auto-select if no device currently selected and no explicit selection made
         if self._device_idx is not None:
             return
+            
+        # Check if device manager has a selected device
+        selected_idx = self.device_manager.get_selected_index()
+        if selected_idx is not None:
+            self._device_idx = selected_idx
+            if not self.quiet:
+                print(f"[pulse] using selected device idx={selected_idx} name={dev.get('DeviceName')}")
+            return
+            
+        # Auto-select first vibrator device if no explicit selection
         idx = dev.get("DeviceIndex")
         msgs = dev.get("DeviceMessages", {})
         scalars = msgs.get("ScalarCmd", [])
@@ -283,8 +318,20 @@ class PulseEngine:
             if s.get("ActuatorType") == "Vibrate":
                 self._device_idx = idx
                 if not self.quiet:
-                    print(f"[pulse] selected device idx={idx} name={dev.get('DeviceName')}")
+                    print(f"[pulse] auto-selected device idx={idx} name={dev.get('DeviceName')}")
                 break
+                
+    def select_device_by_index(self, device_idx: Optional[int]) -> bool:
+        """Manually select a device by index. Returns True if selection changed."""
+        if self.device_manager.select_device(device_idx):
+            self._device_idx = device_idx
+            if not self.quiet:
+                if device_idx is not None:
+                    print(f"[pulse] manually selected device idx={device_idx}")
+                else:
+                    print(f"[pulse] cleared device selection")
+            return True
+        return False
 
     # ---------------- commands ----------------
     async def _send_scalar(self, level: float) -> None:

@@ -1,57 +1,47 @@
 # MesmerGlass Documentation
 
-## Overview
-MesmerGlass is a sophisticated video overlay and device control application that synchronizes visual effects with connected devices.
+Welcome to the MesmerGlass documentation! This directory contains comprehensive guides for users and developers.
 
-## Features
-- Real-time video overlay and effects
-- Text and visual effect synchronization
-- Device control via Buttplug protocol
-- Virtual device testing support
-- Developer mode with debugging tools
-- CLI interface for testing and automation
+## 📚 Documentation Structure
 
-## Quick Start
-1. Installation:
-   ```powershell
-   # Clone the repository
-   git clone https://github.com/Ashyy0205/MesmerGlass.git
-   cd MesmerGlass
+### 📖 User Guide (`/user-guide/`)
+Documentation for end users:
+- **[Installation](user-guide/installation.md)** - Setup and installation instructions
+- **[Features](user-guide/features.md)** - Overview of MesmerGlass features
+- **[Device Management](user-guide/device-management.md)** - Managing connected devices
 
-   # Create and activate virtual environment
-   python -m venv .venv
-   .\.venv\Scripts\activate
+### 🛠️ Development (`/development/`)
+Documentation for developers:
+- **[Development Setup](development/dev-setup.md)** - Setting up development environment
+- **[Testing](development/testing.md)** - Running tests and validation
+- **[MesmerIntiface Complete](development/mesmerintiface-complete.md)** - Technical implementation details
 
-   # Install dependencies
-   pip install -r requirements.txt
-   ```
+### 🔧 Technical Reference (`/technical/`)
+Technical specifications and architecture:
+- **[Audio Engine](technical/audio-engine.md)** - Audio processing system
+- **[Video Engine](technical/video-engine.md)** - Video overlay system
+- **[Device Control](technical/device-control.md)** - Device communication protocols
+- **[UI Components](technical/ui-components.md)** - User interface architecture
+- **[Virtual Devices](technical/virtual-devices.md)** - Virtual device simulation
+- **[CLI Interface](technical/cli-interface.md)** - Command line interface
 
-2. Running the Application:
-   ```powershell
-   # Start GUI mode
-   python run.py
+## 🚀 Quick Start
 
-   # Or use CLI mode
-   python run.py --help
-   ```
+1. **New Users**: Start with [Installation](user-guide/installation.md)
+2. **Developers**: Begin with [Development Setup](development/dev-setup.md)
+3. **Technical Details**: Explore the [Technical Reference](technical/)
 
-## Core Components
-- [Video Engine](video-engine.md) - Handles video playback and effects
-- [Audio Engine](audio-engine.md) - Processes audio input and synchronization
-- [Device Control](device-control.md) - Manages device connections and commands
-- [UI Components](ui-components.md) - User interface and control panels
-- [CLI Interface](cli-interface.md) - Command-line tools and testing
+## 📝 Contributing
 
-## Development Guide
-- [Setting Up Dev Environment](dev-setup.md)
-- [Testing Guide](testing.md)
-- [Virtual Device Testing](virtual-devices.md)
-- [Contributing Guidelines](contributing.md)
+When adding new documentation:
+- Place user-facing docs in `/user-guide/`
+- Place development docs in `/development/`
+- Place technical specs in `/technical/`
+- Update this README with new document links
 
-## Usage Guides
-- [Basic Usage](basic-usage.md)
-- [Advanced Features](advanced-features.md)
-- [Troubleshooting](troubleshooting.md)
+## 🆘 Support
 
-## Support
-For issues and feature requests, please use the [GitHub Issues](https://github.com/Ashyy0205/MesmerGlass/issues) page.
+If you need help:
+1. Check the relevant documentation section
+2. Review [Testing](development/testing.md) for troubleshooting
+3. Open an issue on the project repository

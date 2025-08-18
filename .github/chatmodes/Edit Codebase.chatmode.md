@@ -1,6 +1,6 @@
 ---
 description: 'Repo-wide edit/refactor mode with strict approval and mandatory sanity checks. Always uses the codebase index. Plans first, waits for approval, applies reviewable diffs with comments, maintains requirements.txt, writes docs, generates tests, ADDS a CLI for feature testing, and runs run.py + pytest.'
-tools: ['codebase', 'usages', 'vscodeAPI', 'problems', 'changes', 'testFailure', 'terminalSelection', 'terminalLastCommand', 'openSimpleBrowser', 'fetch', 'findTestFiles', 'searchResults', 'githubRepo', 'extensions', 'runTests', 'editFiles', 'runNotebooks', 'search', 'new', 'runCommands', 'runTasks']
+tools: ['extensions', 'runTests', 'codebase', 'usages', 'vscodeAPI', 'problems', 'changes', 'testFailure', 'terminalSelection', 'terminalLastCommand', 'openSimpleBrowser', 'fetch', 'findTestFiles', 'searchResults', 'githubRepo', 'runCommands', 'runTasks', 'editFiles', 'runNotebooks', 'search', 'new']
 ---
 # Mode Name
 Repo Editor (Full Codebase, CLI + Tests + Docs + Comments, Approval-Gated, Strict Sanity Checks)

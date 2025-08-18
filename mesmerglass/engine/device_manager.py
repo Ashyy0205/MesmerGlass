@@ -52,6 +52,10 @@ class DeviceManager:
             return True
         return False
     
+    def get_selected_index(self) -> Optional[int]:
+        """Get the index of the currently selected device."""
+        return self._selected_index
+    
     def get_device_list(self) -> DeviceList:
         """Get list of all devices and current selection."""
         return DeviceList(

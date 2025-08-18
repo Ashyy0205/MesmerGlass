@@ -11,6 +11,7 @@ from PyQt6.QtWidgets import (
 
 from ..engine.audio import Audio2
 from ..engine.pulse import PulseEngine, clamp
+from ..engine.mesmerintiface import MesmerIntifaceServer
 from .overlay import OverlayWindow
 from .pages.textfx import TextFxPage
 from .pages.device import DevicePage
@@ -64,6 +65,10 @@ class Launcher(QMainWindow):
         self.enable_device_sync = False
         self.enable_buzz_on_flash = True; self.buzz_intensity = 0.6
         self.enable_bursts = False; self.burst_min_s = 25; self.burst_max_s = 60; self.burst_peak = 0.9; self.burst_max_ms = 2000
+
+        # MesmerIntiface server for pure Python device control
+        self.mesmer_server = None
+        self.device_scan_in_progress = False
 
         self.overlays: List[OverlayWindow] = []; self.running = False
 
@@ -150,6 +155,8 @@ class Launcher(QMainWindow):
 
         # Device wiring
         self.page_device.enableSyncChanged.connect(self._on_toggle_device_sync)
+        self.page_device.scanDevicesRequested.connect(self._on_scan_devices)
+        self.page_device.deviceSelected.connect(self._on_device_selected)
         self.page_device.buzzOnFlashChanged.connect(lambda b:setattr(self, "enable_buzz_on_flash", b))
         self.page_device.buzzIntensityChanged.connect(lambda v:setattr(self, "buzz_intensity", v/100.0))
         self.page_device.burstsEnableChanged.connect(lambda b:setattr(self, "enable_bursts", b))
@@ -284,7 +291,117 @@ class Launcher(QMainWindow):
             self.audio.load2(f); self._set_vols(self.vol1, self.vol2); self._refresh_status()
 
     def _set_vols(self, v1, v2): self.vol1, self.vol2 = v1, v2; self.audio.set_vols(v1, v2)
-    def _on_toggle_device_sync(self, b: bool): self.enable_device_sync = b; self._refresh_status()
+    def _on_toggle_device_sync(self, b: bool): 
+        self.enable_device_sync = b
+        
+        # Initialize or shutdown MesmerIntiface server
+        if b and not self.mesmer_server:
+            try:
+                self.mesmer_server = MesmerIntifaceServer(port=12350)
+                self.mesmer_server.start()
+                print("🚀 MesmerIntiface server started on port 12350")
+            except Exception as e:
+                print(f"❌ Failed to start MesmerIntiface server: {e}")
+                self.mesmer_server = None
+                
+        elif not b and self.mesmer_server:
+            try:
+                import asyncio
+                asyncio.create_task(self.mesmer_server.shutdown())
+                self.mesmer_server = None
+                print("🛑 MesmerIntiface server stopped")
+            except Exception as e:
+                print(f"❌ Error stopping MesmerIntiface server: {e}")
+                
+        self._refresh_status()
+    
+    def _on_scan_devices(self):
+        """Handle device scan request."""
+        if self.device_scan_in_progress or not self.mesmer_server:
+            return
+            
+        self.device_scan_in_progress = True
+        
+        # Start scanning in background
+        import asyncio
+        import threading
+        
+        def scan_task():
+            try:
+                # Run async scan
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                
+                async def do_scan():
+                    print("🔍 Starting Bluetooth device scan...")
+                    success = await self.mesmer_server.start_real_scanning()
+                    if success:
+                        # Scan for 8 seconds
+                        await asyncio.sleep(8.0)
+                        await self.mesmer_server.stop_real_scanning()
+                        
+                        # Get device list and update UI
+                        device_list = self.mesmer_server.get_device_list()
+                        
+                        # Update UI on main thread
+                        from PyQt6.QtCore import QTimer
+                        QTimer.singleShot(0, lambda: self._update_device_list_ui(device_list))
+                        
+                        print(f"✅ Scan completed - found {len(device_list.devices)} device(s)")
+                    else:
+                        print("❌ Failed to start Bluetooth scan")
+                        QTimer.singleShot(0, lambda: self._scan_completed(None))
+                
+                loop.run_until_complete(do_scan())
+                loop.close()
+                
+            except Exception as e:
+                print(f"❌ Scan error: {e}")
+                from PyQt6.QtCore import QTimer
+                QTimer.singleShot(0, lambda: self._scan_completed(None))
+            finally:
+                self.device_scan_in_progress = False
+                
+        threading.Thread(target=scan_task, daemon=True).start()
+    
+    def _update_device_list_ui(self, device_list):
+        """Update UI with scan results (called on main thread)."""
+        self.page_device.update_device_list(device_list)
+        self.device_scan_in_progress = False
+        
+        # Also tell pulse engine about devices if sync is enabled
+        if self.enable_device_sync and device_list.devices:
+            # Update pulse engine's device manager
+            for device in device_list.devices:
+                self.pulse.device_manager.add_device({
+                    "DeviceIndex": device.index,
+                    "DeviceName": device.name,
+                    "DeviceMessages": device.device_messages
+                })
+    
+    def _scan_completed(self, device_list):
+        """Handle scan completion."""
+        self.device_scan_in_progress = False
+        if device_list:
+            self._update_device_list_ui(device_list)
+    
+    def _on_device_selected(self, device_idx: int):
+        """Handle device selection."""
+        if not self.mesmer_server:
+            return
+            
+        print(f"🎯 Selecting device index {device_idx}")
+        
+        # Update pulse engine selection
+        if hasattr(self.pulse, 'select_device_by_index'):
+            self.pulse.select_device_by_index(device_idx)
+        elif hasattr(self.pulse, 'device_manager'):
+            self.pulse.device_manager.select_device(device_idx)
+            
+        # Update UI
+        device_list = self.mesmer_server.get_device_list()
+        device_list.selected_index = device_idx
+        self.page_device.update_device_list(device_list)
 
     def _refresh_status(self):
         self.chip_overlay.setText(f"Overlay: {'Running' if self.running else 'Idle'}")
@@ -375,6 +492,19 @@ class Launcher(QMainWindow):
         """Handle application close."""
         if self.dev_tools:
             self.dev_tools.close()
+            
+        # Shutdown MesmerIntiface server
+        if self.mesmer_server:
+            try:
+                import asyncio
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(self.mesmer_server.shutdown())
+                loop.close()
+                print("🛑 MesmerIntiface server shut down")
+            except Exception as e:
+                print(f"❌ Error shutting down MesmerIntiface server: {e}")
+                
         super().closeEvent(event)
         self.overlays.clear()
         self.audio.stop()

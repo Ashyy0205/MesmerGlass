@@ -4,6 +4,10 @@ pygame
 websockets
 numpy
 
+# Real device control dependencies
+bleak>=0.21.0          # Bluetooth Low Energy support
+cffi>=1.15.0           # C Foreign Function Interface for Rust bindings
+
 # Testing dependencies
 pytest
 pytest-asyncio

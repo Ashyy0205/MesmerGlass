@@ -1,277 +1,161 @@
-# Mesmer Glass
+# MesmerGlass 🌟
 
-  
+**MesmerGlass** is a sophisticated desktop overlay application that creates hypnotic visual experiences with synchronized device control. Built with PyQt6, it provides real-time video effects, text animations, and seamless device synchronization through our pure Python **MesmerIntiface** system.
 
-**Mesmer Glass** is a desktop overlay that blends hypnotic visuals and timed text prompts with optional, *consensual* device feedback. It runs above everything on your screen, stays click‑through, and can span multiple displays—so you can keep using your computer while it runs a session in the background.
+## ✨ Features
 
-  
+- **🎬 Video Overlay System** - Real-time video effects and overlays across multiple displays
+- **📝 Text & Visual Effects** - Customizable text animations with hypnotic effects
+- **🎮 Device Control** - Native Bluetooth device control without external dependencies
+- **🎵 Audio Synchronization** - Audio-reactive effects and synchronization
+- **🔧 Developer Tools** - Built-in debugging and testing tools
+- **🖥️ Multi-Display Support** - Span effects across multiple monitors
+- **🎯 Click-Through Interface** - Non-intrusive overlay that doesn't interfere with other applications
 
----
+## 🚀 Quick Start
 
-  
+### Prerequisites
+- **Windows 10/11, macOS, or Linux**
+- **Python 3.12+** (64-bit)
+- **Bluetooth LE support** (for device control)
 
-## Install (Windows 10/11)
+### Installation
 
-  
+1. **Clone the repository:**
+   ```bash
+   git clone https://github.com/Ashyy0205/MesmerGlass.git
+   cd MesmerGlass
+   ```
 
-### 1) Get Python
+2. **Create and activate virtual environment:**
+   ```bash
+   python -m venv .venv
+   
+   # Windows
+   .\.venv\Scripts\activate
+   
+   # macOS/Linux  
+   source .venv/bin/activate
+   ```
 
-- Install **Python 3.12 (64‑bit)** from [python.org](https://www.python.org/downloads/).  
+3. **Install dependencies:**
+   ```bash
+   pip install -r requirements.txt
+   ```
 
-  ✅ During install, **check “Add python.exe to PATH.”**  
+4. **Run MesmerGlass:**
+   ```bash
+   python run.py
+   ```
 
-  *If you already have the Microsoft Store Python, prefer using the `py` launcher in the steps below.*
+## 🎮 Device Control with MesmerIntiface
 
-  
+MesmerGlass includes **MesmerIntiface** - a pure Python implementation for direct Bluetooth device control:
 
-### 2) Prepare a folder
+### ✅ **No External Dependencies**
+- No Rust compilation required
+- No Intiface Central needed
+- Direct Bluetooth LE communication
 
-Put `MesmerGlass.py` (or your current script) in a new folder, e.g. `C:\MesmerGlass\`.
+### 🔧 **Supported Devices**
+- **Lovense**: Lush, Max, Nora, Edge, Hush, Domi, Calor
+- **We-Vibe**: Sync, Pivot, Nova
+- **Extensible** for additional manufacturers
 
-  
+### 📡 **Quick Device Setup**
+1. Enable Bluetooth on your system
+2. Put your device in pairing mode
+3. In MesmerGlass: **Device Sync** → **Scan for devices**
+4. Select your device and start your session!
 
-### 3) Create a virtual environment
+## 📚 Documentation
 
-Open **Windows PowerShell** in that folder and run:
+### 📖 **User Guides**
+- [📥 Installation Guide](docs/user-guide/installation.md) - Detailed setup instructions
+- [⚡ Features Overview](docs/user-guide/features.md) - Complete feature walkthrough  
+- [🎮 Device Management](docs/user-guide/device-management.md) - Device setup and control
 
-```powershell
+### 🛠️ **Development**
+- [🔧 Development Setup](docs/development/dev-setup.md) - Setup development environment
+- [🧪 Testing Guide](docs/development/testing.md) - Running tests and validation
+- [📋 MesmerIntiface Technical](docs/development/mesmerintiface-complete.md) - Implementation details
 
-py -3.12 -m venv .venv
+### 🔍 **Technical Reference**
+- [🎵 Audio Engine](docs/technical/audio-engine.md) - Audio processing system
+- [🎬 Video Engine](docs/technical/video-engine.md) - Video overlay architecture
+- [📡 Device Control](docs/technical/device-control.md) - Communication protocols
 
-.\.venv\Scripts\Activate.ps1
+## 🎯 Examples
 
-python -m pip install --upgrade pip wheel
+Explore our example scripts in the [`examples/`](examples/) directory:
 
+### Device Control
+```bash
+# Full MesmerIntiface demonstration
+python examples/device_control/demo_mesmer_intiface.py
+
+# Basic device testing
+python examples/device_control/basic_device_test.py
 ```
 
-  
-
-### 4) Install dependencies
-
-Either install from the provided requirements file:
-
-```powershell
-
-pip install -r requirements.txt
-
+### Testing & Validation
+```bash
+# Integration validation
+python examples/testing/integration_validation.py
 ```
 
-…or install packages one by one:
-
-```powershell
-
-pip install pyqt6 opencv-python av pygame websockets numpy
+## 🏗️ Project Structure
 
 ```
-
-  
-
-> If `pip` warns about not being on PATH, use the `py -3.12 -m pip install …` form instead.
-
-  
-
-### 5) (Optional) Set up Intiface for device control
-
-- Install **Intiface Central**.
-
-- Open it and click **Start Server** (default endpoint `ws://127.0.0.1:12345`).
-
-- Open **Device Manager → Start Scanning** and pair your toy. Ensure it shows as **Connected**.
-
-- Keep Intiface running while you use Mesmer Glass.
-
-  
-
-### 6) Run Mesmer Glass
-
-From the same PowerShell (with the venv active):
-
-```powershell
-
-python MesmerGlass.py
-
+MesmerGlass/
+├── mesmerglass/                    # Main application code
+│   ├── engine/                     # Core engines
+│   │   ├── mesmerintiface/        # Pure Python device control
+│   │   ├── audio.py               # Audio processing
+│   │   ├── video.py               # Video overlay
+│   │   └── pulse.py               # Device synchronization
+│   ├── ui/                        # User interface
+│   └── tests/                     # Test suite
+├── docs/                          # Documentation
+│   ├── user-guide/               # User documentation
+│   ├── development/              # Developer guides  
+│   └── technical/                # Technical references
+├── examples/                      # Example scripts
+│   ├── device_control/           # Device control examples
+│   └── testing/                  # Testing utilities
+└── requirements.txt              # Dependencies
 ```
 
+## 🤝 Contributing
 
-  
+We welcome contributions! Please see our [development documentation](docs/development/) for:
 
----
+- [Development Setup](docs/development/dev-setup.md)
+- [Testing Guidelines](docs/development/testing.md)
+- Code style and conventions
 
-  
+## 🛠️ System Requirements
 
-## What it does (current features)
+### Minimum Requirements
+- **OS**: Windows 10, macOS 10.15, or Linux (Ubuntu 20.04+)
+- **Python**: 3.12 or higher
+- **RAM**: 4GB minimum, 8GB recommended
+- **GPU**: DirectX 11/OpenGL 3.3 compatible
 
-  
+### For Device Control
+- **Bluetooth LE**: Built-in or USB adapter
+- **Supported Devices**: See [device compatibility](docs/user-guide/device-management.md)
 
-- **Click‑through glass overlay** (always on top, non‑interactive).
+## 📄 License
 
-- **Primary & secondary video layers** with independent opacity.
+This project is licensed under the MIT License - see the LICENSE file for details.
 
-- **Text flash** centered on screen, with **alpha = primary video opacity + 2%** (clamped) and **Screen** blend so white stays bright at low opacity.
+## 🆘 Support
 
-- **Hypnotic text effects** (Breath + Sway, Shimmer, Tunnel, Subtle) with intensity control and auto-fit sizing.
-
-- **Custom fonts & colors** (add your own TTF/OTF).
-
-- **Dual audio tracks** with individual volume (looped).
-
-- **Optional device sync** via **Intiface/Buttplug v3 over WebSocket**:
-
-  - **Buzz on Flash:** every text flash triggers a pulse (duration = Flash Width).
-
-  - **Random bursts:** occasional micro-patterns (hit, wave, edge) within your min/max spacing, peak, and duration.
-
-- **Multi-display launch**—pick which screens to use.
-
-- **Resilient connection**—background WS loop with simple reconnects; zeroes device output on exit.
-
-  
+- 📖 **Documentation**: Start with our [user guides](docs/user-guide/)
+- 🐛 **Issues**: Report bugs on [GitHub Issues](https://github.com/Ashyy0205/MesmerGlass/issues)
+- 💬 **Discussions**: Join conversations in [GitHub Discussions](https://github.com/Ashyy0205/MesmerGlass/discussions)
 
 ---
 
-  
-
-## Terminology
-
-  
-
-- **Flash Interval (ms):** how often the text appears.
-
-- **Flash Width (ms):** how long the text stays visible *per flash*. When **Buzz on Flash** is enabled, Flash Width = **pulse duration**.
-
-  
-
----
-
-  
-
-## Quick start (how to use)
-
-  
-
-1. **Select videos**
-
-   - **Primary video** (required) and optional **Secondary** overlay video.
-
-   - Set **Primary Opacity** and **Secondary Opacity** to taste.
-
-  
-
-2. **Configure text**
-
-   - Enter your **Message**.
-
-   - Choose **Font** (add TTF/OTF if you want), **Text Size**, **Color**.
-
-   - Pick an **FX preset** and set **Intensity**.
-
-   - Enable **Flash** and set **Interval** (how often) and **Flash Width** (how long it shows).  
-
-     *Flash Width also sets the device pulse duration when Buzz on Flash is enabled.*
-
-  
-
-3. **Audio (optional)**
-
-   - Load **Audio 1** and **Audio 2**, set volumes. Both loop.
-
-  
-
-4. **Device sync (optional)**
-
-   - Enable **Buzz on Flash** and set **Intensity** (strength of the pulse).
-
-   - Toggle **Random Bursts**, then tune **min/max delay**, **max intensity**, and **max duration**.
-
-   - Use **Test Burst** to verify output.
-
-  
-
-5. **Displays**
-
-   - Tick the monitors where you want the overlay to appear.
-
-  
-
-6. **Launch**
-
-   - Click **Launch Overlay**. The overlays will full‑screen on the selected monitors, the audio will start, and the device engine will connect.  
-
-   - Close the main window to stop everything; outputs are zeroed on exit.
-
-  
-
----
-
-  
-
-## Troubleshooting
-
-  
-
-**`pip` errors / cannot import**  
-
-- Ensure your virtual environment is **activated** (`.\.venv\Scripts\Activate.ps1`).  
-
-- Use the launcher explicitly: `py -3.12 -m pip install ...`  
-
-- Upgrade pip/wheel: `python -m pip install -U pip wheel`
-
-  
-
-**`av` install fails**  
-
-- Make sure you’re on **Python 3.10–3.12** (32‑bit builds are not recommended).  
-
-- Try `pip install "av>=11,<12"`
-
-  
-
-**No devices found**  
-
-- Ensure Intiface Central is **running** and the **Server** is started (`ws://127.0.0.1:12345`).  
-
-- Pair your device in **Device Manager** and verify it shows as **Connected**.  
-
-- Close vendor apps that might own the BLE connection.  
-
-- Toggle device power/BLE and rescan.
-
-  
-
-**WS timeouts**  
-
-- Avoid OS sleep/BT power‑saver during sessions. Restart the Intiface Server if the link stalls.
-
-  
-
-**Audio memory usage**  
-
-- Large WAVs use more RAM with `pygame`. Prefer MP3/OGG for now. (Planned: switch to streaming audio backend.)
-
-  
-
-**Overlay not click‑through**  
-
-- Rare GPU/Qt combos can misbehave. Run non‑admin, disable other overlays, and keep GPU drivers current. (Planned: Win32 layered/transparent fallback.)
-
-
----
-
-  
-
-## Credits
-
-  
-
-- **Buttplug/Intiface**, **PyQt6**, **OpenCV**, **PyAV**, **pygame**, **websockets**.
-
-  
-
-## License & privacy
-
-  
-
-- Runs locally; no cloud calls.  
-
-- Use responsibly. Keep sessions consensual and within the law where you live.
+**⚠️ Disclaimer**: MesmerGlass is designed for consensual adult use only. Always ensure proper consent and communication when using device control features.
