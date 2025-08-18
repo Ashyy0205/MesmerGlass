@@ -1,9 +1,11 @@
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QLabel, QGroupBox, QSlider, QHBoxLayout, QWidget as QW,
-    QPushButton
+    QPushButton, QDialog
 )
 from ..widgets import ToggleSwitch, UnitSpin
+from ..dialogs.device_selection import DeviceSelectionDialog
+from ...engine.device_manager import DeviceList
 
 
 # ---------- tiny helpers ----------
@@ -41,6 +43,8 @@ def _pct_label(v: int) -> QLabel:
 class DevicePage(QWidget):
     # signals to launcher
     enableSyncChanged   = pyqtSignal(bool)
+    scanDevicesRequested = pyqtSignal()         # Request device scan
+    deviceSelected      = pyqtSignal(int)       # Device index selected
     buzzOnFlashChanged  = pyqtSignal(bool)
     buzzIntensityChanged = pyqtSignal(int)      # 0..100
     burstsEnableChanged = pyqtSignal(bool)
@@ -63,6 +67,7 @@ class DevicePage(QWidget):
         parent=None,
     ):
         super().__init__(parent)
+        self._current_device_list = None  # Track available devices
 
         root = QVBoxLayout(self)
         root.setContentsMargins(6, 6, 6, 6)
@@ -71,12 +76,38 @@ class DevicePage(QWidget):
         # 1) Master bubble
         card_enable = _card("Device sync")
         cv = QVBoxLayout(card_enable); cv.setContentsMargins(12, 8, 12, 8); cv.setSpacing(4)
+        
+        # Connection toggle
         self.sw_enable, row_en = _toggle_line(
             "Enable device sync (Buttplug)",
             "Connect to Intiface/Buttplug at ws://127.0.0.1:12345 and drive toys.",
             enable_sync,
         )
         cv.addWidget(row_en)
+        
+        # Device scanning and selection
+        scan_widget = QWidget()
+        scan_layout = QHBoxLayout(scan_widget)
+        scan_layout.setContentsMargins(10, 6, 10, 6)
+        scan_layout.setSpacing(10)
+        
+        # Device control row
+        self.scan_button = QPushButton("Scan for devices")
+        self.scan_button.setToolTip("Search for available Buttplug devices")
+        self.scan_button.clicked.connect(self._on_scan_clicked)
+        scan_layout.addWidget(self.scan_button)
+        
+        self.select_button = QPushButton("Select device")
+        self.select_button.setToolTip("Choose which device to use")
+        self.select_button.clicked.connect(self._on_select_clicked)
+        self.select_button.setEnabled(False)  # Enable when devices found
+        scan_layout.addWidget(self.select_button)
+        
+        self.device_label = QLabel("No devices found")
+        self.device_label.setStyleSheet("color: gray;")
+        scan_layout.addWidget(self.device_label, 1)  # Give label remaining space
+        
+        cv.addWidget(scan_widget)
         root.addWidget(card_enable)
 
         # 2) Buzz-on-flash bubble (toggle + intensity on separate lines)
@@ -148,6 +179,48 @@ class DevicePage(QWidget):
     def _on_peak(self, v: int):
         self.lab_peak.setText(f"{v}%")
         self.burstPeakChanged.emit(v)
+        
+    def _on_scan_clicked(self):
+        """Request a device scan."""
+        self.scan_button.setEnabled(False)
+        self.scan_button.setText("Scanning...")
+        self.scanDevicesRequested.emit()
+        
+    def _on_select_clicked(self):
+        """Show device selection dialog."""
+        if not self._current_device_list:
+            return
+            
+        dialog = DeviceSelectionDialog(self._current_device_list, self)
+        dialog.deviceSelected.connect(self._on_device_selected)
+        dialog.exec()
+        
+    def _on_device_selected(self, device_idx: int):
+        """Handle device selection."""
+        self.deviceSelected.emit(device_idx)
+        
+    def update_device_list(self, device_list: "DeviceList"):
+        """Update UI with new device list."""
+        self._current_device_list = device_list
+        self.scan_button.setEnabled(True)
+        self.scan_button.setText("Scan for devices")
+        
+        # Update UI
+        if not device_list.devices:
+            self.device_label.setText("No devices found")
+            self.device_label.setStyleSheet("color: gray;")
+            self.select_button.setEnabled(False)
+        else:
+            num_devices = len(device_list.devices)
+            if device_list.selected_index is not None:
+                selected = next((d for d in device_list.devices if d.index == device_list.selected_index), None)
+                if selected:
+                    self.device_label.setText(f"Using: {selected.name}")
+                    self.device_label.setStyleSheet("color: green;")
+            else:
+                self.device_label.setText(f"{num_devices} device{'s' if num_devices != 1 else ''} found")
+                self.device_label.setStyleSheet("color: black;")
+            self.select_button.setEnabled(True)
 
     # --- ui logic ---
     def _apply_enabled_states(self):
@@ -157,3 +230,8 @@ class DevicePage(QWidget):
         bursts_enabled = self.sw_enable.isChecked() and self.sw_bursts.isChecked()
         for w in (self.spin_min, self.spin_max, self.sld_peak, self.spin_max_ms):
             w.setEnabled(bursts_enabled)
+            
+        # Device controls
+        scan_enabled = self.sw_enable.isChecked()
+        self.scan_button.setEnabled(scan_enabled)
+        self.select_button.setEnabled(scan_enabled and bool(self._current_device_list and self._current_device_list.devices))

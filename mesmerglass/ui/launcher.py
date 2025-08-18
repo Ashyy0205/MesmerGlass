@@ -15,6 +15,7 @@ from .overlay import OverlayWindow
 from .pages.textfx import TextFxPage
 from .pages.device import DevicePage
 from .pages.audio import AudioPage  # <-- NEW
+from .devtools import DevToolsWindow  # <-- Dev Tools
 
 
 # ---- tiny helpers used by pages built in this file ----
@@ -46,8 +47,14 @@ class Launcher(QMainWindow):
         # ---------- state ----------
         self.primary_path = ""; self.secondary_path = ""
         self.primary_op = 0.10; self.secondary_op = 0.0
+        self.dev_mode = False
+        self.dev_tools = None  # Will be created when needed
 
         self.text = "RELAX"; self.text_color = QColor("#FFFFFF"); self.font = QFont("Segoe UI", 64)
+        
+        # Dev mode shortcut (Ctrl+Shift+D)
+        self.dev_shortcut = QShortcut(QKeySequence("Ctrl+Shift+D"), self)
+        self.dev_shortcut.activated.connect(self.toggle_dev_mode)
         self.text_scale_pct = 22; self.fx_mode = "Breath + Sway"; self.fx_intensity = 70
         self.flash_interval_ms = 1500; self.flash_width_ms = 200
 
@@ -352,6 +359,23 @@ class Launcher(QMainWindow):
                 if hasattr(ov, "_flash_sync_timer"): ov._flash_sync_timer.stop()
                 ov.close()
             except Exception: pass
+                
+    def toggle_dev_mode(self):
+        """Toggle development mode with virtual toy support."""
+        self.dev_mode = not self.dev_mode
+        if self.dev_mode:
+            if not self.dev_tools:
+                self.dev_tools = DevToolsWindow(self)
+            self.dev_tools.show()
+        else:
+            if self.dev_tools:
+                self.dev_tools.close()
+                
+    def closeEvent(self, event):
+        """Handle application close."""
+        if self.dev_tools:
+            self.dev_tools.close()
+        super().closeEvent(event)
         self.overlays.clear()
         self.audio.stop()
         try: self.pulse.set_level(0.0)

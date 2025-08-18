@@ -4,3 +4,8 @@ pygame
 websockets
 numpy
 
+# Testing dependencies
+pytest
+pytest-asyncio
+pytest-timeout
+

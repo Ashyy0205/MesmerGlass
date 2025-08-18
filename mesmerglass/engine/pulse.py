@@ -7,7 +7,7 @@ from typing import Optional, Any
 
 import websockets  # websockets>=10
 from websockets.exceptions import ConnectionClosed
-from ..tests.mock_server import MockServer
+from .buttplug_server import ButtplugServer
 
 WS_URL_DEFAULT = "ws://127.0.0.1:12345"
 
@@ -54,7 +54,7 @@ class PulseEngine:
                     continue
         return False
 
-    def __init__(self, url: str = WS_URL_DEFAULT, quiet: bool = False) -> None:
+    def __init__(self, url: str = WS_URL_DEFAULT, quiet: bool = False, server: Optional[ButtplugServer] = None) -> None:
         self.url = url
         self.quiet = quiet
 
@@ -71,8 +71,8 @@ class PulseEngine:
         self._pending: list[_PulseReq] = []
         self._last_level: float = 0.0
         
-        # Initialize mock server
-        self._server = MockServer(port=int(url.split(":")[-1]))
+        # Use provided server or create a new one
+        self._server = server or ButtplugServer(port=int(url.split(":")[-1]))
 
     # ---------------- public API (UI thread) ----------------
     def start(self) -> None:
