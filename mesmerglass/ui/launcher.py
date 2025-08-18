@@ -132,7 +132,6 @@ class Launcher(QMainWindow):
 
         # Device wiring
         self.page_device.enableSyncChanged.connect(self._on_toggle_device_sync)
-        self.page_device.launchIntifaceRequested.connect(lambda: self.pulse.launch_intiface())
         self.page_device.buzzOnFlashChanged.connect(lambda b:setattr(self, "enable_buzz_on_flash", b))
         self.page_device.buzzIntensityChanged.connect(lambda v:setattr(self, "buzz_intensity", v/100.0))
         self.page_device.burstsEnableChanged.connect(lambda b:setattr(self, "enable_bursts", b))

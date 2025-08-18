@@ -1,6 +1,6 @@
 ---
 description: 'Full repository editing/refactoring mode. Automatically includes the workspace codebase in every query so the assistant can reason across the entire project.'
-tools: ['codebase', 'editFiles']
+tools: ['codebase', 'problems', 'fetch', 'findTestFiles', 'githubRepo', 'runTests', 'editFiles', 'new', 'runCommands', 'runTasks']
 ---
 # Mode Name
 Repo Editor (Full Codebase)

@@ -1,13 +1,12 @@
 from __future__ import annotations
 import asyncio, json, threading, time, traceback, contextlib
-import subprocess
-import os
-from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional, Any
 
 import websockets  # websockets>=10
 from websockets.exceptions import ConnectionClosed
+
+from ..resources.server import ButtplugServer
 
 WS_URL_DEFAULT = "ws://127.0.0.1:12345"
 
@@ -70,14 +69,17 @@ class PulseEngine:
 
         self._pending: list[_PulseReq] = []
         self._last_level: float = 0.0
+        
+        # Initialize bundled server
+        self._server = ButtplugServer(port=int(url.split(":")[-1]))
 
     # ---------------- public API (UI thread) ----------------
     def start(self) -> None:
         if self._enabled:
             return
-            
-        # Try to launch Intiface if needed
-        self.launch_intiface()
+        
+        # Start bundled server
+        self._server.start()
         
         self._enabled = True
         self._should_stop.clear()
@@ -98,6 +100,10 @@ class PulseEngine:
         if t and t.is_alive():
             t.join(timeout=1.5)
         self._thread = None
+        
+        # Stop bundled server
+        self._server.stop()
+        
         if not self.quiet:
             print("[pulse] stopped")
 
