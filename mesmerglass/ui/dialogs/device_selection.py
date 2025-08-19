@@ -2,15 +2,16 @@
 
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QListWidget, QListWidgetItem, QPushButton,
-    QLabel, QDialogButtonBox
+    QLabel, QDialogButtonBox, QAbstractItemView
 )
 from PyQt6.QtCore import Qt, pyqtSignal
 from ...engine.device_manager import DeviceList, Device
 
 class DeviceSelectionDialog(QDialog):
-    """Dialog for selecting Buttplug devices."""
-    
-    deviceSelected = pyqtSignal(int)  # Device index selected
+    """Dialog for selecting Buttplug devices (now supports multi-select)."""
+
+    deviceSelected = pyqtSignal(int)      # Single device index selected (back-compat)
+    devicesSelected = pyqtSignal(object)  # List[int] of selected device indices
     
     def __init__(self, device_list: DeviceList, parent=None):
         super().__init__(parent)
@@ -30,37 +31,41 @@ class DeviceSelectionDialog(QDialog):
         
         # Device list
         self.list_widget = QListWidget()
+        self.list_widget.setSelectionMode(QAbstractItemView.SelectionMode.MultiSelection)
         layout.addWidget(self.list_widget)
         
         # Populate list
-        list_position = 0
         for device_idx, device in enumerate(device_list.devices):
             if self._device_supports_vibration(device):
                 item = QListWidgetItem(f"{device.name}")
                 item.setData(Qt.ItemDataRole.UserRole, device.index)
                 self.list_widget.addItem(item)
-                # Check if this device (at device_idx in the original list) is selected
-                if device_idx == device_list.selected_idx:
+                # Check if this device index is selected (back-compat mirror)
+                if getattr(device_list, "selected_index", None) == device.index:
                     item.setSelected(True)
-                list_position += 1
         
         # Buttons
-        button_box = QDialogButtonBox()
-        select_button = button_box.addButton("Select", QDialogButtonBox.ButtonRole.AcceptRole)
-        cancel_button = button_box.addButton(QDialogButtonBox.StandardButton.Cancel)
-        
+        button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        # Rename Ok to Select for clarity
+        ok_btn = button_box.button(QDialogButtonBox.StandardButton.Ok)
+        if ok_btn is not None:
+            ok_btn.setText("Select")
+
         layout.addWidget(button_box)
-        
+
         # Connect signals
-        select_button.clicked.connect(self.accept)
-        cancel_button.clicked.connect(self.reject)
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
         
     def accept(self):
-        """Handle device selection."""
+        """Handle device selection (emit single and multi-select signals)."""
         items = self.list_widget.selectedItems()
         if items:
-            device_index = items[0].data(Qt.ItemDataRole.UserRole)
-            self.deviceSelected.emit(device_index)
+            indices = [it.data(Qt.ItemDataRole.UserRole) for it in items]
+            # Emit multi-select list
+            self.devicesSelected.emit(indices)
+            # Emit single-select for first item (back-compat callers)
+            self.deviceSelected.emit(indices[0])
         super().accept()
         
     def _device_supports_vibration(self, device: Device) -> bool:

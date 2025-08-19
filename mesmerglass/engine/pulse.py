@@ -57,13 +57,14 @@ class PulseEngine:
                     continue
         return False
 
-    def __init__(self, url: str = WS_URL_DEFAULT, quiet: bool = False, server: Optional[ButtplugServer] = None, use_mesmer: bool = True) -> None:
+    def __init__(self, url: str = WS_URL_DEFAULT, quiet: bool = False, server: Optional[ButtplugServer] = None, use_mesmer: bool = True, allow_auto_select: bool = True) -> None:
         # Respect an explicit URL by default; we'll only override to MesmerIntiface
         # in the common default case (no explicit server provided and using the
         # default classic URL). This keeps tests that pass a custom url/server working.
         self.url = url
         self.quiet = quiet
         self.use_mesmer = use_mesmer  # Use MesmerIntiface instead of external Intiface
+        self.allow_auto_select = bool(allow_auto_select)  # Control auto-select behavior
 
         self._thread: Optional[threading.Thread] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -71,17 +72,18 @@ class PulseEngine:
         self._enabled = False
         self._should_stop = threading.Event()
 
-        self._ws: Optional[websockets.WebSocketClientProtocol] = None
+        # Websocket client protocol type varies across versions; keep it loose.
+        self._ws: Optional[Any] = None
         self._msg_id = 0
         self._device_idx: Optional[int] = None
         self._devices_found = False  # Track if devices have been discovered
 
         self._pending: list[_PulseReq] = []
         self._last_level: float = 0.0
-        
+
         # Device manager for tracking connected devices
         self.device_manager = DeviceManager()
-        
+
         # Use provided server or create a new one
         self._server = server or ButtplugServer(port=int(url.split(":")[-1]))
 
@@ -257,8 +259,11 @@ class PulseEngine:
 
     async def _expect_server_info(self) -> None:
         # Wait until we see a ServerInfo message
+        ws = self._ws
+        if not ws:
+            return
         while True:
-            raw = await asyncio.wait_for(self._ws.recv(), timeout=5.0)
+            raw = await asyncio.wait_for(ws.recv(), timeout=5.0)
             if not self.quiet:
                 logging.getLogger(__name__).debug("<< %s", raw)
             try:
@@ -298,7 +303,12 @@ class PulseEngine:
             asyncio.create_task(self._do_pulse(req.level, req.ms))
             self._pending.remove(req)
 
-    async def _on_message(self, raw: str) -> None:
+    async def _on_message(self, raw: Any) -> None:
+        if isinstance(raw, (bytes, bytearray)):
+            try:
+                raw = raw.decode("utf-8", errors="ignore")
+            except Exception:
+                return
         if not self.quiet:
             logging.getLogger(__name__).debug("<< %s", raw)
         try:
@@ -341,12 +351,13 @@ class PulseEngine:
     def _maybe_select_device(self, dev: dict) -> None:
         # Add device to device manager
         self.device_manager.add_device(dev)
-        
-        # Only auto-select if no device currently selected and no explicit selection made
+
+        # If we already have a device selected, do nothing.
         if self._device_idx is not None:
             return
-            
-        # Check if device manager has a selected device
+
+        # Prefer explicit selection from the device manager (e.g., UI choice),
+        # regardless of allow_auto_select.
         selected_idx = self.device_manager.get_selected_index()
         if selected_idx is not None:
             self._device_idx = selected_idx
@@ -357,8 +368,12 @@ class PulseEngine:
                     dev.get("DeviceName"),
                 )
             return
-            
-        # Auto-select first vibrator device if no explicit selection
+
+        # If auto-select is disabled, stop here.
+        if not self.allow_auto_select:
+            return
+
+        # Auto-select first vibrator-capable device as a fallback.
         idx = dev.get("DeviceIndex")
         msgs = dev.get("DeviceMessages", {})
         scalars = msgs.get("ScalarCmd", [])

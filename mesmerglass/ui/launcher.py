@@ -57,17 +57,19 @@ class Launcher(QMainWindow):
         # ---------- state ----------
         self.primary_path = ""; self.secondary_path = ""
         self.primary_op = 0.10; self.secondary_op = 0.0
-    # Dev tools UI removed; keep flags absent to avoid accidental use
+        # Dev tools UI removed; keep flags absent to avoid accidental use
 
         self.text = "RELAX"; self.text_color = QColor("#FFFFFF"); self.font = QFont("Segoe UI", 64)
-        
-    # Dev tools shortcut removed
+
+        # Dev tools shortcut removed
         self.text_scale_pct = 22; self.fx_mode = "Breath + Sway"; self.fx_intensity = 70
         self.flash_interval_ms = 1500; self.flash_width_ms = 200
 
         self.audio = Audio2(); self.audio1_path = ""; self.audio2_path = ""; self.vol1 = 0.6; self.vol2 = 0.5
 
-        self.pulse = PulseEngine(quiet=True)
+        # Disable auto-select fallback in the engine; selection must be explicit.
+        self.pulse = PulseEngine(quiet=True, allow_auto_select=False)
+
         # Allow callers (like CLI) to disable device-sync side effects at construction time.
         # This avoids starting BLE/servers when running quick UI navigation commands.
         self.enable_device_sync = bool(enable_device_sync_default)
@@ -78,11 +80,12 @@ class Launcher(QMainWindow):
         self.mesmer_server = None
         self.device_scan_in_progress = False
 
-        self.overlays: List[OverlayWindow] = []; self.running = False
+        self.overlays: List[OverlayWindow] = []
+        self.running = False
 
         self._build_ui()
         self._bind_shortcuts()
-        
+
         # Auto-start MesmerIntiface server if device sync is enabled
         if self.enable_device_sync:
             self._start_mesmer_server()
@@ -436,11 +439,7 @@ class Launcher(QMainWindow):
         self.page_device.update_device_list(device_list)
         logging.getLogger(__name__).debug("Called update_device_list on device page")
         
-        # Auto-select single device
-        if len(device_list.devices) == 1:
-            device = device_list.devices[0]
-            logging.getLogger(__name__).info("Auto-selecting single device: %s (index %s)", device.name, device.index)
-            self._on_device_selected(device.index)
+    # Do not auto-select devices; user must choose explicitly.
         
         # Also tell pulse engine about devices if sync is enabled
         if self.enable_device_sync and device_list.devices:
