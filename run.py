@@ -1,4 +1,7 @@
-"""MesmerGlass CLI and GUI launcher."""
+"""MesmerGlass CLI and GUI launcher.
+
+Adds structured logging flags and config to aid debugging and support.
+"""
 
 import sys
 import argparse
@@ -9,7 +12,7 @@ from typing import Optional
 from mesmerglass.app import run
 from mesmerglass.engine.pulse import PulseEngine
 from mesmerglass.engine.buttplug_server import ButtplugServer
-from mesmerglass.tests.virtual_toy import VirtualToy
+from mesmerglass.logging_utils import setup_logging, get_default_log_path
 
 # Monkey patch to suppress Bleak event loop closure errors
 def patch_bleak_errors():
@@ -42,49 +45,30 @@ def patch_bleak_errors():
 # Apply the patch
 patch_bleak_errors()
 
-async def cli_test_device(intensity: float = 0.5, duration_ms: int = 1000, server_port: int = 12345):
-    """Test a device with specific intensity."""
-    print(f"[cli] Starting device test (intensity={intensity}, duration={duration_ms}ms)")
-    
-    # Start server
-    server = ButtplugServer(port=server_port)
-    server.start()
-    print("[cli] Server started")
-    
-    # Create and connect virtual toy
-    toy = VirtualToy(name="CLI Test Toy", port=server_port)
-    connected = await toy.connect()
-    if not connected:
-        print("[cli] Failed to connect virtual toy")
-        server.stop()
-        return
-    print("[cli] Virtual toy connected")
-    
-    # Start pulse engine
-    engine = PulseEngine()
-    engine.start()  # This runs in its own thread
-    print("[cli] Pulse engine started")
-    
-    # Allow time for engine to connect
-    await asyncio.sleep(1.0)
-    
-    # Send test pulse
-    print(f"[cli] Sending pulse: {intensity*100}% for {duration_ms}ms")
-    engine.pulse(intensity, duration_ms)
-    
-    # Wait for pulse to complete
-    await asyncio.sleep(duration_ms/1000.0 + 0.1)
-    
-    # Cleanup
-    await toy.disconnect()
-    server.stop()
-    engine.stop()
-    await asyncio.sleep(0.5)  # Allow time for cleanup
-    print("[cli] Test complete")
+"""Legacy runner remains for convenience; virtual toy ops removed."""
 
 def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description="MesmerGlass - CLI and GUI Interface")
+
+    # Global logging options
+    parser.add_argument(
+        "--log-level",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        default="INFO",
+        help="Set log level (default: INFO)",
+    )
+    parser.add_argument(
+        "--log-file",
+        default=str(get_default_log_path()),
+        help="Path to log file (default: per-user MesmerGlass directory)",
+    )
+    parser.add_argument(
+        "--log-format",
+        choices=["plain", "json"],
+        default="plain",
+        help="Log format (plain or json-like)",
+    )
     
     # Add command subparsers
     subparsers = parser.add_subparsers(dest="command", help="Command to run")
@@ -101,13 +85,6 @@ def parse_args():
     test_parser.add_argument("-p", "--port", type=int, default=12345,
                            help="Server port")
                            
-    # Virtual toy command
-    toy_parser = subparsers.add_parser("toy", help="Start a virtual toy")
-    toy_parser.add_argument("-n", "--name", type=str, default="CLI Virtual Toy",
-                          help="Toy name")
-    toy_parser.add_argument("-p", "--port", type=int, default=12345,
-                          help="Server port")
-                          
     # Server command
     server_parser = subparsers.add_parser("server", help="Start a Buttplug server")
     server_parser.add_argument("-p", "--port", type=int, default=12345,
@@ -115,50 +92,35 @@ def parse_args():
     
     return parser.parse_args()
 
-async def run_virtual_toy(name: str, port: int):
-    """Run a virtual toy in CLI mode."""
-    toy = VirtualToy(name=name, port=port)
-    print(f"[cli] Starting virtual toy: {name} on port {port}")
-    connected = await toy.connect()
-    if not connected:
-        print("[cli] Failed to connect toy")
-        return
-    print("[cli] Virtual toy connected and running")
-    try:
-        while True:
-            await asyncio.sleep(1)
-            level = toy.state.level
-            if level > 0:
-                print(f"[cli] Toy level: {int(level*100)}%")
-    except KeyboardInterrupt:
-        print("\n[cli] Shutting down toy...")
-        await toy.disconnect()
-
 def run_server(port: int):
     """Run a Buttplug server in CLI mode."""
     server = ButtplugServer(port=port)
-    print(f"[cli] Starting Buttplug server on port {port}")
+    logging.getLogger(__name__).info("Starting Buttplug server on port %s", port)
     server.start()
     try:
         while True:
             devices = server.get_device_list()
             if devices.devices:
-                print("\n[cli] Connected devices:")
+                logging.getLogger(__name__).info("Connected devices:")
                 for dev in devices.devices:
-                    print(f"- {dev.name} (index: {dev.index})")
+                    logging.getLogger(__name__).info(" - %s (index=%s)", dev.name, dev.index)
             input("Press Enter to refresh device list or Ctrl+C to quit...")
     except KeyboardInterrupt:
-        print("\n[cli] Shutting down server...")
+        logging.getLogger(__name__).info("Shutting down server...")
         server.stop()
 
 if __name__ == "__main__":
     args = parse_args()
-    
-    if args.command == "test":
-        asyncio.run(cli_test_device(args.intensity, args.duration, args.port))
-    elif args.command == "toy":
-        asyncio.run(run_virtual_toy(args.name, args.port))
-    elif args.command == "server":
+
+    # Configure logging once per run
+    setup_logging(
+        level=args.log_level,
+        log_file=args.log_file,
+        json_format=(args.log_format == "json"),
+        add_console=True,
+    )
+
+    if args.command == "server":
         run_server(args.port)
     else:  # gui or no command
         run()  # Start GUI

@@ -326,6 +326,16 @@ async def test_connection_error_handling():
 - Use `pytest-asyncio` for async test management
 
 #### 2. Import Errors
+#### 2.5 Windows Socket/Port Conflicts
+**Symptoms**: `[WinError 10048] only one usage of each socket address...` during tests that start servers.
+**Solutions**:
+- Prefer dynamic ports in tests by passing `port=0` when creating `ButtplugServer`/`MesmerIntifaceServer` to bind an ephemeral free port. Read `server.port` after `start()` to get the actual port.
+- Avoid running multiple instances bound to the same fixed port concurrently.
+
+#### 2.6 Windows BLE Event Loop Warnings
+**Symptoms**: `RuntimeError: Event loop is closed` from bleak scanner during teardown.
+**Notes**: These can occur when a background BLE callback fires during test shutdown. We guard these internally; the warnings are benign. Ensure proper teardown order and allow a short sleep after stopping servers.
+
 **Symptoms**: `ImportError` or `ModuleNotFoundError` in tests
 **Solutions**:
 - Verify relative imports use correct paths (e.g., `..engine.mesmerintiface`)

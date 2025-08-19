@@ -61,14 +61,8 @@ class BluetoothDeviceScanner:
         # Setup logging with console output
         self._logger = logging.getLogger(__name__)
         self._logger.setLevel(logging.INFO)
-        
-        # Add console handler if not already present
-        if not self._logger.handlers:
-            console_handler = logging.StreamHandler()
-            console_handler.setLevel(logging.INFO)
-            formatter = logging.Formatter('[bluetooth] %(message)s')
-            console_handler.setFormatter(formatter)
-            self._logger.addHandler(console_handler)
+    # Rely on application/global logging config; avoid attaching our own stream handler
+    # to prevent writing to closed streams during test runner shutdown.
             
         self._shutdown = False
         
@@ -250,7 +244,7 @@ class BluetoothDeviceScanner:
         # Skip if shutting down
         if self._shutdown:
             return
-            
+
         try:
             # Extract device information
             device_info = BluetoothDeviceInfo(
@@ -258,40 +252,61 @@ class BluetoothDeviceScanner:
                 name=device.name,
                 rssi=advertisement_data.rssi,
                 manufacturer_data=advertisement_data.manufacturer_data,
-                service_uuids=[str(uuid) for uuid in advertisement_data.service_uuids]
+                service_uuids=[str(uuid) for uuid in advertisement_data.service_uuids],
             )
-            
+
             # Log all detected devices for debugging
-            self._logger.info(f"Detected BLE device: {device.name or 'Unknown'} ({device.address}) RSSI: {advertisement_data.rssi}")
+            self._logger.info(
+                f"Detected BLE device: {device.name or 'Unknown'} ({device.address}) RSSI: {advertisement_data.rssi}"
+            )
             if device_info.service_uuids:
                 self._logger.info(f"  Service UUIDs: {device_info.service_uuids}")
             if device_info.manufacturer_data:
                 self._logger.info(f"  Manufacturer data: {device_info.manufacturer_data}")
-            
+
             # Check if this looks like a sex toy
             device_type, protocol = self._identify_device(device_info)
             if device_type:
                 device_info.device_type = device_type
                 device_info.protocol = protocol
-                
+
                 # Store/update device
                 self._discovered_devices[device.address] = device_info
-                
-                self._logger.info(f"✅ Identified {device_type} device: {device.name or device.address}")
-                
-                # Notify callbacks (but not if shutting down)
+
+                self._logger.info(
+                    f"✅ Identified {device_type} device: {device.name or device.address}"
+                )
+
+                # Notify callbacks (but not if shutting down). Guard against closed loop.
                 if not self._shutdown:
-                    self._notify_device_callbacks()
+                    try:
+                        self._notify_device_callbacks()
+                    except RuntimeError as e:
+                        # On Windows, callbacks may be scheduled on a closed loop during teardown.
+                        if "Event loop is closed" in str(e):
+                            self._logger.debug(
+                                "Callback skipped: event loop closed during shutdown"
+                            )
+                        else:
+                            raise
             else:
                 # For debugging: store unidentified devices too
                 device_info.device_type = "unknown"
                 device_info.protocol = "unknown"
                 self._discovered_devices[device.address] = device_info
-                
+
                 # Notify callbacks for all devices during development
                 if not self._shutdown:
-                    self._notify_device_callbacks()
-                
+                    try:
+                        self._notify_device_callbacks()
+                    except RuntimeError as e:
+                        if "Event loop is closed" in str(e):
+                            self._logger.debug(
+                                "Callback skipped: event loop closed during shutdown"
+                            )
+                        else:
+                            raise
+
         except Exception as e:
             if not self._shutdown:  # Don't log errors during shutdown
                 self._logger.error(f"Error processing detected device: {e}")
@@ -394,4 +409,12 @@ class BluetoothDeviceScanner:
             
         self._discovered_devices.clear()
         self._device_callbacks.clear()
-        self._logger.info("Bluetooth scanner shutdown complete")
+        # Disable further logging from this component to avoid emitting to closed streams
+        try:
+            self._logger.info("Bluetooth scanner shutdown complete")
+            self._logger.handlers.clear()
+            self._logger.propagate = False
+            self._logger.disabled = True
+        except Exception:
+            # Be defensive; shutdown should not raise
+            pass

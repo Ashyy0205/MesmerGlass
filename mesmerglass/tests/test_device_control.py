@@ -199,6 +199,6 @@ class TestMesmerIntifaceDeviceControl:
             # Stop scanning
             stop_result = await mesmer_server.stop_real_scanning()
             
-            # Both operations should complete
+            # Both operations should complete (stop now returns a boolean)
             assert scan_result is True or scan_result is False
-            assert stop_result is None  # stop_real_scanning returns None
+            assert stop_result is True or stop_result is False

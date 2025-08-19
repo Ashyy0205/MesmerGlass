@@ -9,6 +9,7 @@ import websockets  # websockets>=10
 from websockets.exceptions import ConnectionClosed
 from .buttplug_server import ButtplugServer
 from .device_manager import DeviceManager
+import logging
 
 WS_URL_DEFAULT = "ws://127.0.0.1:12345"
 MESMER_URL_DEFAULT = "ws://127.0.0.1:12350"
@@ -57,6 +58,9 @@ class PulseEngine:
         return False
 
     def __init__(self, url: str = WS_URL_DEFAULT, quiet: bool = False, server: Optional[ButtplugServer] = None, use_mesmer: bool = True) -> None:
+        # Respect an explicit URL by default; we'll only override to MesmerIntiface
+        # in the common default case (no explicit server provided and using the
+        # default classic URL). This keeps tests that pass a custom url/server working.
         self.url = url
         self.quiet = quiet
         self.use_mesmer = use_mesmer  # Use MesmerIntiface instead of external Intiface
@@ -80,9 +84,13 @@ class PulseEngine:
         
         # Use provided server or create a new one
         self._server = server or ButtplugServer(port=int(url.split(":")[-1]))
-        
-        # Use MesmerIntiface URL if enabled
-        if self.use_mesmer:
+
+        # Only override URL to MesmerIntiface when:
+        #  - caller opted into Mesmer usage, AND
+        #  - no explicit server instance was provided, AND
+        #  - the URL wasn't explicitly set to a non-default value.
+        # This avoids breaking unit tests that spin up their own server.
+        if self.use_mesmer and server is None and (url == WS_URL_DEFAULT or not url):
             self.url = MESMER_URL_DEFAULT
 
     # ---------------- public API (UI thread) ----------------
@@ -101,7 +109,10 @@ class PulseEngine:
         self._thread = threading.Thread(target=self._thread_main, name="PulseEngine", daemon=True)
         self._thread.start()
         if not self.quiet:
-            print(f"[pulse] started ({'MesmerIntiface' if self.use_mesmer else 'Classic'} mode)")
+            logging.getLogger(__name__).info(
+                "pulse engine started mode=%s",
+                "MesmerIntiface" if self.use_mesmer else "Classic",
+            )
 
     def stop(self, quiet: Optional[bool] = None) -> None:
         if quiet is not None:
@@ -121,7 +132,7 @@ class PulseEngine:
             self._server.stop()
         
         if not self.quiet:
-            print("[pulse] stopped")
+            logging.getLogger(__name__).info("pulse engine stopped")
 
     def set_level(self, level: float) -> None:
         level = float(clamp(level, 0.0, 1.0))
@@ -159,6 +170,15 @@ class PulseEngine:
             except (RuntimeError, ValueError):
                 # Event loop closed or invalid - ignore
                 pass
+        else:
+            # If we didn't schedule the coroutine (engine disabled or loop missing),
+            # explicitly close it to avoid "coroutine was never awaited" warnings.
+            # This can happen during shutdown when UI code still calls set_level()/pulse.
+            try:
+                if hasattr(coro, "close"):
+                    coro.close()  # type: ignore[attr-defined]
+            except Exception:
+                pass
 
     # ---------------- core async flow ----------------
     async def _main(self) -> None:
@@ -171,14 +191,13 @@ class PulseEngine:
                 break
             except Exception as e:
                 if not self.quiet:
-                    print(f"[pulse] session error: {e}")
-                    traceback.print_exc(limit=1)
+                    logging.getLogger(__name__).warning("session error: %s", e)
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2.0, 8.0)
 
     async def _connect_and_run(self) -> None:
         if not self.quiet:
-            print(f"[pulse] connecting {self.url} ...")
+            logging.getLogger(__name__).info("connecting %s ...", self.url)
         async with websockets.connect(
             self.url,
             ping_interval=20,
@@ -234,14 +253,14 @@ class PulseEngine:
         payload = json.dumps([obj], separators=(",", ":"))
         await ws.send(payload)
         if not self.quiet:
-            print(">>", payload)
+            logging.getLogger(__name__).debug(">> %s", payload)
 
     async def _expect_server_info(self) -> None:
         # Wait until we see a ServerInfo message
         while True:
             raw = await asyncio.wait_for(self._ws.recv(), timeout=5.0)
             if not self.quiet:
-                print("<<", raw)
+                logging.getLogger(__name__).debug("<< %s", raw)
             try:
                 data = json.loads(raw)
             except Exception:
@@ -259,12 +278,14 @@ class PulseEngine:
             # Check if we have available devices before starting more scans
             device_list = self.device_manager.get_device_list()
             if device_list and device_list.devices:
-                print(f"[pulse] Found {len(device_list.devices)} devices, stopping auto-scan")
+                logging.getLogger(__name__).info(
+                    "Found %d devices, stopping auto-scan", len(device_list.devices)
+                )
                 self._devices_found = True  # Set flag to prevent further scanning
                 break
                 
             try:
-                print("[pulse] Starting scan for devices...")
+                logging.getLogger(__name__).debug("Starting scan for devices...")
                 await self._send({"StartScanning": {"Id": self._next_id()}})
                 await self._send({"RequestDeviceList": {"Id": self._next_id()}})
             except Exception:
@@ -279,7 +300,7 @@ class PulseEngine:
 
     async def _on_message(self, raw: str) -> None:
         if not self.quiet:
-            print("<<", raw)
+            logging.getLogger(__name__).debug("<< %s", raw)
         try:
             data = json.loads(raw)
         except Exception:
@@ -288,12 +309,15 @@ class PulseEngine:
         for msg in items:
             if "Error" in msg:
                 if not self.quiet:
-                    print(f"[pulse] server error: {msg.get('Error')}")
+                    logging.getLogger(__name__).error("server error: %s", msg.get("Error"))
             elif "DeviceList" in msg:
                 devices = msg["DeviceList"].get("Devices", [])
                 if devices and not self._devices_found:
                     self._devices_found = True  # Mark that devices have been found
-                    print(f"[pulse] Device list received with {len(devices)} devices, stopping auto-scan")
+                    logging.getLogger(__name__).info(
+                        "Device list received devices=%d stopping auto-scan",
+                        len(devices),
+                    )
                     
                 for dev in devices:
                     self._maybe_select_device(dev)
@@ -301,7 +325,7 @@ class PulseEngine:
             elif "DeviceAdded" in msg:
                 if not self._devices_found:
                     self._devices_found = True  # Mark that devices have been found
-                    print("[pulse] New device added, stopping auto-scan")
+                    logging.getLogger(__name__).info("New device added, stopping auto-scan")
                     
                 self._maybe_select_device(msg["DeviceAdded"])
                 await self._drain_pending()
@@ -312,7 +336,7 @@ class PulseEngine:
                     if removed_idx == self._device_idx:
                         self._device_idx = None
                         if not self.quiet:
-                            print(f"[pulse] device idx={removed_idx} disconnected")
+                            logging.getLogger(__name__).info("device idx=%s disconnected", removed_idx)
 
     def _maybe_select_device(self, dev: dict) -> None:
         # Add device to device manager
@@ -327,7 +351,11 @@ class PulseEngine:
         if selected_idx is not None:
             self._device_idx = selected_idx
             if not self.quiet:
-                print(f"[pulse] using selected device idx={selected_idx} name={dev.get('DeviceName')}")
+                logging.getLogger(__name__).info(
+                    "using selected device idx=%s name=%s",
+                    selected_idx,
+                    dev.get("DeviceName"),
+                )
             return
             
         # Auto-select first vibrator device if no explicit selection
@@ -338,7 +366,9 @@ class PulseEngine:
             if s.get("ActuatorType") == "Vibrate":
                 self._device_idx = idx
                 if not self.quiet:
-                    print(f"[pulse] auto-selected device idx={idx} name={dev.get('DeviceName')}")
+                    logging.getLogger(__name__).info(
+                        "auto-selected device idx=%s name=%s", idx, dev.get("DeviceName")
+                    )
                 break
                 
     def select_device_by_index(self, device_idx: Optional[int]) -> bool:
@@ -347,10 +377,11 @@ class PulseEngine:
             self._device_idx = device_idx
             if not self.quiet:
                 if device_idx is not None:
-                    print(f"[pulse] manually selected device idx={device_idx}")
-                    print(f"[pulse] stopping auto-scan due to device selection")
+                    logging.getLogger(__name__).info(
+                        "manually selected device idx=%s; stopping auto-scan", device_idx
+                    )
                 else:
-                    print(f"[pulse] cleared device selection")
+                    logging.getLogger(__name__).info("cleared device selection")
             return True
         return False
 

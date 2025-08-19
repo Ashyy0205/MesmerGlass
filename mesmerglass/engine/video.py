@@ -1,4 +1,4 @@
-import time, threading, cv2
+import time, threading, cv2, logging
 from typing import Optional
 from PyQt6.QtCore import QSize, Qt
 from PyQt6.QtGui import QImage, QPixmap
@@ -19,14 +19,20 @@ class VideoStream:
         self.close()
         self.cap = cv2.VideoCapture(path)
         if not self.cap or not self.cap.isOpened():
-            print(f"[video] failed to open: {path}")
-            self.cap = None; return
+            logging.getLogger(__name__).error("video failed to open: %s", path)
+            self.cap = None
+            return
         self.path = path
         fps = self.cap.get(cv2.CAP_PROP_FPS)
-        self.fps = fps if fps and fps > 0 else 30.0
+        # Handle cases where fps may be a mock or non-numeric; fall back to 30.0
+        try:
+            fps_val = float(fps)
+        except Exception:
+            fps_val = 0.0
+        self.fps = fps_val if fps_val and fps_val > 0 else 30.0
         self.frame_interval = 1.0 / self.fps
         self.last_ts = 0.0
-        print(f"[video] opened {path} @ {self.fps:.2f} fps")
+        logging.getLogger(__name__).info("video opened %s @ %.2f fps", path, self.fps)
 
     def close(self):
         if self.cap: self.cap.release(); self.cap = None

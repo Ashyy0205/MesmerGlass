@@ -206,34 +206,36 @@ class DevicePage(QWidget):
         
     def update_device_list(self, device_list: "DeviceList"):
         """Update UI with new device list."""
-        print(f"📱 DevicePage.update_device_list called with {len(device_list.devices)} devices")
+        import logging
+        log = logging.getLogger(__name__)
+        log.info("DevicePage.update_device_list with %d devices", len(device_list.devices))
         for device in device_list.devices:
-            print(f"   - Device: {device.name} (index: {device.index})")
+            log.debug("   - Device: %s (index: %s)", device.name, device.index)
             
         self._current_device_list = device_list
         
         # Always restore scan button state
         self.scan_button.setEnabled(True)
         self.scan_button.setText("Scan for devices")
-        print("✅ Scan button reset to normal state")
+        log.debug("Scan button reset to normal state")
         
         # Update device status
-        if not device_list.devices:
-            print("   No devices found - updating label")
+        num_devices = len(device_list.devices)
+        if num_devices == 0:
+            log.debug("   No devices found - updating label")
             self.device_label.setText("No devices found")
             self.device_label.setStyleSheet("color: gray;")
             self.select_button.setEnabled(False)
         else:
-            num_devices = len(device_list.devices)
-            print(f"   Found {num_devices} devices - updating label")
+            log.debug("   Found %d devices - updating label", num_devices)
         if device_list.selected_idx is not None:
-            print(f"✅ Selected device at list index {device_list.selected_idx}")
+            log.info("Selected device at list index %s", device_list.selected_idx)
             selected_device = device_list.devices[device_list.selected_idx]
-            print(f"✅ Using device: {selected_device.name}")
+            log.info("Using device: %s", selected_device.name)
             self.device_label.setText(f"Using: {selected_device.name}")
             self.device_label.setStyleSheet("color: green;")
         else:
-            print(f"❌ No device selected")
+            log.info("No device selected")
             self.device_label.setText(f"{num_devices} device{'s' if num_devices != 1 else ''} found")
             self.device_label.setStyleSheet("color: white;")
             self.select_button.setEnabled(True)

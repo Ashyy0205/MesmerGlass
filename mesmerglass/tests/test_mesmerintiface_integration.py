@@ -11,22 +11,25 @@ from ..engine.mesmerintiface import MesmerIntifaceServer
 pytestmark = pytest.mark.asyncio
 
 
+# Module-level fixtures to avoid class-binding issues
+@pytest.fixture
+def server_port():
+    """Get unique port for testing (0 selects an ephemeral free port)."""
+    return 0
+
+
+@pytest.fixture
+async def mesmer_server(server_port):
+    """Create and start MesmerIntiface server for testing."""
+    server = MesmerIntifaceServer(port=server_port)
+    server.start()
+    await asyncio.sleep(0.1)  # Brief startup delay
+    yield server
+    server.stop()
+
+
 class TestMesmerIntifaceIntegration:
     """Test MesmerIntiface integration with other components."""
-
-    @pytest.fixture
-    def server_port(self):
-        """Get unique port for testing."""
-        return 12350
-
-    @pytest.fixture
-    async def mesmer_server(self, server_port):
-        """Create and start MesmerIntiface server for testing."""
-        server = MesmerIntifaceServer(port=server_port)
-        server.start()
-        await asyncio.sleep(0.1)  # Brief startup delay
-        yield server
-        server.stop()
 
     async def test_pulse_engine_integration(self, mesmer_server, server_port):
         """Test PulseEngine with MesmerIntiface integration."""
@@ -62,7 +65,8 @@ class TestMesmerIntifaceIntegration:
         assert isinstance(status, dict)
         assert 'port' in status
         assert 'running' in status
-        assert status['port'] == 12350
+        # Port should be a valid positive integer once started
+        assert isinstance(status['port'], int) and status['port'] > 0
         assert status['running'] is True
 
     async def test_bluetooth_scanning(self, mesmer_server):
@@ -93,7 +97,7 @@ class TestMesmerIntifaceIntegration:
 
     async def test_server_lifecycle(self, server_port):
         """Test MesmerIntiface server start/stop lifecycle."""
-        server = MesmerIntifaceServer(port=server_port + 1)
+        server = MesmerIntifaceServer(port=server_port)
         
         # Test start
         server.start()

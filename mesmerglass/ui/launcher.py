@@ -15,8 +15,8 @@ from ..engine.mesmerintiface import MesmerIntifaceServer
 from .overlay import OverlayWindow
 from .pages.textfx import TextFxPage
 from .pages.device import DevicePage
-from .pages.audio import AudioPage  # <-- NEW
-from .devtools import DevToolsWindow  # <-- Dev Tools
+from .pages.audio import AudioPage
+import logging  # add logging
 
 
 class ScanCompleteSignaler(QObject):
@@ -45,7 +45,7 @@ def _pct_label(v: float) -> QLabel:
 
 
 class Launcher(QMainWindow):
-    def __init__(self, app_title="Mesmer Glass — 0.7.0"):
+    def __init__(self, app_title="Mesmer Glass — 0.7.0", *, enable_device_sync_default: bool = True):
         super().__init__()
         self.setWindowTitle(app_title)
         
@@ -57,21 +57,20 @@ class Launcher(QMainWindow):
         # ---------- state ----------
         self.primary_path = ""; self.secondary_path = ""
         self.primary_op = 0.10; self.secondary_op = 0.0
-        self.dev_mode = False
-        self.dev_tools = None  # Will be created when needed
+    # Dev tools UI removed; keep flags absent to avoid accidental use
 
         self.text = "RELAX"; self.text_color = QColor("#FFFFFF"); self.font = QFont("Segoe UI", 64)
         
-        # Dev mode shortcut (Ctrl+Shift+D)
-        self.dev_shortcut = QShortcut(QKeySequence("Ctrl+Shift+D"), self)
-        self.dev_shortcut.activated.connect(self.toggle_dev_mode)
+    # Dev tools shortcut removed
         self.text_scale_pct = 22; self.fx_mode = "Breath + Sway"; self.fx_intensity = 70
         self.flash_interval_ms = 1500; self.flash_width_ms = 200
 
         self.audio = Audio2(); self.audio1_path = ""; self.audio2_path = ""; self.vol1 = 0.6; self.vol2 = 0.5
 
         self.pulse = PulseEngine(quiet=True)
-        self.enable_device_sync = True  # Enable device sync by default
+        # Allow callers (like CLI) to disable device-sync side effects at construction time.
+        # This avoids starting BLE/servers when running quick UI navigation commands.
+        self.enable_device_sync = bool(enable_device_sync_default)
         self.enable_buzz_on_flash = True; self.buzz_intensity = 0.6
         self.enable_bursts = False; self.burst_min_s = 25; self.burst_max_s = 60; self.burst_peak = 0.9; self.burst_max_ms = 2000
 
@@ -311,10 +310,10 @@ class Launcher(QMainWindow):
             try:
                 self.mesmer_server = MesmerIntifaceServer(port=12350)
                 self.mesmer_server.start()
-                print("🚀 MesmerIntiface server started automatically on port 12350")
+                logging.getLogger(__name__).info("MesmerIntiface server started automatically on port 12350")
                 self._refresh_status()
             except Exception as e:
-                print(f"❌ Failed to start MesmerIntiface server: {e}")
+                logging.getLogger(__name__).error("Failed to start MesmerIntiface server: %s", e)
                 self.mesmer_server = None
     
     def _on_toggle_device_sync(self, b: bool): 
@@ -325,9 +324,9 @@ class Launcher(QMainWindow):
             try:
                 self.mesmer_server = MesmerIntifaceServer(port=12350)
                 self.mesmer_server.start()
-                print("🚀 MesmerIntiface server started on port 12350")
+                logging.getLogger(__name__).info("MesmerIntiface server started on port 12350")
             except Exception as e:
-                print(f"❌ Failed to start MesmerIntiface server: {e}")
+                logging.getLogger(__name__).error("Failed to start MesmerIntiface server: %s", e)
                 self.mesmer_server = None
                 
         elif not b and self.mesmer_server:
@@ -359,9 +358,9 @@ class Launcher(QMainWindow):
                     loop.close()
                     
                 self.mesmer_server = None
-                print("🛑 MesmerIntiface server stopped")
+                logging.getLogger(__name__).info("MesmerIntiface server stopped")
             except Exception as e:
-                print(f"❌ Error stopping MesmerIntiface server: {e}")
+                logging.getLogger(__name__).error("Error stopping MesmerIntiface server: %s", e)
                 
         self._refresh_status()
     
@@ -383,7 +382,7 @@ class Launcher(QMainWindow):
                 asyncio.set_event_loop(loop)
                 
                 async def do_scan():
-                    print("🔍 Starting Bluetooth device scan...")
+                    logging.getLogger(__name__).info("Starting Bluetooth device scan...")
                     success = await self.mesmer_server.start_real_scanning()
                     if success:
                         # Scan for 8 seconds
@@ -394,24 +393,24 @@ class Launcher(QMainWindow):
                         device_list = self.mesmer_server.get_device_list()
                         
                         # Debug: Print device list info
-                        print(f"🔍 Device list contains {len(device_list.devices)} devices:")
+                        logging.getLogger(__name__).info("Device list contains %d devices:", len(device_list.devices))
                         for i, device in enumerate(device_list.devices):
-                            print(f"  {i}: {device.name} (index={device.index})")
+                            logging.getLogger(__name__).info("  %d: %s (index=%s)", i, device.name, device.index)
                         
                         # Update UI using thread-safe signal
-                        print("📡 Emitting scan_completed signal...")
+                        logging.getLogger(__name__).debug("Emitting scan_completed signal...")
                         self.scan_signaler.scan_completed.emit(device_list)
                         
-                        print(f"✅ Scan completed - found {len(device_list.devices)} device(s)")
+                        logging.getLogger(__name__).info("Scan completed - found %d device(s)", len(device_list.devices))
                     else:
-                        print("❌ Failed to start Bluetooth scan")
+                        logging.getLogger(__name__).error("Failed to start Bluetooth scan")
                         QTimer.singleShot(0, lambda: self._scan_completed(None))
                 
                 loop.run_until_complete(do_scan())
                 loop.close()
                 
             except Exception as e:
-                print(f"❌ Scan error: {e}")
+                logging.getLogger(__name__).exception("Scan error: %s", e)
                 from PyQt6.QtCore import QTimer
                 QTimer.singleShot(0, lambda: self._scan_completed(None))
                 
@@ -429,18 +428,18 @@ class Launcher(QMainWindow):
         # Always reset scan state first
         self.device_scan_in_progress = False
         
-        print(f"🖥️ Updating UI with device list containing {len(device_list.devices)} devices")
+        logging.getLogger(__name__).info("Updating UI with %d devices", len(device_list.devices))
         for device in device_list.devices:
-            print(f"   - {device.name} (index: {device.index})")
+            logging.getLogger(__name__).debug(" - %s (index: %s)", device.name, device.index)
         
         # Update the device page
         self.page_device.update_device_list(device_list)
-        print("✅ Called update_device_list on device page")
+        logging.getLogger(__name__).debug("Called update_device_list on device page")
         
         # Auto-select single device
         if len(device_list.devices) == 1:
             device = device_list.devices[0]
-            print(f"🎯 Auto-selecting single device: {device.name} (index {device.index})")
+            logging.getLogger(__name__).info("Auto-selecting single device: %s (index %s)", device.name, device.index)
             self._on_device_selected(device.index)
         
         # Also tell pulse engine about devices if sync is enabled
@@ -467,7 +466,7 @@ class Launcher(QMainWindow):
         if not self.mesmer_server:
             return
             
-        print(f"🎯 Selecting device with Buttplug index {device_idx}")
+        logging.getLogger(__name__).info("Selecting device with Buttplug index %s", device_idx)
         
         # Update pulse engine selection
         if hasattr(self.pulse, 'select_device_by_index'):
@@ -486,7 +485,7 @@ class Launcher(QMainWindow):
         if list_idx is not None:
             # Update server device selection using list index
             self.mesmer_server.select_device(list_idx)
-            print(f"✅ Selected device at list index {list_idx} (Buttplug index {device_idx})")
+            logging.getLogger(__name__).info("Selected device at list index %s (Buttplug index %s)", list_idx, device_idx)
             
             # Automatically connect to the selected device
             import threading
@@ -498,26 +497,26 @@ class Launcher(QMainWindow):
                     asyncio.set_event_loop(loop)
                     
                     async def do_connect():
-                        print(f"🔗 Attempting to connect to device {device_idx}...")
+                        logging.getLogger(__name__).info("Attempting to connect to device %s...", device_idx)
                         success = await self.mesmer_server.connect_real_device(device_idx)
                         if success:
-                            print(f"✅ Successfully connected to device {device_idx}")
+                            logging.getLogger(__name__).info("Successfully connected to device %s", device_idx)
                         else:
-                            print(f"❌ Failed to connect to device {device_idx}")
+                            logging.getLogger(__name__).error("Failed to connect to device %s", device_idx)
                         return success
                     
-                    result = loop.run_until_complete(do_connect())
+                    _ = loop.run_until_complete(do_connect())
                     loop.close()
                     
                 except Exception as e:
-                    print(f"❌ Error connecting to device {device_idx}: {e}")
+                    logging.getLogger(__name__).exception("Error connecting to device %s: %s", device_idx, e)
                     
             # Run connection in background thread
             connect_thread = threading.Thread(target=connect_device, daemon=True)
             connect_thread.start()
             
         else:
-            print(f"❌ Could not find device with Buttplug index {device_idx}")
+            logging.getLogger(__name__).error("Could not find device with Buttplug index %s", device_idx)
         
         # Get updated device list and refresh UI
         device_list = self.mesmer_server.get_device_list()
@@ -646,22 +645,9 @@ class Launcher(QMainWindow):
         self.audio.stop()
         self.pulse.stop()
                 
-    def toggle_dev_mode(self):
-        """Toggle development mode with virtual toy support."""
-        self.dev_mode = not self.dev_mode
-        if self.dev_mode:
-            if not self.dev_tools:
-                self.dev_tools = DevToolsWindow(self)
-            self.dev_tools.show()
-        else:
-            if self.dev_tools:
-                self.dev_tools.close()
-                
     def closeEvent(self, event):
         """Handle application close."""
-        if self.dev_tools:
-            self.dev_tools.close()
-            
+    # Dev tools removed: nothing to close here
         # Shutdown MesmerIntiface server
         if self.mesmer_server:
             try:
@@ -670,9 +656,9 @@ class Launcher(QMainWindow):
                 asyncio.set_event_loop(loop)
                 loop.run_until_complete(self.mesmer_server.shutdown())
                 loop.close()
-                print("🛑 MesmerIntiface server shut down")
+                logging.getLogger(__name__).info("MesmerIntiface server shut down")
             except Exception as e:
-                print(f"❌ Error shutting down MesmerIntiface server: {e}")
+                logging.getLogger(__name__).error("Error shutting down MesmerIntiface server: %s", e)
                 
         super().closeEvent(event)
         self.overlays.clear()

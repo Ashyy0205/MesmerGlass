@@ -52,13 +52,19 @@ class MesmerIntifaceServer(ButtplugServer):
             self._logger.error(f"Failed to start Bluetooth scanning: {e}")
             return False
             
-    async def stop_real_scanning(self) -> None:
-        """Stop Bluetooth device scanning."""
+    async def stop_real_scanning(self) -> bool:
+        """Stop Bluetooth device scanning.
+
+        Returns:
+            True if a stop operation was attempted without error; False on failure.
+        """
         try:
             await self._bluetooth_scanner.stop_scanning()
             self._logger.info("Stopped Bluetooth device scanning")
+            return True
         except Exception as e:
             self._logger.error(f"Error stopping Bluetooth scanning: {e}")
+            return False
             
     def is_real_scanning(self) -> bool:
         """Check if Bluetooth scanning is active."""
@@ -281,10 +287,18 @@ class MesmerIntifaceServer(ButtplugServer):
             # Update our device tracking
             self._bluetooth_devices = {dev.address: dev for dev in devices}
             
-            # Debug: Print discovered devices
-            print(f"🔍 Processing {len(devices)} Bluetooth devices:")
+            # Debug: log discovered devices (DEBUG level to avoid console noise)
+            self._logger.debug(
+                "Processing %d Bluetooth devices", len(devices)
+            )
             for dev in devices:
-                print(f"  - {dev.name or 'Unknown'} ({dev.address}) type={dev.device_type}")
+                # Inline details for each device; keep at DEBUG level
+                self._logger.debug(
+                    " - %s (%s) type=%s",
+                    dev.name or "Unknown",
+                    dev.address,
+                    dev.device_type,
+                )
             
             # Convert to Buttplug devices and update device manager
             buttplug_devices = []
@@ -301,7 +315,12 @@ class MesmerIntifaceServer(ButtplugServer):
                     
                 device_index = self._device_index_map[device.address]
                 
-                print(f"✅ Converting device: {device.name} -> Buttplug index {device_index}")
+                # Trace conversion mapping for visibility when DEBUG enabled
+                self._logger.debug(
+                    "Converting device: %s -> Buttplug index %s",
+                    device.name,
+                    device_index,
+                )
                 
                 # Identify device capabilities
                 device_def = self._device_database.identify_device(
@@ -361,16 +380,21 @@ class MesmerIntifaceServer(ButtplugServer):
             # Update device manager
             self._device_manager._device_list.devices = buttplug_devices
             
-            print(f"📱 Final device list has {len(buttplug_devices)} devices")
+            # Summary at INFO level so operators can see device counts
+            self._logger.info(
+                "Updated device list: %d devices", len(buttplug_devices)
+            )
             
             # Auto-stop scanning if we found sex toy devices
             if buttplug_devices and self.is_real_scanning():
-                print("🛑 Auto-stopping scan - found sex toy devices")
+                # Auto-stop scanning once we have target devices; log action
+                self._logger.info("Auto-stopping scan — found target devices")
                 asyncio.create_task(self.stop_real_scanning())
             
             # Notify callbacks
             self._notify_device_callbacks()
             
+            # Already logged above; keep here in case upstream callers rely on it
             self._logger.info(f"Updated device list: {len(buttplug_devices)} devices")
             
         except Exception as e:
@@ -470,7 +494,12 @@ class MesmerIntifaceServer(ButtplugServer):
         bluetooth_devices = list(self._bluetooth_devices.values())
         connected_devices = [dev for dev in bluetooth_devices if dev.is_connected]
         
+        # Include both legacy keys (port, running) and detailed keys for compatibility
         return {
+            # Compatibility keys expected by existing tests/UI
+            "port": self.port,  # exposed by base server
+            "running": not self._stop,
+            # Detailed status
             "server_running": not self._stop,
             "bluetooth_scanning": self.is_real_scanning(),
             "discovered_devices": len(bluetooth_devices),
@@ -478,5 +507,5 @@ class MesmerIntifaceServer(ButtplugServer):
             "active_protocols": len(self._device_protocols),
             "buttplug_devices": len(self._device_manager._device_list.devices),
             "device_types": list(set(dev.device_type for dev in bluetooth_devices if dev.device_type)),
-            "supported_protocols": self._protocol_manager.get_supported_protocols()
+            "supported_protocols": self._protocol_manager.get_supported_protocols(),
         }

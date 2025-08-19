@@ -37,13 +37,7 @@ async def launcher(qapp):
     window.close()
     await asyncio.sleep(0.1)  # Allow time for cleanup
 
-@pytest.fixture
-async def dev_tools(launcher):
-    """Open dev tools window for testing."""
-    launcher.toggle_dev_mode()  # Ensure dev tools is created
-    QTest.qWait(100)  # Allow window to show
-    assert launcher.dev_tools is not None, "Dev tools should be created"
-    return launcher.dev_tools
+# Dev Tools UI has been removed; no dev_tools fixture.
     
 # ---------- Media Tests ----------
 @pytest.mark.asyncio
@@ -196,138 +190,12 @@ async def test_launch_and_overlay(launcher):
     
     assert len(launcher.overlays) == 0, "Should close all overlays"
 
-@pytest.mark.asyncio
-async def test_launch_dev_tools(launcher):
-    """Test dev tools window functionality."""
-    # Open dev tools
-    launcher.toggle_dev_mode()
-    QTest.qWait(100)  # Allow window to open
-    assert launcher.dev_tools is not None, "Dev tools should be created"
-    assert launcher.dev_tools.isVisible(), "Dev tools should be visible"
-    
-    # Close dev tools
-    launcher.toggle_dev_mode()
-    QTest.qWait(100)  # Allow window to close
-    assert not launcher.dev_tools.isVisible(), "Dev tools should be hidden"
-    launcher.dev_tools.close()
-    await asyncio.sleep(0.1)
+# Dev Tools UI tests removed.
 
-@pytest.mark.asyncio
-async def test_dev_mode_toggle(launcher):
-    """Test dev mode window toggling."""
-    assert launcher.dev_tools is None, "Dev tools should start closed"
-    
-    # Toggle dev mode on
-    launcher.toggle_dev_mode()
-    await asyncio.sleep(0.1)
-    assert launcher.dev_tools is not None, "Dev tools should open"
-    assert launcher.dev_tools.isVisible(), "Dev tools window should be visible"
-    
-    # Toggle dev mode off
-    launcher.toggle_dev_mode()
-    await asyncio.sleep(0.1)
-    assert not launcher.dev_tools.isVisible(), "Dev tools window should hide"
+# Dev mode toggle tests removed.
 
-@pytest.mark.asyncio
-async def test_virtual_toy_creation(launcher, dev_tools):
-    """Test adding and removing virtual toys in dev mode."""
-    # Find the add toy button
-    # Ensure dev tools is visible
-    dev_tools.show()
-    await asyncio.sleep(0.1)
-    
-    add_btn = None
-    for child in dev_tools.findChildren(QPushButton):
-        if child.text() == "Add Virtual Toy":
-            add_btn = child
-            break
-    assert add_btn is not None, "Should find Add Virtual Toy button"
-    
-    # Add a toy
-    QTest.mouseClick(add_btn, Qt.MouseButton.LeftButton)
-    await asyncio.sleep(0.1)
-    
-    # Verify toy was added
-    assert len(dev_tools.toys) == 1, "Should have one toy"
-    assert len(dev_tools.toy_widgets) == 1, "Should have one toy widget"
-    
-    # Get the toy widget
-    toy_id = list(dev_tools.toys.keys())[0]
-    widgets = dev_tools.toy_widgets[toy_id]
-    
-    # Process events to ensure widget is properly shown
-    QTest.qWait(100)
-    widgets["frame"].show()
-    assert widgets["frame"].isVisible(), "Toy frame should be visible"
-    
-    # Wait for the toy to show up
-    toy = dev_tools.toys[toy_id]
-    status_text = widgets["status"].text()
-    assert toy.name in status_text, f"Status should show toy name: {status_text}"
-    
-    # Test remove button
-    remove_btn = None
-    for child in widgets["frame"].findChildren(QPushButton):
-        if child.text() == "Remove":
-            remove_btn = child
-            break
-    assert remove_btn is not None, "Should find Remove button"
-    
-    # Remove the toy
-    QTest.mouseClick(remove_btn, Qt.MouseButton.LeftButton)
-    await asyncio.sleep(0.1)
-    
-    assert len(dev_tools.toys) == 0, "Should have no toys after removal"
-    assert len(dev_tools.toy_widgets) == 0, "Should have no toy widgets after removal"
+# Dev Tools virtual toy UI creation tests removed.
 
-@pytest.mark.asyncio
-async def test_multiple_virtual_toys(launcher, dev_tools):
-    """Test handling multiple virtual toys."""
-    add_btn = next(btn for btn in dev_tools.findChildren(QPushButton) if btn.text() == "Add Virtual Toy")
-    
-    # Add three toys
-    for _ in range(3):
-        QTest.mouseClick(add_btn, Qt.MouseButton.LeftButton)
-        await asyncio.sleep(0.1)
-    
-    assert len(dev_tools.toys) == 3, "Should have three toys"
-    
-    # Verify each toy has unique name and widget
-    names = set()
-    for toy_id, widgets in dev_tools.toy_widgets.items():
-        name = dev_tools.toys[toy_id].name
-        assert name not in names, "Each toy should have unique name"
-        names.add(name)
-        assert widgets["intensity"].value() == 0, "Initial intensity should be 0"
-    
-    # Remove toys one by one
-    while dev_tools.toy_widgets:
-        toy_id = next(iter(dev_tools.toy_widgets))
-        widgets = dev_tools.toy_widgets[toy_id]
-        remove_btn = next(btn for btn in widgets["frame"].findChildren(QPushButton) if btn.text() == "Remove")
-        QTest.mouseClick(remove_btn, Qt.MouseButton.LeftButton)
-        await asyncio.sleep(0.1)
-    
-    assert len(dev_tools.toys) == 0, "Should remove all toys"
+# Dev Tools multi virtual toy tests removed.
 
-@pytest.mark.asyncio
-async def test_virtual_toy_intensity(launcher, dev_tools):
-    """Test virtual toy intensity updates."""
-    # Add a toy
-    add_btn = next(btn for btn in dev_tools.findChildren(QPushButton) if btn.text() == "Add Virtual Toy")
-    QTest.mouseClick(add_btn, Qt.MouseButton.LeftButton)
-    await asyncio.sleep(0.1)
-    
-    toy_id = next(iter(dev_tools.toys))
-    toy = dev_tools.toys[toy_id]
-    widgets = dev_tools.toy_widgets[toy_id]
-    
-    # Test intensity updates
-    test_levels = [0.0, 0.5, 1.0, 0.3, 0.0]
-    for level in test_levels:
-        toy.state.level = level
-        # Force an immediate update
-        dev_tools.update_toy_status()
-        await asyncio.sleep(0.1)
-        expected = int(level * 100)
-        assert widgets["intensity"].value() == expected, f"Intensity should update to {expected}%"
+# Dev Tools virtual toy intensity tests removed.

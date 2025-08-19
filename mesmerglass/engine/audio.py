@@ -1,5 +1,6 @@
 # mesmerglass/engine/audio.py
 import pygame
+import logging
 
 def clamp(x, a, b): return max(a, min(b, x))
 
@@ -14,9 +15,9 @@ class Audio2:
             pygame.mixer.pre_init(44100, -16, 2, 512)
             pygame.mixer.init()
             self.init_ok = True
-            print("[audio] pygame mixer initialized")
+            logging.getLogger(__name__).info("pygame mixer initialized")
         except Exception as e:
-            print(f"[audio] init failed: {e}")
+            logging.getLogger(__name__).error("audio init failed: %s", e)
             return
 
         self.snd1 = None
@@ -33,7 +34,7 @@ class Audio2:
         try:
             self.snd1 = pygame.mixer.Sound(path)  # full load
         except Exception as e:
-            print(f"[audio] load1 error: {e} — falling back to streaming")
+            logging.getLogger(__name__).warning("load1 error: %s — falling back to streaming", e)
             # streaming fallback (uses global music channel)
             self.music1_path = path
 
@@ -42,7 +43,7 @@ class Audio2:
         try:
             self.snd2 = pygame.mixer.Sound(path)
         except Exception as e:
-            print(f"[audio] load2 error: {e}")
+            logging.getLogger(__name__).error("load2 error: %s", e)
             self.snd2 = None
 
     # -------- playback -------------------------------------------------------
@@ -56,7 +57,7 @@ class Audio2:
                 pygame.mixer.music.set_volume(clamp(vol1, 0, 1))
                 pygame.mixer.music.play(loops=-1)
             except Exception as e:
-                print(f"[audio] music play error: {e}")
+                logging.getLogger(__name__).error("music play error: %s", e)
         elif self.snd1 and not self.chan1:
             self.chan1 = self.snd1.play(loops=-1)
             if self.chan1:

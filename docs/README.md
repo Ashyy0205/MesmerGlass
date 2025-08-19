@@ -45,3 +45,7 @@ If you need help:
 1. Check the relevant documentation section
 2. Review [Testing](development/testing.md) for troubleshooting
 3. Open an issue on the project repository
+
+## 📜 CLI Reference
+
+- For detailed command-line interface documentation, refer to the [CLI Reference](../docs/cli.md)

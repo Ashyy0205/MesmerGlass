@@ -6,6 +6,7 @@ import threading
 import websockets
 from typing import Optional, Dict, List, Callable
 from dataclasses import dataclass
+import logging
 
 @dataclass
 class Device:
@@ -50,11 +51,14 @@ class ButtplugServer:
     """A Buttplug protocol server that handles device communication."""
     
     def __init__(self, port: int = 12345):
+        # Requested port; may be 0 to request an ephemeral port from OS.
         self.port = port
         self._msg_id = 0
         self._stop = False
         self._thread = None
         self._clients = set()
+        # Actual bound port after server starts; defaults to requested.
+        self._actual_port: Optional[int] = None
         
         # Device management
         self._device_manager = DeviceManager()
@@ -85,19 +89,26 @@ class ButtplugServer:
             try:
                 callback(device_list)
             except Exception as e:
-                print(f"[server] Error in device callback: {e}")
+                logging.getLogger(__name__).exception("Error in device callback: %s", e)
         
     def start(self):
         """Start the WebSocket server."""
         # Run the async server in a new thread
         self._thread = threading.Thread(target=self._run_server, daemon=True)
         self._thread.start()
-        print(f"[server] Server thread started with port {self.port}")
+        # Log inside method scope
+        logging.getLogger(__name__).info("Server thread started port=%s", self.port)
         
     def stop(self):
         """Stop the server."""
         self._stop = True
-        print("[server] Stopping server...")
+        logger = logging.getLogger(__name__)
+        logger.info("Stopping server...")
+        # After requesting stop, reduce logger verbosity to minimize shutdown noise
+        try:
+            logger.setLevel(logging.WARNING)
+        except Exception:
+            pass
         
     def _run_server(self):
         """Run the WebSocket server in a separate thread."""
@@ -105,27 +116,43 @@ class ButtplugServer:
         asyncio.set_event_loop(loop)
         
         async def run_server():
-            print(f"[server] Starting server on port {self.port}")
-            async with websockets.serve(self._handle_client, "127.0.0.1", self.port):
-                print("[server] Ready for connections")
+            logging.getLogger(__name__).info("Starting server on port %s", self.port)
+            # Create the server and record the actual bound port (support port=0 ephemeral binding)
+            ws_server = await websockets.serve(self._handle_client, "127.0.0.1", self.port)
+            try:
+                # websockets 11+: server.sockets provides bound sockets. Pick first.
+                if ws_server.sockets:
+                    bound_port = ws_server.sockets[0].getsockname()[1]
+                    self._actual_port = bound_port
+                    # Keep compatibility: update self.port so calling code sees the bound port
+                    self.port = bound_port
+                logging.getLogger(__name__).info("Ready for connections")
                 # Keep running until stopped
                 while not self._stop:
                     await asyncio.sleep(1)
+            finally:
+                ws_server.close()
+                await ws_server.wait_closed()
                     
         try:
             loop.run_until_complete(run_server())
         finally:
             loop.close()
+
+    @property
+    def selected_port(self) -> int:
+        """Return the actual bound port once started (falls back to requested)."""
+        return self._actual_port or self.port
                 
     async def _handle_client(self, websocket):
         """Handle client connection."""
         try:
             self._clients.add(websocket)
-            print("[server] Client connected")
+            logging.getLogger(__name__).debug("Client connected")
             async for message in websocket:
                 await self._process_message(websocket, message)
         except websockets.exceptions.ConnectionClosed:
-            print("[server] Client disconnected")
+            logging.getLogger(__name__).debug("Client disconnected")
         finally:
             self._clients.remove(websocket)
             
@@ -165,7 +192,7 @@ class ButtplugServer:
                     
                 elif "StartScanning" in msg:
                     # Start scanning for devices
-                    print("[server] Starting device scan")
+                    logging.getLogger(__name__).info("Starting device scan")
                     msg_id = msg["StartScanning"]["Id"]
                     await self._send(websocket, {
                         "Ok": {
@@ -176,7 +203,7 @@ class ButtplugServer:
                 elif "DeviceList" in msg:
                     # Handle device registration
                     device_list = msg["DeviceList"]
-                    print("[server] Received device list")
+                    logging.getLogger(__name__).debug("Received device list")
                     current_devices = {(d.name, d.index) for d in self._device_manager._device_list.devices}
                     for device_info in device_list.get("Devices", []):
                         # Check if device already registered
@@ -189,7 +216,7 @@ class ButtplugServer:
                                 device_messages=device_info.get("DeviceMessages", {})
                             )
                             self._device_manager._device_list.devices.append(device)
-                            print(f"[server] Registered device: {device.name}")
+                            logging.getLogger(__name__).info("Registered device: %s", device.name)
                             # Notify callbacks of device list change
                             self._notify_device_callbacks()
                     # Send acknowledgment
@@ -204,7 +231,7 @@ class ButtplugServer:
                     cmd = msg["ScalarCmd"]
                     if "Id" in cmd:
                         msg_id = cmd["Id"]
-                        print(f"[server] ScalarCmd received (id={msg_id})")
+                        logging.getLogger(__name__).debug("ScalarCmd received id=%s", msg_id)
                         # Forward command to other clients
                         for client in self._clients:
                             if client != websocket:
@@ -220,7 +247,7 @@ class ButtplugServer:
                     cmd = msg["StopDeviceCmd"]
                     if "Id" in cmd:
                         msg_id = cmd["Id"]
-                        print(f"[server] StopDeviceCmd received (id={msg_id})")
+                        logging.getLogger(__name__).debug("StopDeviceCmd received id=%s", msg_id)
                         # Forward command to other clients
                         for client in self._clients:
                             if client != websocket:
@@ -233,7 +260,7 @@ class ButtplugServer:
                         })
                         
         except Exception as e:
-            print(f"[server] Error processing message: {e}")
+            logging.getLogger(__name__).error("Error processing message: %s", e)
             
     async def _send(self, websocket, msg: dict):
         """Send a message to the client."""

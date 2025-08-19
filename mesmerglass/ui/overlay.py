@@ -4,6 +4,7 @@ from typing import Optional
 from PyQt6.QtCore import Qt, QTimer, QRect, QSize
 from PyQt6.QtGui import QPainter, QPixmap, QColor, QFont, QGuiApplication
 from PyQt6.QtWidgets import QWidget
+import logging  # add logging
 
 # --- Optional Windows click-through fallback ---
 try:
@@ -46,12 +47,12 @@ class _VideoReader:
                 if fps and fps > 1.0:
                     self.fps = float(fps)
                 self._frame_period = 1.0 / float(self.fps)
-                print(f"[video] opened {self.path} @ {self.fps:.2f} fps")
+                logging.getLogger(__name__).info("[video] opened %s @ %.2f fps", self.path, self.fps)
             else:
-                print(f"[video] failed to open: {self.path}")
+                logging.getLogger(__name__).warning("[video] failed to open: %s", self.path)
         except Exception as e:
             self.cv2 = None
-            print(f"[video] OpenCV not available: {e}")
+            logging.getLogger(__name__).warning("[video] OpenCV not available: %s", e)
 
     def read_if_due(self, now: float, target_size: QSize) -> Optional[QPixmap]:
         """Advance only when enough time has elapsed; otherwise reuse last frame."""
