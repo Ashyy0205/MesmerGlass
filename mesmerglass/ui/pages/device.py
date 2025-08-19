@@ -77,6 +77,8 @@ class DevicePage(QWidget):
     ):
         super().__init__(parent)
         self._current_device_list: DeviceList | None = None
+        # Track multi-selected device names for display
+        self._selected_names: list[str] = []
 
         root = QVBoxLayout(self)
         root.setContentsMargins(6, 6, 6, 6)
@@ -242,7 +244,19 @@ class DevicePage(QWidget):
             self.select_button.setEnabled(False)
         else:
             log.debug("   Found %d devices - updating label", num_devices)
-        # Prefer engine-style selected_index (Buttplug index)
+        # If we have an active multi-selection label, keep showing it
+        if self._selected_names and len(self._selected_names) > 1:
+            pretty = ", ".join(self._selected_names[:3])
+            more = len(self._selected_names) - 3
+            if more > 0:
+                pretty += f" +{more} more"
+            self.device_label.setText(f"Using: {pretty}")
+            self.device_label.setStyleSheet("color: green;")
+            self.select_button.setEnabled(True)
+            self._apply_enabled_states()
+            return
+
+        # Prefer engine-style selected_index (Buttplug index) for single-select
         sel_bp = getattr(device_list, "selected_index", None)
         if sel_bp is not None:
             selected_device = next((d for d in device_list.devices if getattr(d, "index", None) == sel_bp), None)
@@ -264,6 +278,27 @@ class DevicePage(QWidget):
             self.device_label.setStyleSheet("color: white;")
             self.select_button.setEnabled(True)
 
+        self._apply_enabled_states()
+
+    # --- external UI helpers ---
+    def set_selected_devices(self, names: list[str]):
+        """Set the currently selected devices for display (multi-select)."""
+        try:
+            self._selected_names = list(names)
+        except Exception:
+            self._selected_names = []
+        # Update label immediately
+        if self._selected_names:
+            pretty = ", ".join(self._selected_names[:3])
+            more = len(self._selected_names) - 3
+            if more > 0:
+                pretty += f" +{more} more"
+            self.device_label.setText(f"Using: {pretty}")
+            self.device_label.setStyleSheet("color: green;")
+            self.select_button.setEnabled(True)
+        else:
+            self.device_label.setText("No devices found" if not (self._current_device_list and self._current_device_list.devices) else "Devices available")
+            self.device_label.setStyleSheet("color: gray;")
         self._apply_enabled_states()
 
     # --- ui logic ---

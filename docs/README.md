@@ -31,6 +31,8 @@ Technical specifications and architecture:
 2. **Developers**: Begin with [Development Setup](development/dev-setup.md)
 3. **Technical Details**: Explore the [Technical Reference](technical/)
 
+4. **DevTools Page**: In the GUI, press Ctrl+Shift+D to open the DevTools page. It lets you spin up deterministic virtual toys without hardware and view their live intensity.
+
 ## 📝 Contributing
 
 When adding new documentation:

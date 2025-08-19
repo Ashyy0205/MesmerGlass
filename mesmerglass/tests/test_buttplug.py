@@ -20,8 +20,7 @@ def get_next_port():
 
 from ..engine.buttplug_server import ButtplugServer
 from ..engine.pulse import PulseEngine, clamp
-from .virtual_toy import VirtualToy  # Virtual toy for testing
-from .virtual_toy import VirtualToy
+from mesmerglass.devtools.virtual_toy import VirtualToy  # Virtual toy for testing
 
 # Utility for running async tests
 async def run_for(coroutine, duration: float):

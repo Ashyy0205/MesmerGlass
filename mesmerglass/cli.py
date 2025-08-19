@@ -17,6 +17,7 @@ from .ui.launcher import Launcher
 from .engine.buttplug_server import ButtplugServer
 from .engine.pulse import PulseEngine
 from .logging_utils import setup_logging, get_default_log_path
+from .devtools.virtual_toy import VirtualToy  # dev-only, used by 'toy' subcommand
 
 
 def _add_logging_args(parser: argparse.ArgumentParser) -> None:
@@ -119,7 +120,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_ui.add_argument("--timeout", type=float, default=0.3, help="Seconds to keep the event loop alive (default: 0.3)")
     p_ui.add_argument("--show", action="store_true", help="Show the main window (default: hidden)")
 
-    # 'toy' subcommand removed; virtual test devices are reserved for test suite only
+    # dev-only: virtual toy simulator to drive tests or local dev without hardware
+    p_toy = sub.add_parser("toy", help="Run a deterministic virtual toy simulator (dev-only)")
+    p_toy.add_argument("--name", type=str, default="Virtual Test Toy")
+    p_toy.add_argument("--port", type=int, default=12345)
+    p_toy.add_argument("--latency-ms", type=int, default=0)
+    p_toy.add_argument("--map", choices=["linear", "ease"], default="linear")
+    p_toy.add_argument("--gain", type=float, default=1.0)
+    p_toy.add_argument("--gamma", type=float, default=1.0)
+    p_toy.add_argument("--offset", type=float, default=0.0)
+    p_toy.add_argument("--run-for", type=float, default=5.0, help="Seconds to run before exiting")
 
     sub.add_parser("selftest", help="Quick environment/import check")
 
@@ -237,7 +247,29 @@ def main(argv: Optional[list[str]] = None) -> int:
         rc = app.exec()
         win.close()
         return 0
-    # 'toy' command removed
+    if cmd == "toy":
+        # Minimal async runner for the toy
+        async def _run_toy() -> int:
+            toy = VirtualToy(
+                name=args.name,
+                port=args.port,
+                latency_ms=args.latency_ms,
+                mapping=args.map,  # type: ignore[arg-type]
+                gain=args.gain,
+                gamma=args.gamma,
+                offset=args.offset,
+            )
+            ok = await toy.connect()
+            if not ok:
+                return 1
+            listen_task = asyncio.create_task(toy.start_listening())
+            try:
+                await asyncio.sleep(max(0.0, float(args.run_for)))
+                return 0
+            finally:
+                listen_task.cancel()
+                await toy.disconnect()
+        return asyncio.run(_run_toy())
 
     parser.print_help()
     return 2

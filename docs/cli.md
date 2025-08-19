@@ -19,6 +19,7 @@ python -m mesmerglass run --log-level DEBUG
 - `pulse --level 0..1 --duration <ms>` — Send a single pulse to the selected device.
 - `server [--port N]` — Start a local Buttplug-compatible server.
 - `ui` — Drive basic UI navigation (list/select tabs) and simple actions for testing.
+- `toy` — Run a deterministic virtual toy simulator for dev/CI (no hardware required).
 - `selftest` — Quick import/environment check; exit code 0 on success.
 
 ### ui
@@ -46,6 +47,27 @@ python -m mesmerglass ui --list-tabs
 python -m mesmerglass ui --tab Audio --timeout 0.1
 python -m mesmerglass ui --tab "Text & FX" --set-text "HELLO" --set-fx-mode Shimmer --set-fx-intensity 60 --status
 python -m mesmerglass ui --displays primary --launch --timeout 0.2
+```
+
+### toy (dev-only)
+
+Run a simple virtual toy that connects to the local Buttplug server and reacts to ScalarCmd/StopDeviceCmd.
+
+Flags:
+- `--name` (default: "Virtual Test Toy")
+- `--port` (default: 12345)
+- `--latency-ms` (default: 0)
+- `--map {linear|ease}` (default: linear)
+- `--gain` (default: 1.0)
+- `--gamma` (default: 1.0; used for ease curve)
+- `--offset` (default: 0.0)
+- `--run-for` seconds to auto-exit (default: 5.0)
+
+Examples:
+
+```
+python -m mesmerglass server --port 0  # start server on ephemeral port; note the port from logs
+python -m mesmerglass toy --port 12345 --latency-ms 50 --map ease --gamma 2.0 --run-for 1.0
 ```
 
 ## Exit codes

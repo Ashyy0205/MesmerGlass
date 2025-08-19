@@ -377,12 +377,31 @@ class MesmerIntifaceServer(ButtplugServer):
                 
                 buttplug_devices.append(buttplug_device)
                 
-            # Update device manager
-            self._device_manager._device_list.devices = buttplug_devices
+            # Merge existing non-BLE (virtual) devices with newly discovered BLE devices
+            try:
+                existing = list(self._device_manager._device_list.devices)
+            except Exception:
+                existing = []
+
+            # Identify indices assigned to BLE devices
+            ble_indices = set(self._device_index_map.values())
+            # Keep any existing devices whose index is not a known BLE index (i.e., virtual/test devices)
+            virtual_devices = [d for d in existing if getattr(d, "index", None) not in ble_indices]
+
+            # Deduplicate by index, preferring BLE definitions over prior ones
+            merged_by_index = {}
+            for dev in virtual_devices + buttplug_devices:
+                merged_by_index[getattr(dev, "index", None)] = dev
+            merged_list = list(merged_by_index.values())
+
+            # Update device manager with merged list
+            self._device_manager._device_list.devices = merged_list
             
             # Summary at INFO level so operators can see device counts
             self._logger.info(
-                "Updated device list: %d devices", len(buttplug_devices)
+                "Updated device list: %d devices (including %d virtual)",
+                len(merged_list),
+                len(virtual_devices),
             )
             
             # Auto-stop scanning if we found sex toy devices
@@ -393,9 +412,6 @@ class MesmerIntifaceServer(ButtplugServer):
             
             # Notify callbacks
             self._notify_device_callbacks()
-            
-            # Already logged above; keep here in case upstream callers rely on it
-            self._logger.info(f"Updated device list: {len(buttplug_devices)} devices")
             
         except Exception as e:
             self._logger.error(f"Error updating devices: {e}")
@@ -441,6 +457,16 @@ class MesmerIntifaceServer(ButtplugServer):
     def get_device_list(self) -> "DeviceList":
         """Get the current device list."""
         return self._device_manager.get_device_list()
+
+    def is_ble_device_index(self, device_index: int) -> bool:
+        """Return True if the given Buttplug device index originates from a real BLE device.
+
+        Virtual/devtool devices are not present in the BLE index map and will return False.
+        """
+        try:
+            return int(device_index) in set(self._device_index_map.values())
+        except Exception:
+            return False
     
     def _add_virtual_device(self, device_info: Dict) -> None:
         """Add a virtual device for testing purposes."""

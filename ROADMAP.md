@@ -4,7 +4,7 @@ Focused, incremental milestones in the exact order we’ll implement them. Each 
 
 — Last Updated: August 19, 2025 —
 
-## 1) Device Sync improvements (no auto-select, multi-select, show connected)
+## 1) Device Sync improvements (no auto-select, multi-select, show connected) [DONE]
 
 - Scope
   - Remove auto-selection/auto-connect side effects when scanning.
