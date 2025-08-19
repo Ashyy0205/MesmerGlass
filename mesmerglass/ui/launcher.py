@@ -47,10 +47,15 @@ def _row(label: str, widget: QWidget, trailing: QWidget | None = None) -> QWidge
     return w
 
 
+from .. import __app_name__
+
+
 class Launcher(QMainWindow):
-    def __init__(self, title: str, enable_device_sync_default: bool = True):
+    def __init__(self, title: str, enable_device_sync_default: bool = True, layout_mode: str = "tabbed"):
         super().__init__()
         self.setWindowTitle(title)
+        # Layout mode: "tabbed" (default, current tests) or "sidebar"
+        self.layout_mode = layout_mode if layout_mode in ("tabbed", "sidebar") else "tabbed"
 
         # State
         self.primary_path = ""; self.secondary_path = ""
@@ -86,8 +91,8 @@ class Launcher(QMainWindow):
         root = QWidget(); self.setCentralWidget(root)
         main = QVBoxLayout(root); main.setContentsMargins(10, 10, 10, 10); main.setSpacing(10)
 
-        # Tabs
-        self.tabs = QTabWidget(); main.addWidget(self.tabs, 1)
+        # Tabs container (always created, used by both layouts)
+        self.tabs = QTabWidget()
 
         # Media tab
         scroll_media = QScrollArea(); scroll_media.setWidgetResizable(True); scroll_media.setFrameShape(QFrame.Shape.NoFrame)
@@ -138,6 +143,48 @@ class Launcher(QMainWindow):
         scroll_displays.setWidget(self._page_displays())
         self.tabs.addTab(scroll_displays, "Displays")
 
+        # Build chrome/layout
+        if self.layout_mode == "sidebar":
+            # Top bar with hard-coded program name as requested
+            topbar = QWidget(); topbar.setObjectName("topBar")
+            tbl = QHBoxLayout(topbar); tbl.setContentsMargins(12, 8, 12, 8); tbl.setSpacing(8)
+            title_lab = QLabel("MesmerGlass"); title_lab.setObjectName("topTitle")
+            tbl.addWidget(title_lab, 0); tbl.addStretch(1)
+            # Status chips in top bar
+            self.chip_overlay = QLabel("Overlay: Idle"); self.chip_overlay.setObjectName("statusChip")
+            self.chip_device = QLabel("Device: Off"); self.chip_device.setObjectName("statusChip")
+            tbl.addWidget(self.chip_overlay, 0); tbl.addWidget(self.chip_device, 0)
+            main.addWidget(topbar, 0)
+
+            # Left nav + content
+            center = QWidget(); ch = QHBoxLayout(center); ch.setContentsMargins(0, 0, 0, 0); ch.setSpacing(10)
+            self.nav = QListWidget(); self.nav.setObjectName("sideNav")
+            for name in ("Media", "Text & FX", "Audio", "Device Sync", "Displays"):
+                self.nav.addItem(name)
+            self.nav.setCurrentRow(0)
+            # Hide the tab bar; use side nav instead
+            try:
+                self.tabs.tabBar().setVisible(False)
+            except Exception:
+                pass
+            ch.addWidget(self.nav, 0)
+            ch.addWidget(self.tabs, 1)
+            main.addWidget(center, 1)
+
+            # Wire nav <-> tabs
+            def _on_nav_change(i: int):
+                if 0 <= i < self.tabs.count():
+                    self.tabs.setCurrentIndex(i)
+            self.nav.currentRowChanged.connect(_on_nav_change)
+            self.tabs.currentChanged.connect(lambda i: self.nav.setCurrentRow(i))
+        else:
+            # Default: tabbed layout with visible tabs
+            try:
+                self.tabs.tabBar().setVisible(True)
+            except Exception:
+                pass
+            main.addWidget(self.tabs, 1)
+
         # Wire page signals -> state
         self.page_textfx.textChanged.connect(lambda s: setattr(self, "text", s))
         self.page_textfx.fontRequested.connect(self._pick_font)
@@ -167,16 +214,19 @@ class Launcher(QMainWindow):
         self.page_device.burstPeakChanged.connect(lambda v: setattr(self, "burst_peak", v / 100.0))
         self.page_device.burstMaxMsChanged.connect(lambda v: setattr(self, "burst_max_ms", v))
 
-        # Footer
+        # Footer (kept for controls and audio status). In sidebar mode, overlay/device chips live in top bar.
         footer = QWidget(); footer.setObjectName("footerBar")
         fl = QHBoxLayout(footer); fl.setContentsMargins(10, 6, 10, 6)
         self.btn_launch = QPushButton("Launch")
         self.btn_stop = QPushButton("Stop")
         fl.addWidget(self.btn_launch); fl.addWidget(self.btn_stop); fl.addStretch(1)
-        self.chip_overlay = QLabel("Overlay: Idle"); self.chip_overlay.setObjectName("statusChip")
-        self.chip_device = QLabel("Device: Off"); self.chip_device.setObjectName("statusChip")
+        # Only create overlay/device chips in footer for tabbed mode
+        if self.layout_mode != "sidebar":
+            self.chip_overlay = QLabel("Overlay: Idle"); self.chip_overlay.setObjectName("statusChip")
+            self.chip_device = QLabel("Device: Off"); self.chip_device.setObjectName("statusChip")
+            fl.addWidget(self.chip_overlay); fl.addWidget(self.chip_device)
         self.chip_audio = QLabel("Audio: 0/2"); self.chip_audio.setObjectName("statusChip")
-        fl.addWidget(self.chip_overlay); fl.addWidget(self.chip_device); fl.addWidget(self.chip_audio)
+        fl.addWidget(self.chip_audio)
         main.addWidget(footer, 0)
 
         self.btn_launch.clicked.connect(self.launch)
@@ -263,6 +313,13 @@ class Launcher(QMainWindow):
             scroll.setWidget(page)
             self.tabs.addTab(scroll, "DevTools")
             self.tabs.setCurrentIndex(self.tabs.count() - 1)
+            # In sidebar mode, append to nav
+            if getattr(self, "layout_mode", "tabbed") == "sidebar" and hasattr(self, "nav"):
+                try:
+                    self.nav.addItem("DevTools")
+                    self.nav.setCurrentRow(self.tabs.count() - 1)
+                except Exception:
+                    pass
         except Exception as e:
             logging.getLogger(__name__).error("Failed to open DevTools page: %s", e)
 

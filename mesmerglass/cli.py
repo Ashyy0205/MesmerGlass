@@ -104,6 +104,9 @@ def build_parser() -> argparse.ArgumentParser:
     # Query/Navigation
     p_ui.add_argument("--list-tabs", action="store_true", help="List top-level tab names and exit")
     p_ui.add_argument("--tab", type=str, default=None, help="Select a tab by name (case-insensitive) or index")
+    # Layout selection
+    p_ui.add_argument("--layout", choices=["tabbed", "sidebar"], default="tabbed", help="Choose UI layout")
+
     # Setters
     p_ui.add_argument("--set-text", type=str, default=None, help="Set overlay text")
     p_ui.add_argument("--set-text-scale", type=int, default=None, help="Set text scale percent (0-100)")
@@ -162,7 +165,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         # Minimal Qt session to drive tab operations without side effects.
         # Note: use no-show by default to avoid window popups in CI.
         app = QApplication.instance() or QApplication([])
-        win = Launcher("MesmerGlass", enable_device_sync_default=False)  # disable device sync for CLI actions
+        win = Launcher(
+            "MesmerGlass",
+            enable_device_sync_default=False,  # disable device sync for CLI actions to keep tests deterministic
+            layout_mode=getattr(args, "layout", "tabbed"),  # pass through layout selection
+        )
         if getattr(args, "show", False):
             win.show()
         # Perform actions
@@ -242,11 +249,11 @@ def main(argv: Optional[list[str]] = None) -> int:
             }
             print(json.dumps(status))
     # Spin event loop briefly; a single-shot QTimer quits after timeout
-        from PyQt6.QtCore import QTimer
-        QTimer.singleShot(int(max(0.0, args.timeout) * 1000), app.quit)
-        rc = app.exec()
-        win.close()
-        return 0
+    from PyQt6.QtCore import QTimer
+    QTimer.singleShot(int(max(0.0, args.timeout) * 1000), app.quit)
+    rc = app.exec()
+    win.close()
+    return 0
     if cmd == "toy":
         # Minimal async runner for the toy
         async def _run_toy() -> int:

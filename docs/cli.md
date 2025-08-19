@@ -29,6 +29,7 @@ Drive simple UI actions for tests without heavy side-effects.
 Flags:
 - `--list-tabs` — Print top-level tab names (one per line) and exit.
 - `--tab <name-or-index>` — Select a tab by case-insensitive name or zero-based index.
+- `--layout {tabbed|sidebar}` — Choose the UI layout (default: `tabbed`).
 - `--set-text <str>` — Set overlay text.
 - `--set-text-scale <0..100>` — Set text scale percent.
 - `--set-fx-mode <name>` — Set FX mode.
@@ -45,6 +46,7 @@ Examples:
 ```
 python -m mesmerglass ui --list-tabs
 python -m mesmerglass ui --tab Audio --timeout 0.1
+python -m mesmerglass ui --layout sidebar --show --timeout 0.1
 python -m mesmerglass ui --tab "Text & FX" --set-text "HELLO" --set-fx-mode Shimmer --set-fx-intensity 60 --status
 python -m mesmerglass ui --displays primary --launch --timeout 0.2
 ```

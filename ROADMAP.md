@@ -22,7 +22,7 @@ Focused, incremental milestones in the exact order we’ll implement them. Each 
   - Multi-select works; connected state visible and accurate.
   - Zero regressions in Bluetooth tests.
 
-## 2) Virtual Toy devtool (for development and CI)
+## 2) Virtual Toy devtool (for development and CI) [DONE]
 
 - Scope
   - Provide a lightweight simulator for 1–2 device types with latency and intensity mapping.
@@ -35,7 +35,7 @@ Focused, incremental milestones in the exact order we’ll implement them. Each 
 - Success
   - End-to-end CLI/UI flows can run without real hardware.
 
-## 3) Sessions & “Message Packs” (JSON content bundles)
+## 3) Sessions & “Message Packs” (JSON content bundles) 
 
 - Scope
   - Define minimal JSON format for session state: text sequences, pulsing stages, fallback behaviors.
