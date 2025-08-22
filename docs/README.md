@@ -24,6 +24,7 @@ Technical specifications and architecture:
 - **[UI Components](technical/ui-components.md)** - User interface architecture
 - **[Virtual Devices](technical/virtual-devices.md)** - Virtual device simulation
 - **[CLI Interface](technical/cli-interface.md)** - Command line interface
+- **[Session Packs](technical/sessions.md)** - JSON message pack schema & usage
 
 ## 🚀 Quick Start
 

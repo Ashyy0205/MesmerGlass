@@ -52,27 +52,31 @@ from .. import __app_name__
 
 class Launcher(QMainWindow):
     def __init__(self, title: str, enable_device_sync_default: bool = True, layout_mode: str = "tabbed"):
+        """Main application launcher / controller window.
+
+        Rebuilt cleanly after earlier indentation damage; all state lives inside
+        this method. Initial display text left blank so message packs fully drive
+        content (was previously hard-coded 'MESMERGLASS').
+        """
         super().__init__()
         self.setWindowTitle(title)
-        # Layout mode: "tabbed" (default, current tests) or "sidebar"
         self.layout_mode = layout_mode if layout_mode in ("tabbed", "sidebar") else "tabbed"
 
-        # State
+        # Core state -------------------------------------------------
         self.primary_path = ""; self.secondary_path = ""
         self.primary_op = 1.0; self.secondary_op = 0.5
-        self.text = "MESMERGLASS"; self.text_color = QColor("white"); self.text_font = QFont("Segoe UI", 28)
+        self.text = ""  # blank initial message
+        self.text_color = QColor("white"); self.text_font = QFont("Segoe UI", 28)
         self.text_scale_pct = 100; self.fx_mode = "Breath + Sway"; self.fx_intensity = 50
         self.flash_interval_ms = 1200; self.flash_width_ms = 250
-
         self.audio1_path = ""; self.audio2_path = ""; self.vol1 = 0.5; self.vol2 = 0.5
         self.enable_device_sync = bool(enable_device_sync_default)
         self.enable_buzz_on_flash = True; self.buzz_intensity = 0.6
         self.enable_bursts = False; self.burst_min_s = 30; self.burst_max_s = 120; self.burst_peak = 0.9; self.burst_max_ms = 1200
-
-        self.overlays = []
+        self.overlays: list = []
         self.running = False
 
-        # Engines
+        # Engines ----------------------------------------------------
         self.audio = Audio2()
         self.pulse = PulseEngine(use_mesmer=True, allow_auto_select=False)
         self.mesmer_server = None
@@ -81,25 +85,27 @@ class Launcher(QMainWindow):
         self.scan_signaler = ScanCompleteSignaler()
         self.scan_signaler.scan_completed.connect(self._scan_completed)
 
-        # Build UI and start optional services
+        # UI / services ----------------------------------------------
         self._build_ui()
         self._bind_shortcuts()
-        self._start_mesmer_server()  # opportunistic start
+        self._start_mesmer_server()
+
+        # Message pack placeholder
+        self.session_pack = None
 
     # ========================== UI build ==========================
     def _build_ui(self):
+        # Clean reimplementation to fix prior indentation issues
         root = QWidget(); self.setCentralWidget(root)
         main = QVBoxLayout(root); main.setContentsMargins(10, 10, 10, 10); main.setSpacing(10)
 
-        # Tabs container (always created, used by both layouts)
         self.tabs = QTabWidget()
 
-        # Media tab
+        # Media
         scroll_media = QScrollArea(); scroll_media.setWidgetResizable(True); scroll_media.setFrameShape(QFrame.Shape.NoFrame)
-        scroll_media.setWidget(self._page_media())
-        self.tabs.addTab(scroll_media, "Media")
+        scroll_media.setWidget(self._page_media()); self.tabs.addTab(scroll_media, "Media")
 
-        # Text & FX tab
+        # Text & FX
         self.page_textfx = TextFxPage(
             text=self.text,
             text_scale_pct=self.text_scale_pct,
@@ -108,11 +114,16 @@ class Launcher(QMainWindow):
             flash_interval_ms=self.flash_interval_ms,
             flash_width_ms=self.flash_width_ms,
         )
+        try: self.page_textfx.loadPackRequested.connect(self._on_load_session_pack)
+        except Exception: pass
+        try:
+            self.page_textfx.createPackRequested.connect(self._on_create_message_pack)
+            # removed cycle interval feature
+        except Exception: pass
         scroll_textfx = QScrollArea(); scroll_textfx.setWidgetResizable(True); scroll_textfx.setFrameShape(QFrame.Shape.NoFrame)
-        scroll_textfx.setWidget(self.page_textfx)
-        self.tabs.addTab(scroll_textfx, "Text & FX")
+        scroll_textfx.setWidget(self.page_textfx); self.tabs.addTab(scroll_textfx, "Text & FX")
 
-        # Audio tab
+        # Audio
         self.page_audio = AudioPage(
             file1=os.path.basename(self.audio1_path),
             file2=os.path.basename(self.audio2_path),
@@ -120,10 +131,9 @@ class Launcher(QMainWindow):
             vol2_pct=int(self.vol2 * 100),
         )
         scroll_audio = QScrollArea(); scroll_audio.setWidgetResizable(True); scroll_audio.setFrameShape(QFrame.Shape.NoFrame)
-        scroll_audio.setWidget(self.page_audio)
-        self.tabs.addTab(scroll_audio, "Audio")
+        scroll_audio.setWidget(self.page_audio); self.tabs.addTab(scroll_audio, "Audio")
 
-        # Device tab
+        # Device
         self.page_device = DevicePage(
             enable_sync=self.enable_device_sync,
             buzz_on_flash=self.enable_buzz_on_flash,
@@ -135,99 +145,75 @@ class Launcher(QMainWindow):
             max_ms=self.burst_max_ms,
         )
         scroll_device = QScrollArea(); scroll_device.setWidgetResizable(True); scroll_device.setFrameShape(QFrame.Shape.NoFrame)
-        scroll_device.setWidget(self.page_device)
-        self.tabs.addTab(scroll_device, "Device Sync")
+        scroll_device.setWidget(self.page_device); self.tabs.addTab(scroll_device, "Device Sync")
 
-        # Displays tab
+        # Displays
         scroll_displays = QScrollArea(); scroll_displays.setWidgetResizable(True); scroll_displays.setFrameShape(QFrame.Shape.NoFrame)
-        scroll_displays.setWidget(self._page_displays())
-        self.tabs.addTab(scroll_displays, "Displays")
+        scroll_displays.setWidget(self._page_displays()); self.tabs.addTab(scroll_displays, "Displays")
 
-        # Build chrome/layout
         if self.layout_mode == "sidebar":
-            # Top bar with hard-coded program name as requested
             topbar = QWidget(); topbar.setObjectName("topBar")
-            tbl = QHBoxLayout(topbar); tbl.setContentsMargins(12, 8, 12, 8); tbl.setSpacing(8)
+            tbl = QHBoxLayout(topbar); tbl.setContentsMargins(12,8,12,8); tbl.setSpacing(8)
             title_lab = QLabel("MesmerGlass"); title_lab.setObjectName("topTitle")
-            tbl.addWidget(title_lab, 0); tbl.addStretch(1)
-            # Status chips in top bar
+            tbl.addWidget(title_lab,0); tbl.addStretch(1)
             self.chip_overlay = QLabel("Overlay: Idle"); self.chip_overlay.setObjectName("statusChip")
             self.chip_device = QLabel("Device: Off"); self.chip_device.setObjectName("statusChip")
-            tbl.addWidget(self.chip_overlay, 0); tbl.addWidget(self.chip_device, 0)
-            main.addWidget(topbar, 0)
-
-            # Left nav + content
-            center = QWidget(); ch = QHBoxLayout(center); ch.setContentsMargins(0, 0, 0, 0); ch.setSpacing(10)
+            tbl.addWidget(self.chip_overlay,0); tbl.addWidget(self.chip_device,0)
+            main.addWidget(topbar,0)
+            center = QWidget(); ch = QHBoxLayout(center); ch.setContentsMargins(0,0,0,0); ch.setSpacing(10)
             self.nav = QListWidget(); self.nav.setObjectName("sideNav")
-            for name in ("Media", "Text & FX", "Audio", "Device Sync", "Displays"):
-                self.nav.addItem(name)
+            for name in ("Media","Text & FX","Audio","Device Sync","Displays"): self.nav.addItem(name)
             self.nav.setCurrentRow(0)
-            # Hide the tab bar; use side nav instead
-            try:
-                self.tabs.tabBar().setVisible(False)
-            except Exception:
-                pass
-            ch.addWidget(self.nav, 0)
-            ch.addWidget(self.tabs, 1)
-            main.addWidget(center, 1)
-
-            # Wire nav <-> tabs
-            def _on_nav_change(i: int):
-                if 0 <= i < self.tabs.count():
-                    self.tabs.setCurrentIndex(i)
-            self.nav.currentRowChanged.connect(_on_nav_change)
+            try: self.tabs.tabBar().setVisible(False)
+            except Exception: pass
+            ch.addWidget(self.nav,0); ch.addWidget(self.tabs,1); main.addWidget(center,1)
+            def _on_nav(i:int):
+                if 0 <= i < self.tabs.count(): self.tabs.setCurrentIndex(i)
+            self.nav.currentRowChanged.connect(_on_nav)
             self.tabs.currentChanged.connect(lambda i: self.nav.setCurrentRow(i))
         else:
-            # Default: tabbed layout with visible tabs
-            try:
-                self.tabs.tabBar().setVisible(True)
-            except Exception:
-                pass
-            main.addWidget(self.tabs, 1)
+            try: self.tabs.tabBar().setVisible(True)
+            except Exception: pass
+            main.addWidget(self.tabs,1)
 
-        # Wire page signals -> state
-        self.page_textfx.textChanged.connect(lambda s: setattr(self, "text", s))
-        self.page_textfx.fontRequested.connect(self._pick_font)
-        self.page_textfx.colorRequested.connect(self._pick_color)
-        self.page_textfx.textScaleChanged.connect(lambda v: setattr(self, "text_scale_pct", v))
-        self.page_textfx.fxModeChanged.connect(lambda s: setattr(self, "fx_mode", s))
-        self.page_textfx.fxIntensityChanged.connect(lambda v: setattr(self, "fx_intensity", v))
-        self.page_textfx.flashIntervalChanged.connect(lambda v: setattr(self, "flash_interval_ms", v))
-        self.page_textfx.flashWidthChanged.connect(lambda v: setattr(self, "flash_width_ms", v))
+        # Wire signals
+        self.page_textfx.textChanged.connect(lambda s: setattr(self, 'text', s))
+        self.page_textfx.textScaleChanged.connect(lambda v: setattr(self, 'text_scale_pct', v))
+        self.page_textfx.fxModeChanged.connect(lambda s: setattr(self, 'fx_mode', s))
+        self.page_textfx.fxIntensityChanged.connect(lambda v: setattr(self, 'fx_intensity', v))
+        self.page_textfx.flashIntervalChanged.connect(lambda v: setattr(self, 'flash_interval_ms', v))
+        self.page_textfx.flashWidthChanged.connect(lambda v: setattr(self, 'flash_width_ms', v))
+        # Apply chosen text colour live
+        if hasattr(self.page_textfx, 'colorChanged'):
+            self.page_textfx.colorChanged.connect(self._on_text_color_changed)
 
-        # Audio wiring
         self.page_audio.load1Requested.connect(self._pick_a1)
         self.page_audio.load2Requested.connect(self._pick_a2)
-        self.page_audio.vol1Changed.connect(lambda pct: self._set_vols(pct / 100.0, self.vol2))
-        self.page_audio.vol2Changed.connect(lambda pct: self._set_vols(self.vol1, pct / 100.0))
+        self.page_audio.vol1Changed.connect(lambda pct: self._set_vols(pct/100.0, self.vol2))
+        self.page_audio.vol2Changed.connect(lambda pct: self._set_vols(self.vol1, pct/100.0))
 
-        # Device wiring
         self.page_device.enableSyncChanged.connect(self._on_toggle_device_sync)
         self.page_device.scanDevicesRequested.connect(self._on_scan_devices)
         self.page_device.deviceSelected.connect(self._on_device_selected)
-        self.page_device.devicesSelected.connect(self._on_devices_selected)  # multi-select handler
-        self.page_device.buzzOnFlashChanged.connect(lambda b: setattr(self, "enable_buzz_on_flash", b))
-        self.page_device.buzzIntensityChanged.connect(lambda v: setattr(self, "buzz_intensity", v / 100.0))
-        self.page_device.burstsEnableChanged.connect(lambda b: setattr(self, "enable_bursts", b))
-        self.page_device.burstMinChanged.connect(lambda v: setattr(self, "burst_min_s", v))
-        self.page_device.burstMaxChanged.connect(lambda v: setattr(self, "burst_max_s", v))
-        self.page_device.burstPeakChanged.connect(lambda v: setattr(self, "burst_peak", v / 100.0))
-        self.page_device.burstMaxMsChanged.connect(lambda v: setattr(self, "burst_max_ms", v))
+        self.page_device.devicesSelected.connect(self._on_devices_selected)
+        self.page_device.buzzOnFlashChanged.connect(lambda b: setattr(self,'enable_buzz_on_flash', b))
+        self.page_device.buzzIntensityChanged.connect(lambda v: setattr(self,'buzz_intensity', v/100.0))
+        self.page_device.burstsEnableChanged.connect(lambda b: setattr(self,'enable_bursts', b))
+        self.page_device.burstMinChanged.connect(lambda v: setattr(self,'burst_min_s', v))
+        self.page_device.burstMaxChanged.connect(lambda v: setattr(self,'burst_max_s', v))
+        self.page_device.burstPeakChanged.connect(lambda v: setattr(self,'burst_peak', v/100.0))
+        self.page_device.burstMaxMsChanged.connect(lambda v: setattr(self,'burst_max_ms', v))
 
-        # Footer (kept for controls and audio status). In sidebar mode, overlay/device chips live in top bar.
-        footer = QWidget(); footer.setObjectName("footerBar")
-        fl = QHBoxLayout(footer); fl.setContentsMargins(10, 6, 10, 6)
-        self.btn_launch = QPushButton("Launch")
-        self.btn_stop = QPushButton("Stop")
+        footer = QWidget(); footer.setObjectName('footerBar')
+        fl = QHBoxLayout(footer); fl.setContentsMargins(10,6,10,6)
+        self.btn_launch = QPushButton('Launch'); self.btn_stop = QPushButton('Stop')
         fl.addWidget(self.btn_launch); fl.addWidget(self.btn_stop); fl.addStretch(1)
-        # Only create overlay/device chips in footer for tabbed mode
-        if self.layout_mode != "sidebar":
-            self.chip_overlay = QLabel("Overlay: Idle"); self.chip_overlay.setObjectName("statusChip")
-            self.chip_device = QLabel("Device: Off"); self.chip_device.setObjectName("statusChip")
+        if self.layout_mode != 'sidebar':
+            self.chip_overlay = QLabel('Overlay: Idle'); self.chip_overlay.setObjectName('statusChip')
+            self.chip_device = QLabel('Device: Off'); self.chip_device.setObjectName('statusChip')
             fl.addWidget(self.chip_overlay); fl.addWidget(self.chip_device)
-        self.chip_audio = QLabel("Audio: 0/2"); self.chip_audio.setObjectName("statusChip")
-        fl.addWidget(self.chip_audio)
-        main.addWidget(footer, 0)
+        self.chip_audio = QLabel('Audio: 0/2'); self.chip_audio.setObjectName('statusChip')
+        fl.addWidget(self.chip_audio); main.addWidget(footer,0)
 
         self.btn_launch.clicked.connect(self.launch)
         self.btn_stop.clicked.connect(self.stop_all)
@@ -607,40 +593,71 @@ class Launcher(QMainWindow):
                                self.fx_mode, self.fx_intensity)
             ov.start_time = shared_start_time
             self.overlays.append(ov)
-        if self.overlays and self.enable_device_sync and self.enable_buzz_on_flash:
+        # Always use a single shared flash timer so message changes align exactly
+        # with flash boundaries (prevents mid-flash text changes). Buzz logic
+        # inside the timer remains conditional on enable_device_sync.
+        if self.overlays:
             self._wire_shared_flash_timer(shared_start_time)
         if self.enable_device_sync and self.enable_bursts:
             self._start_burst_scheduler()
 
     def _wire_shared_flash_timer(self, shared_start_time: float):
-        """Create a single synchronized flash timer for all overlays to prevent double-speed flashing."""
+        """Single synchronized flash timer (always used).
+
+        We pick a new random message only on the rising edge of a flash (show
+        transitions False->True). This guarantees the text does not change mid
+        flash and keeps all overlays in sync. (Revised: we now pre-pick the
+        next flash's message shortly *before* the visible phase begins so the
+        very first illuminated frame already shows the new text. This removes
+        the user's observed mid-illumination text switch caused by picking a
+        few milliseconds after the flash started.)
+        """
         self._shared_flash_timer = QTimer(self)
         self._prev_flash_show = False
+        # Track which cycle (integer division of elapsed_ms / interval) we have
+        # already prepared/picked a message for. We prepare the *upcoming* cycle
+        # shortly before it becomes visible (during the dark phase) so that the
+        # first bright frame already has the new message.
+        self._prepared_cycle = -1  # last cycle index for which message was set
+        lead_ms = 40  # how many ms before flash start we pre-pick (tunable)
         def on_shared_tick():
             if not self.overlays:
                 return
-            first_overlay = self.overlays[0]
+            # Use current global flash settings (self.flash_interval_ms / self.flash_width_ms)
+            # so changes via UI take effect immediately without recreating timer.
             now_ms = int((time.time() - shared_start_time) * 1000.0)
-            show = (now_ms % first_overlay.flash_interval_ms) < first_overlay.flash_width_ms
-            if self.enable_device_sync and self.enable_buzz_on_flash and show and not self._prev_flash_show:
-                ms = first_overlay.flash_width_ms
-                lvl = float(clamp(self.buzz_intensity, 0.0, 1.0))
-                self.pulse.pulse(lvl, ms)
+            interval = max(50, int(getattr(self, 'flash_interval_ms', 1200)))
+            width = max(10, min(interval, int(getattr(self, 'flash_width_ms', 250))))
+            phase = now_ms % interval
+            cycle = now_ms // interval  # integer cycle index
+            show = phase < width
+
+            if not show:
+                # We're in dark phase. If close to next flash boundary (within lead_ms)
+                # prepare upcoming cycle's message (cycle+1) once.
+                remaining = interval - phase
+                if remaining <= lead_ms:
+                    upcoming_cycle = cycle + 1
+                    if self._prepared_cycle != upcoming_cycle:
+                        self._pick_random_message()  # pre-pick for next flash
+                        self._prepared_cycle = upcoming_cycle
+            else:
+                # Visible phase. On the very first tick of visibility ensure a
+                # message exists for this cycle (fallback if pre-pick missed boundary).
+                if not self._prev_flash_show:
+                    if self._prepared_cycle != cycle:
+                        self._pick_random_message()
+                        self._prepared_cycle = cycle
+                    if self.enable_device_sync and self.enable_buzz_on_flash:
+                        ms = width
+                        lvl = float(clamp(self.buzz_intensity, 0.0, 1.0))
+                        self.pulse.pulse(lvl, ms)
+
             self._prev_flash_show = show
         self._shared_flash_timer.timeout.connect(on_shared_tick)
         self._shared_flash_timer.start(15)  # 15ms interval for smooth detection
 
-    def _wire_flash_timer(self, ov: OverlayWindow):
-        ov._prev_show = False
-        t = QTimer(self)
-        def on_tick():
-            now_ms = int((time.time()-ov.start_time)*1000.0)
-            show = (now_ms % ov.flash_interval_ms) < ov.flash_width_ms
-            if self.enable_device_sync and self.enable_buzz_on_flash and show and not getattr(ov, "_prev_show", False):
-                ms = ov.flash_width_ms; lvl = float(clamp(self.buzz_intensity, 0.0, 1.0))
-                self.pulse.pulse(lvl, ms)
-            ov._prev_show = show
-        t.timeout.connect(on_tick); t.start(15); ov._flash_sync_timer = t
+    # per-overlay timer removed; shared timer always used
 
     def _start_burst_scheduler(self):
         self._burst_next_at = time.time() + random.uniform(self.burst_min_s, self.burst_max_s)
@@ -691,3 +708,153 @@ class Launcher(QMainWindow):
         try: self.pulse.set_level(0.0)
         except Exception: pass
         self.pulse.stop()
+    # ---------------- Message Pack (v1 mapping) ----------------
+    def apply_session_pack(self, pack):  # duck-typed SessionPack
+        try:
+            self.session_pack = pack
+            self._cycle_index = 0
+            self._cycle_weights = []
+            first = getattr(pack, 'first_text', None)
+            if first:
+                self.text = first
+                try:
+                    if hasattr(self.page_textfx, 'set_text'):
+                        self.page_textfx.set_text(first)
+                    if hasattr(self.page_textfx, 'set_pack_name'):
+                        self.page_textfx.set_pack_name(getattr(pack, 'name', '(pack)'))
+                except Exception:
+                    pass
+            avg = getattr(pack, 'avg_intensity', None)
+            if avg is not None:
+                self.buzz_intensity = max(0.0, min(1.0, float(avg)))
+            logging.getLogger(__name__).info("Applied message pack '%s' (text_set=%s avg_intensity=%s)", getattr(pack, 'name', '?'), bool(first), avg)
+            # Precompute weights for per-flash random selection
+            self._prepare_pack_weights()
+        except Exception as e:
+            logging.getLogger(__name__).error("Failed to apply message pack: %s", e)
+            raise
+
+    # ---- message pack UI handlers ----
+    def _on_load_session_pack(self):
+        from PyQt6.QtWidgets import QFileDialog, QMessageBox
+        try:
+            fn, _ = QFileDialog.getOpenFileName(self, "Load message pack", "", "Message Packs (*.json);;All Files (*.*)")
+            if not fn:
+                return
+            from ..content.loader import load_session_pack
+            pack = load_session_pack(fn)
+            self.apply_session_pack(pack)
+            QMessageBox.information(self, "Message Pack", f"Loaded pack '{pack.name}'")
+        except Exception as e:
+            logging.getLogger(__name__).error("Error loading message pack: %s", e)
+            try:
+                QMessageBox.critical(self, "Message Pack", f"Failed to load pack: {e}")
+            except Exception:
+                pass
+
+    def _on_save_session_pack(self):
+        from PyQt6.QtWidgets import QFileDialog, QMessageBox
+        try:
+            fn, _ = QFileDialog.getSaveFileName(self, "Save message pack", "message_pack.json", "Message Packs (*.json);;All Files (*.*)")
+            if not fn:
+                return
+            # Build a minimal pack dictionary reflecting current text + a single pulse stage heuristic
+            data = {
+                "version": 1,
+                "name": "Saved Pack",
+                "text": {"items": [{"msg": getattr(self, 'text', ''), "secs": 5}]},
+                "pulse": {"stages": [{"mode": "wave", "intensity": float(getattr(self, 'buzz_intensity', 0.5)), "secs": 10}], "fallback": "idle"}
+            }
+            import json
+            with open(fn, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            if hasattr(self.page_textfx, 'set_pack_name'):
+                self.page_textfx.set_pack_name(data.get('name'))
+            QMessageBox.information(self, "Message Pack", f"Saved pack to {fn}")
+        except Exception as e:
+            logging.getLogger(__name__).error("Error saving message pack: %s", e)
+            try:
+                QMessageBox.critical(self, "Message Pack", f"Failed to save pack: {e}")
+            except Exception:
+                pass
+    # New editor dialog
+    def _on_create_message_pack(self):
+        try:
+            from .dialogs.message_pack_editor import MessagePackEditor
+            from PyQt6.QtWidgets import QDialog
+            dlg = MessagePackEditor(self)
+            if dlg.exec() == QDialog.DialogCode.Accepted and hasattr(dlg, 'result_pack'):
+                pack = dlg.result_pack
+                self.apply_session_pack(pack)
+                try:
+                    self.page_textfx.set_pack_name(getattr(pack, 'name', '(pack)'))
+                except Exception:
+                    pass
+        except Exception as e:
+            logging.getLogger(__name__).error("Editor failed: %s", e)
+
+    # Legacy cycle timer methods removed (replaced by per-flash pre-pick logic above)
+
+    def _prepare_pack_weights(self):  # Per-flash random message selection helper
+        """Build weight list from current session_pack for random selection each flash."""
+        try:
+            pack = getattr(self, 'session_pack', None)
+            self._cycle_weights = []
+            if not pack or not getattr(pack, 'text', None) or not pack.text.items:
+                return
+            for it in pack.text.items:
+                try:
+                    w = float(getattr(it, 'effective_weight', lambda: 1.0)())
+                except Exception:
+                    w = float(getattr(it, 'secs', 1) or 1)
+                if w <= 0: w = 1.0
+                self._cycle_weights.append(w)
+        except Exception:
+            self._cycle_weights = []
+
+    def _pick_random_message(self):
+        try:
+            import random
+            pack = getattr(self, 'session_pack', None)
+            if not pack or not getattr(pack, 'text', None) or not pack.text.items:
+                return
+            items = pack.text.items
+            if not items: return
+            weights = getattr(self, '_cycle_weights', None)
+            if not weights or len(weights) != len(items):
+                self._prepare_pack_weights(); weights = getattr(self, '_cycle_weights', [1]*len(items))
+            idx = random.choices(range(len(items)), weights=weights, k=1)[0]
+            msg = items[idx].msg
+            self.text = msg
+            try:
+                if hasattr(self.page_textfx, 'set_text'): self.page_textfx.set_text(msg)
+                # Update overlay texts live
+                for ov in getattr(self, 'overlays', []):
+                    ov.text = msg
+            except Exception:
+                pass
+        except Exception as e:
+            logging.getLogger(__name__).error("Random message pick failed: %s", e)
+
+    def _on_text_color_changed(self, hex_str: str):
+        """Update text colour and propagate to overlays."""
+        try:
+            from PyQt6.QtGui import QColor
+            c = QColor(hex_str)
+            if c.isValid():
+                self.text_color = c
+                for ov in getattr(self, 'overlays', []):
+                    ov.text_color = c
+        except Exception:
+            pass
+        try:
+            if hasattr(self, '_cycle_timer') and self._cycle_timer and getattr(self, 'session_pack', None) and self.page_textfx.is_auto_cycle_enabled():
+                # Simply restart timer (do not advance message immediately)
+                interval_ms = 5000
+                try:
+                    interval_ms = int(self.page_textfx.cycle_interval_secs()) * 1000
+                except Exception:
+                    interval_ms = 5000
+                self._cycle_timer.start(interval_ms)
+        except Exception:
+            pass

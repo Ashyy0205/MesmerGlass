@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "name": "Training",
+  "text": {
+    "items": [
+      {
+        "msg": "Good Boy Love Diapers",
+        "weight": 1.0
+      },
+      {
+        "msg": "Good Boy Wear Diapers",
+        "weight": 1.0
+      },
+      {
+        "msg": "Good Boys Obey Daddy",
+        "weight": 1.0
+      },
+      {
+        "msg": "You Are A Good Boy",
+        "weight": 1.0
+      }
+    ]
+  },
+  "pulse": {
+    "stages": []
+  }
+}

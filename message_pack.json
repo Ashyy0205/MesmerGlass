@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "name": "Untitled Pack",
+  "text": {
+    "items": [
+      {
+        "msg": "Obey",
+        "secs": 5
+      }
+    ]
+  },
+  "pulse": {
+    "stages": [
+      {
+        "mode": "wave",
+        "intensity": 0.5,
+        "secs": 5
+      }
+    ]
+  }
+}

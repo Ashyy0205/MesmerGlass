@@ -81,13 +81,16 @@ async def test_text_and_effects(launcher):
     # Get text fx page
     text_fx_page = launcher.tabs.currentWidget().widget()
     
-    # Find text input
+    # Find text & fx group
     text_group = next(g for g in text_fx_page.findChildren(QGroupBox)
                      if g.title() == "Text & FX")
-    text_input = next(w for w in text_group.findChildren(QLineEdit))
-    text_input.setText("TEST TEXT")
-    QTest.qWait(100)  # Allow signals to propagate
-    assert launcher.text == "TEST TEXT", "Text should update"
+    # New design uses a QLabel (read-only) instead of QLineEdit; verify label exists
+    lbls = [w for w in text_group.findChildren(QLabel) if w.text()]
+    assert lbls, "Expected at least one QLabel in Text & FX group"
+    # Simulate a message update via API
+    launcher.page_textfx.set_text("TEST TEXT")
+    QTest.qWait(100)
+    assert launcher.text == "TEST TEXT"
     
     # Test effect mode selection
     effect_combo = next(w for w in text_group.findChildren(QComboBox)

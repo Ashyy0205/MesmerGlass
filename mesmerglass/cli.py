@@ -9,15 +9,17 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 from typing import Optional
 
-from .app import run as run_gui
-from PyQt6.QtWidgets import QApplication
-from .ui.launcher import Launcher
+# Suppress pygame support prompt so JSON outputs (e.g. session --print) remain clean.
+os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
+
 from .engine.buttplug_server import ButtplugServer
 from .engine.pulse import PulseEngine
 from .logging_utils import setup_logging, get_default_log_path
 from .devtools.virtual_toy import VirtualToy  # dev-only, used by 'toy' subcommand
+from .content.loader import load_session_pack  # session packs
 
 
 def _add_logging_args(parser: argparse.ArgumentParser) -> None:
@@ -136,6 +138,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("selftest", help="Quick environment/import check")
 
+    # Session pack subcommand
+    p_sess = sub.add_parser("session", help="Load and inspect/apply a session pack")
+    p_sess.add_argument("--load", required=True, help="Path to session pack JSON file")
+    g = p_sess.add_mutually_exclusive_group()
+    g.add_argument("--print", action="store_true", help="Print canonical JSON and exit")
+    g.add_argument("--apply", action="store_true", help="Apply pack to headless launcher and print status JSON")
+    g.add_argument("--summary", action="store_true", help="Print concise summary (default)")
+
     return parser
 
 
@@ -153,16 +163,58 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     cmd = args.command or "run"
     if cmd == "run":
+        # Import app lazily so that commands like 'session' don't trigger pygame/audio init
+        # which would emit banners on stdout and break JSON parsing in tests.
+        from .app import run as run_gui  # local import
         run_gui()
         return 0
     if cmd == "selftest":
         return selftest()
+    if cmd == "session":
+        import json as _json
+        try:
+            pack = load_session_pack(args.load)
+        except Exception as e:
+            logging.getLogger(__name__).error("Failed to load session pack: %s", e)
+            return 1
+        # Determine mode
+        summary_mode = (not args.print and not args.apply) or args.summary
+        if args.print:
+            print(_json.dumps(pack.to_canonical_dict(), separators=(",", ":"), ensure_ascii=False))
+            return 0
+        if args.apply:
+            # Headless apply (no event loop spin)
+            from PyQt6.QtWidgets import QApplication
+            from .ui.launcher import Launcher
+            app = QApplication.instance() or QApplication([])
+            win = Launcher("MesmerGlass", enable_device_sync_default=False)
+            try:
+                if hasattr(win, "apply_session_pack"):
+                    win.apply_session_pack(pack)
+            except Exception as e:
+                logging.getLogger(__name__).error("Error applying session pack: %s", e)
+                return 1
+            status = {"pack": pack.name, "text": getattr(win, "text", None), "buzz_intensity": getattr(win, "buzz_intensity", None)}
+            print(_json.dumps(status, ensure_ascii=False))
+            try:
+                win.close()
+            except Exception:
+                pass
+            return 0
+        if summary_mode:
+            ti = f"{len(pack.text.items)} text" if pack.text.items else "0 text"
+            ps = f"{len(pack.pulse.stages)} stages" if pack.pulse.stages else "0 stages"
+            print(f"SessionPack '{pack.name}' v{pack.version} — {ti}, {ps}")
+            return 0
     if cmd == "pulse":
         return asyncio.run(_cli_pulse(args.level, args.duration, args.port))
     if cmd == "server":
         return _cli_server(args.port)
     if cmd == "ui":
         # Minimal Qt session to drive tab operations without side effects.
+        # Import here to avoid unnecessary Qt init for non-UI subcommands.
+        from PyQt6.QtWidgets import QApplication
+        from .ui.launcher import Launcher
         # Note: use no-show by default to avoid window popups in CI.
         app = QApplication.instance() or QApplication([])
         win = Launcher(
@@ -248,12 +300,15 @@ def main(argv: Optional[list[str]] = None) -> int:
                 "displays_checked": sum(1 for i in range(win.list_displays.count()) if win.list_displays.item(i).checkState() != 0),
             }
             print(json.dumps(status))
-    # Spin event loop briefly; a single-shot QTimer quits after timeout
-    from PyQt6.QtCore import QTimer
-    QTimer.singleShot(int(max(0.0, args.timeout) * 1000), app.quit)
-    rc = app.exec()
-    win.close()
-    return 0
+        # Spin event loop briefly; a single-shot QTimer quits after timeout
+        from PyQt6.QtCore import QTimer
+        QTimer.singleShot(int(max(0.0, args.timeout) * 1000), app.quit)
+        app.exec()
+        try:
+            win.close()
+        except Exception:
+            pass
+        return 0
     if cmd == "toy":
         # Minimal async runner for the toy
         async def _run_toy() -> int:
