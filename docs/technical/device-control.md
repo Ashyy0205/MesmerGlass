@@ -3,6 +3,29 @@
 ## Overview
 The device control system manages communication with external devices using the Buttplug protocol over WebSocket connections.
 
+### Scanning Strategy (On-Demand + Maintenance)
+MesmerGlass performs **on-demand BLE scanning only** when the user explicitly initiates a scan (e.g. via the UI scan button). After a scan window completes and devices are selected, continuous advertising scans are stopped to reduce log noise and conserve resources.
+
+Connected real devices are kept alive by a lightweight periodic **connection maintenance** task:
+- Runs every 10s (default) in the background.
+- Performs a one-shot discovery only if a previously connected device appears disconnected.
+- Attempts targeted reconnection for those addresses only.
+- Logs a concise summary (ok / reconnected / failed) instead of per-advertisement spam.
+
+Verbose advertisement logging can be re-enabled for diagnostics by calling `BluetoothDeviceScanner.set_verbose(True)` or constructing it with `verbose=True`.
+
+Benefits:
+- Eliminates continuous BLE log spam after overlay launch.
+- Reduces Bluetooth stack load on Windows.
+- Keeps reconnection logic explicit and predictable.
+
+Failure Mode Notes:
+- If a device repeatedly fails to reconnect it will appear in the maintenance summary under `failed` until a manual scan is initiated again.
+- Manual scan always supersedes maintenance (maintenance does not run while an active scan session is in progress).
+
+Tuning:
+- Maintenance interval and repeat logging interval are constants (`10s` and `30s` respectively) and can be safely adjusted with minimal impact.
+
 ## Components
 
 ### 1. PulseEngine

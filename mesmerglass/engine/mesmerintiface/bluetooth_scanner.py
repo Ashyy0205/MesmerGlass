@@ -8,7 +8,8 @@ import asyncio
 import logging
 from typing import Dict, List, Optional, Callable, Set
 from dataclasses import dataclass
-from bleak import BleakScanner, BleakClient, BLEDevice
+import time  # monotonic timing for connection maintenance without relying on event loop time
+from bleak import BleakScanner, BleakClient  # BLEDevice type imported below from backend for typing only
 from bleak.backends.device import BLEDevice as BLEDeviceType
 
 @dataclass
@@ -51,12 +52,21 @@ class BluetoothDeviceScanner:
         0x0003: "kiiroo",
     }
     
-    def __init__(self):
+    def __init__(self, *, log_unknown: bool = False, repeat_interval: float = 30.0, verbose: bool = False):
         self._scanning = False
         self._scanner = None
         self._discovered_devices: Dict[str, BluetoothDeviceInfo] = {}
         self._device_callbacks: List[Callable[[List[BluetoothDeviceInfo]], None]] = []
         self._connected_clients: Dict[str, BleakClient] = {}
+        # Maintenance / logging controls
+        self._log_unknown = log_unknown
+        self._repeat_interval = repeat_interval  # seconds between repeat INFO logs per device
+        self._verbose = verbose
+        self._last_log_times: Dict[str, float] = {}  # address -> last INFO log monotonic time
+        self._seen_addresses: Set[str] = set()  # track addresses we've seen to avoid repeated 'first seen' logs for unknowns
+        # Counters for summary-only mode
+        self._adv_total = 0
+        self._adv_identified = 0
         
         # Setup logging with console output
         self._logger = logging.getLogger(__name__)
@@ -89,6 +99,9 @@ class BluetoothDeviceScanner:
             
         try:
             self._scanning = True
+            # Reset advertisement counters at scan start
+            self._adv_total = 0
+            self._adv_identified = 0
             self._logger.info("Starting Bluetooth LE device scan")
             
             # Start scanning with device detection callback
@@ -119,6 +132,14 @@ class BluetoothDeviceScanner:
             if self._scanner:
                 await self._scanner.stop()
                 self._scanner = None
+            # Emit summary line if any advertisements were seen
+            try:
+                if self._adv_total:
+                    self._logger.info(
+                        f"Scan found {self._adv_total} BLE advertisements ({self._adv_identified} recognized)"
+                    )
+            except Exception:
+                pass
             self._logger.info("Stopped Bluetooth LE device scan")
         except Exception as e:
             self._logger.error(f"Error stopping scanner: {e}")
@@ -240,75 +261,71 @@ class BluetoothDeviceScanner:
             return False
             
     def _on_device_detected(self, device: BLEDeviceType, advertisement_data) -> None:
-        """Handle detected Bluetooth device."""
-        # Skip if shutting down
+        """Handle detected Bluetooth device.
+
+        Logging strategy:
+        - Identify first; only log unknown devices at INFO if configured (_log_unknown or verbose).
+        - Throttle per-address INFO logs using _last_log_times & repeat interval.
+        - Always record address in _seen_addresses so we don't treat unknowns as perpetually new.
+        """
         if self._shutdown:
             return
-
         try:
-            # Extract device information
+            addr = device.address
+            # Count every advertisement
+            self._adv_total += 1
+            first_seen = addr not in self._seen_addresses
+            if first_seen:
+                self._seen_addresses.add(addr)
+
             device_info = BluetoothDeviceInfo(
-                address=device.address,
+                address=addr,
                 name=device.name,
                 rssi=advertisement_data.rssi,
                 manufacturer_data=advertisement_data.manufacturer_data,
                 service_uuids=[str(uuid) for uuid in advertisement_data.service_uuids],
             )
-
-            # Log all detected devices for debugging
-            self._logger.info(
-                f"Detected BLE device: {device.name or 'Unknown'} ({device.address}) RSSI: {advertisement_data.rssi}"
-            )
-            if device_info.service_uuids:
-                self._logger.info(f"  Service UUIDs: {device_info.service_uuids}")
-            if device_info.manufacturer_data:
-                self._logger.info(f"  Manufacturer data: {device_info.manufacturer_data}")
-
-            # Check if this looks like a sex toy
             device_type, protocol = self._identify_device(device_info)
             if device_type:
+                self._adv_identified += 1
                 device_info.device_type = device_type
                 device_info.protocol = protocol
-
-                # Store/update device
-                self._discovered_devices[device.address] = device_info
-
-                self._logger.info(
-                    f"✅ Identified {device_type} device: {device.name or device.address}"
-                )
-
-                # Notify callbacks (but not if shutting down). Guard against closed loop.
+                self._discovered_devices[addr] = device_info
+                # Throttle identified device logging (always at least once)
+                now = time.monotonic(); last = self._last_log_times.get(addr, 0.0)
+                if self._verbose or (now - last >= self._repeat_interval) or first_seen:
+                    self._last_log_times[addr] = now
+                    self._logger.info(
+                        f"✅ Identified {device_type} device: {device.name or addr} RSSI: {advertisement_data.rssi}"
+                    )
+                else:
+                    self._logger.debug(
+                        f"BLE adv (id {device_type}): {device.name or addr} RSSI {advertisement_data.rssi}"
+                    )
                 if not self._shutdown:
                     try:
                         self._notify_device_callbacks()
                     except RuntimeError as e:
-                        # On Windows, callbacks may be scheduled on a closed loop during teardown.
                         if "Event loop is closed" in str(e):
-                            self._logger.debug(
-                                "Callback skipped: event loop closed during shutdown"
-                            )
+                            self._logger.debug("Callback skipped: event loop closed during shutdown")
                         else:
                             raise
             else:
-                # For debugging: store unidentified devices too
-                device_info.device_type = "unknown"
-                device_info.protocol = "unknown"
-                self._discovered_devices[device.address] = device_info
-
-                # Notify callbacks for all devices during development
-                if not self._shutdown:
-                    try:
-                        self._notify_device_callbacks()
-                    except RuntimeError as e:
-                        if "Event loop is closed" in str(e):
-                            self._logger.debug(
-                                "Callback skipped: event loop closed during shutdown"
-                            )
-                        else:
-                            raise
-
+                # Unknown device path: suppress per-device INFO in summary-only mode unless verbose/log_unknown
+                if self._verbose or self._log_unknown:
+                    now = time.monotonic(); last = self._last_log_times.get(addr, 0.0)
+                    if self._verbose or (now - last >= self._repeat_interval) or first_seen:
+                        self._last_log_times[addr] = now
+                        self._logger.info(
+                            f"Detected BLE device: {device.name or 'Unknown'} ({addr}) RSSI: {advertisement_data.rssi}"
+                        )
+                    else:
+                        self._logger.debug(
+                            f"BLE adv: {device.name or 'Unknown'} ({addr}) RSSI {advertisement_data.rssi}"
+                        )
+                # Not storing unknown devices to keep discovered list focused, unless future need arises.
         except Exception as e:
-            if not self._shutdown:  # Don't log errors during shutdown
+            if not self._shutdown:
                 self._logger.error(f"Error processing detected device: {e}")
             
     def _identify_device(self, device_info: BluetoothDeviceInfo) -> tuple[Optional[str], Optional[str]]:
@@ -418,3 +435,80 @@ class BluetoothDeviceScanner:
         except Exception:
             # Be defensive; shutdown should not raise
             pass
+
+    # ------------------------------------------------------------------
+    # Connection maintenance (no continuous scan)                       
+    # ------------------------------------------------------------------
+    async def _discover_once(self) -> List[BLEDeviceType]:
+        """Perform a one-shot discovery (no continuous advertising callback).
+
+        Separated for easier mocking in tests.
+        """
+        try:
+            return await BleakScanner.discover()
+        except Exception as e:
+            self._logger.debug(f"One-shot discover failed: {e}")
+            return []
+
+    async def maintain_connections(self, addresses: List[str]) -> Dict[str, str]:
+        """Ensure provided device addresses remain connected without continuous scanning.
+
+        For each address:
+        - If an active BleakClient is connected: status 'ok'.
+        - Else attempt a one-shot discovery and reconnect: 'reconnected' on success, 'failed' on failure.
+
+        Returns mapping address -> status.
+        """
+        results: Dict[str, str] = {}
+        # Skip if shutting down or currently scanning (avoid contention with active scan)
+        if self._shutdown:
+            return results
+        # Build quick lookup of one-shot discovery results only if any address needs reconnection.
+        reconnect_needed = [
+            a for a in addresses
+            if not (a in self._connected_clients and self._connected_clients[a].is_connected)
+        ]
+        discovered_devices: List[BLEDeviceType] = []
+        if reconnect_needed:
+            discovered_devices = await self._discover_once()
+        discover_map = {d.address: d for d in discovered_devices}
+        for addr in addresses:
+            try:
+                if addr in self._connected_clients and self._connected_clients[addr].is_connected:
+                    results[addr] = 'ok'
+                    continue
+                # Need reconnect
+                if addr not in discover_map:
+                    results[addr] = 'failed'
+                    continue
+                client = BleakClient(discover_map[addr])
+                try:
+                    await client.connect()
+                except Exception as e:
+                    self._logger.debug(f"Reconnect attempt failed for {addr}: {e}")
+                    results[addr] = 'failed'
+                    continue
+                if client.is_connected:
+                    self._connected_clients[addr] = client
+                    di = self._discovered_devices.get(addr)
+                    if di:
+                        di.is_connected = True
+                    results[addr] = 'reconnected'
+                else:
+                    results[addr] = 'failed'
+            except Exception as e:
+                self._logger.debug(f"Maintenance error for {addr}: {e}")
+                results[addr] = 'failed'
+        # Summarize log at INFO level (compact)
+        if results:
+            ok = sum(1 for s in results.values() if s == 'ok')
+            rc = sum(1 for s in results.values() if s == 'reconnected')
+            fail = sum(1 for s in results.values() if s == 'failed')
+            self._logger.info(
+                f"Connection maintenance: {ok} ok, {rc} reconnected, {fail} failed"
+            )
+        return results
+
+    def set_verbose(self, verbose: bool) -> None:
+        """Enable/disable verbose advertisement logging at runtime."""
+        self._verbose = verbose

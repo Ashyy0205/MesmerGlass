@@ -492,6 +492,14 @@ class Launcher(QMainWindow):
         if not self.mesmer_server:
             return
         logging.getLogger(__name__).info("Selecting device with Buttplug index %s", device_idx)
+        # Stop any active scan immediately (on-demand scanning model)
+        try:
+            import asyncio as _a
+            if self.mesmer_server.is_real_scanning():
+                loop = _a.new_event_loop(); _a.set_event_loop(loop)
+                loop.run_until_complete(self.mesmer_server.stop_real_scanning()); loop.close()
+        except Exception:
+            pass
         if hasattr(self.pulse, 'select_device_by_index'):
             self.pulse.select_device_by_index(device_idx)
         elif hasattr(self.pulse, 'device_manager'):
@@ -522,6 +530,32 @@ class Launcher(QMainWindow):
                 except Exception as e:
                     logging.getLogger(__name__).exception("Error connecting to device %s: %s", device_idx, e)
             threading.Thread(target=connect_device, daemon=True).start()
+            # Start / ensure maintenance timer exists
+            try:
+                from PyQt6.QtCore import QTimer as _QTimer
+                if not hasattr(self, '_ble_maint_timer'):
+                    self._ble_maint_timer = _QTimer(self)
+                    self._ble_maint_timer.setInterval(10000)  # 10s
+                    def _maint():
+                        import threading as _th, asyncio as _asyncio
+                        if not self.mesmer_server:
+                            return
+                        def _run():
+                            try:
+                                loop = _asyncio.new_event_loop(); _asyncio.set_event_loop(loop)
+                                async def do_maint():
+                                    try:
+                                        await self.mesmer_server.maintain_selected_device_connections()
+                                    except Exception:
+                                        pass
+                                loop.run_until_complete(do_maint()); loop.close()
+                            except Exception:
+                                pass
+                        _th.Thread(target=_run, daemon=True).start()
+                    self._ble_maint_timer.timeout.connect(_maint)
+                    self._ble_maint_timer.start()
+            except Exception:
+                pass
         else:
             logging.getLogger(__name__).error("Could not find device with Buttplug index %s", device_idx)
         device_list = self.mesmer_server.get_device_list(); self.page_device.update_device_list(device_list)
@@ -847,14 +881,4 @@ class Launcher(QMainWindow):
                     ov.text_color = c
         except Exception:
             pass
-        try:
-            if hasattr(self, '_cycle_timer') and self._cycle_timer and getattr(self, 'session_pack', None) and self.page_textfx.is_auto_cycle_enabled():
-                # Simply restart timer (do not advance message immediately)
-                interval_ms = 5000
-                try:
-                    interval_ms = int(self.page_textfx.cycle_interval_secs()) * 1000
-                except Exception:
-                    interval_ms = 5000
-                self._cycle_timer.start(interval_ms)
-        except Exception:
-            pass
+    # Legacy cycle timer removed: no action needed on color change beyond overlay propagation.

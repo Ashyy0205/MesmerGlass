@@ -69,6 +69,20 @@ class MesmerIntifaceServer(ButtplugServer):
     def is_real_scanning(self) -> bool:
         """Check if Bluetooth scanning is active."""
         return self._bluetooth_scanner.is_scanning()
+
+    async def maintain_selected_device_connections(self) -> Dict[str, str]:
+        """Run connection maintenance for already mapped Bluetooth devices.
+
+        Returns mapping address -> status ('ok', 'reconnected', 'failed').
+        """
+        try:
+            addresses = list(self._device_index_map.keys())
+            if not addresses:
+                return {}
+            return await self._bluetooth_scanner.maintain_connections(addresses)
+        except Exception as e:
+            self._logger.debug(f"Connection maintenance error: {e}")
+            return {}
         
     async def connect_real_device(self, device_index: int) -> bool:
         """Connect to a real Bluetooth device.
@@ -127,10 +141,13 @@ class MesmerIntifaceServer(ButtplugServer):
             # Clean up protocol first
             if address in self._device_protocols:
                 protocol = self._device_protocols[address]
-                try:
-                    await protocol.cleanup()
-                except Exception as e:
-                    self._logger.warning(f"Error cleaning up protocol for {address}: {e}")
+                # Use getattr to avoid attribute errors if implementation changes
+                cleanup = getattr(protocol, 'cleanup', None)
+                if cleanup:
+                    try:
+                        await cleanup()
+                    except Exception as e:
+                        self._logger.warning(f"Error cleaning up protocol for {address}: {e}")
                 del self._device_protocols[address]
             
             # Disconnect via Bluetooth scanner
@@ -160,8 +177,11 @@ class MesmerIntifaceServer(ButtplugServer):
                 address = addr
                 break
                 
+        # Only log an error for *real* BLE devices. Virtual/devtool indices should
+        # silently no-op so the higher layer doesn't spam logs when using a virtual toy.
         if not address or address not in self._device_protocols:
-            self._logger.error(f"Device {device_index} not connected or no protocol")
+            if self.is_ble_device_index(device_index):
+                self._logger.error(f"Device {device_index} not connected or no protocol")
             return False
             
         try:
@@ -237,24 +257,30 @@ class MesmerIntifaceServer(ButtplugServer):
                         scalar_info = cmd["Scalars"][0]
                         intensity = scalar_info.get("Scalar", 0.0)
                         actuator_index = scalar_info.get("Index", 0)
-                        
-                        # Send to real device
-                        success = await self.send_real_device_command(
-                            device_index, 
-                            "vibrate", 
-                            intensity=intensity,
-                            actuator_index=actuator_index
-                        )
-                        
-                        if success:
+                        # If this is NOT a BLE device index (likely virtual/devtools), acknowledge success
+                        # without attempting real protocol interaction.
+                        if not self.is_ble_device_index(device_index):
                             await self._send(websocket, {"Ok": {"Id": msg_id}})
                         else:
-                            await self._send(websocket, {
-                                "Error": {
-                                    "Id": msg_id,
-                                    "ErrorMessage": f"Failed to control device {device_index}"
-                                }
-                            })
+                            # Send to real device
+                            success = await self.send_real_device_command(
+                                device_index,
+                                "vibrate",
+                                intensity=intensity,
+                                actuator_index=actuator_index,
+                            )
+                            if success:
+                                await self._send(websocket, {"Ok": {"Id": msg_id}})
+                            else:
+                                await self._send(
+                                    websocket,
+                                    {
+                                        "Error": {
+                                            "Id": msg_id,
+                                            "ErrorMessage": f"Failed to control device {device_index}",
+                                        }
+                                    },
+                                )
                     continue
                     
                 # Enhanced StopDeviceCmd
@@ -262,17 +288,23 @@ class MesmerIntifaceServer(ButtplugServer):
                     cmd = msg["StopDeviceCmd"]
                     msg_id = cmd.get("Id", 0)
                     device_index = cmd.get("DeviceIndex", 0)
-                    
-                    success = await self.send_real_device_command(device_index, "stop")
-                    if success:
+                    if not self.is_ble_device_index(device_index):
+                        # Virtual device: treat stop as success silently
                         await self._send(websocket, {"Ok": {"Id": msg_id}})
                     else:
-                        await self._send(websocket, {
-                            "Error": {
-                                "Id": msg_id,
-                                "ErrorMessage": f"Failed to stop device {device_index}"
-                            }
-                        })
+                        success = await self.send_real_device_command(device_index, "stop")
+                        if success:
+                            await self._send(websocket, {"Ok": {"Id": msg_id}})
+                        else:
+                            await self._send(
+                                websocket,
+                                {
+                                    "Error": {
+                                        "Id": msg_id,
+                                        "ErrorMessage": f"Failed to stop device {device_index}",
+                                    }
+                                },
+                            )
                     continue
                     
             # Fall back to parent for other messages
