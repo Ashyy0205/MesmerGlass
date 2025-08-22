@@ -7,6 +7,8 @@ python -m mesmerglass --help
 python -m mesmerglass run --log-level DEBUG
 ```
 
+Legacy: `python run.py` still works but is deprecated (see migration note).
+
 ## Global options
 
 - `--log-level {DEBUG,INFO,WARNING,ERROR}` (default: INFO)
@@ -15,12 +17,26 @@ python -m mesmerglass run --log-level DEBUG
 
 ## Subcommands
 
-- `run` — Start the GUI.
-- `pulse --level 0..1 --duration <ms>` — Send a single pulse to the selected device.
-- `server [--port N]` — Start a local Buttplug-compatible server.
-- `ui` — Drive basic UI navigation (list/select tabs) and simple actions for testing.
-- `toy` — Run a deterministic virtual toy simulator for dev/CI (no hardware required).
-- `selftest` — Quick import/environment check; exit code 0 on success.
+-- `run` — Start the GUI.
+-- `pulse --level 0..1 --duration <ms>` — Send a single pulse (alias: `test`).
+-- `server [--port N]` — Start a local Buttplug-compatible server.
+-- `ui` — Drive basic UI navigation (list/select tabs) and simple actions for testing.
+-- `toy` — Run a deterministic virtual toy simulator for dev/CI (no hardware required).
+-- `selftest` — Quick import/environment check; exit code 0 on success.
+-- `test-run [type]` — Run pytest selection (replaces `run_tests.py`).
+### test-run
+
+Wrapper around pytest for common selections.
+
+Examples:
+```
+python -m mesmerglass test-run              # all tests
+python -m mesmerglass test-run fast -v      # fast subset
+python -m mesmerglass test-run bluetooth    # bluetooth-marked tests
+python -m mesmerglass test-run -c           # with coverage
+```
+
+Equivalent legacy commands using `run_tests.py` are deprecated.
 
 ### ui
 

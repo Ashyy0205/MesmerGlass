@@ -1,22 +1,22 @@
 {
   "version": 1,
-  "name": "Training",
+  "name": "test_pack",
   "text": {
     "items": [
       {
-        "msg": "Good Boy Love Diapers",
+        "msg": "1",
         "weight": 1.0
       },
       {
-        "msg": "Good Boy Wear Diapers",
+        "msg": "2",
         "weight": 1.0
       },
       {
-        "msg": "Good Boys Obey Daddy",
+        "msg": "3",
         "weight": 1.0
       },
       {
-        "msg": "You Are A Good Boy",
+        "msg": "4",
         "weight": 1.0
       }
     ]

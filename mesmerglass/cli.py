@@ -20,6 +20,7 @@ from .engine.pulse import PulseEngine
 from .logging_utils import setup_logging, get_default_log_path
 from .devtools.virtual_toy import VirtualToy  # dev-only, used by 'toy' subcommand
 from .content.loader import load_session_pack  # session packs
+import subprocess, sys, warnings, pathlib
 
 
 def _add_logging_args(parser: argparse.ArgumentParser) -> None:
@@ -94,10 +95,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("run", help="Start the GUI (default)")
 
-    p_pulse = sub.add_parser("pulse", help="Send a single pulse")
+    p_pulse = sub.add_parser("pulse", help="Send a single pulse (alias: 'test')")
     p_pulse.add_argument("--level", type=float, default=0.5, help="Pulse intensity 0..1")
     p_pulse.add_argument("--duration", type=int, default=500, help="Duration in ms")
     p_pulse.add_argument("--port", type=int, default=12345, help="Buttplug server port")
+
+    # Alias for backward compatibility (was 'test' in run.py)
+    p_test_alias = sub.add_parser("test", help=argparse.SUPPRESS)
+    p_test_alias.add_argument("--level", type=float, default=0.5)
+    p_test_alias.add_argument("--duration", type=int, default=500)
+    p_test_alias.add_argument("--port", type=int, default=12345)
 
     p_srv = sub.add_parser("server", help="Start a local Buttplug server")
     p_srv.add_argument("--port", type=int, default=12345)
@@ -137,6 +144,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_toy.add_argument("--run-for", type=float, default=5.0, help="Seconds to run before exiting")
 
     sub.add_parser("selftest", help="Quick environment/import check")
+
+    # Test runner integration (wraps previous run_tests.py functionality)
+    p_tr = sub.add_parser("test-run", help="Run pytest with selection shortcuts (replaces run_tests.py)")
+    p_tr.add_argument("type", choices=["all","fast","slow","unit","integration","bluetooth"], nargs="?", default="all")
+    p_tr.add_argument("-v","--verbose", action="store_true")
+    p_tr.add_argument("-c","--coverage", action="store_true")
 
     # Session pack subcommand
     p_sess = sub.add_parser("session", help="Load and inspect/apply a session pack")
@@ -206,8 +219,33 @@ def main(argv: Optional[list[str]] = None) -> int:
             ps = f"{len(pack.pulse.stages)} stages" if pack.pulse.stages else "0 stages"
             print(f"SessionPack '{pack.name}' v{pack.version} — {ti}, {ps}")
             return 0
+    if cmd == "test":  # backward compatibility alias
+        warnings.warn("'test' subcommand is deprecated; use 'pulse' instead", DeprecationWarning, stacklevel=2)
+        cmd = "pulse"
     if cmd == "pulse":
         return asyncio.run(_cli_pulse(args.level, args.duration, args.port))
+    if cmd == "test-run":
+        # Re-implement logic from legacy run_tests.py script.
+        python_cmd = sys.executable  # prefer current interpreter (inside venv if active)
+        cmdline = [python_cmd, "-m", "pytest"]
+        if args.verbose:
+            cmdline.extend(["-v","-s"])
+        if args.coverage:
+            cmdline.extend(["--cov=mesmerglass","--cov-report=term","--cov-report=html"])
+        t = args.type
+        if t == "fast": cmdline.extend(["-m","not slow"])
+        elif t == "slow": cmdline.extend(["-m","slow"])
+        elif t == "integration": cmdline.extend(["-m","integration"])
+        elif t == "bluetooth": cmdline.extend(["-m","bluetooth"])
+        elif t == "unit": cmdline.extend(["-m","not integration and not bluetooth"])
+        cmdline.append("mesmerglass/tests")
+        # If we are already running inside pytest (detected via env var) avoid executing
+        # the full test suite recursively; just collect quickly. This prevents hang/timeouts
+        # in CI where test-run is itself tested.
+        if os.environ.get("PYTEST_CURRENT_TEST"):
+            cmdline.extend(["--maxfail","1","--collect-only"])
+        logging.getLogger(__name__).info("Running tests: %s", " ".join(cmdline))
+        return subprocess.run(cmdline).returncode
     if cmd == "server":
         return _cli_server(args.port)
     if cmd == "ui":

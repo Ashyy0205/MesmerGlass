@@ -43,10 +43,11 @@
    pip install -r requirements.txt
    ```
 
-4. **Run MesmerGlass:**
+4. **Run MesmerGlass:** (new unified CLI)
    ```bash
-   python run.py
+   python -m mesmerglass run
    ```
+   Legacy: `python run.py` still works (deprecated; see docs/migration/run-py-deprecation.md).
 
 ## 🎮 Device Control with MesmerIntiface
 
@@ -91,32 +92,32 @@ Run the comprehensive test suite to validate functionality:
 
 ### Quick Testing
 ```bash
-# Run all tests
-python run_tests.py
+# Run all tests (replaces run_tests.py)
+python -m mesmerglass test-run
 
 # Run only fast tests (excludes slow integration tests)
-python run_tests.py fast
+python -m mesmerglass test-run fast
 
-# Run with verbose output
-python run_tests.py -v
+# Verbose
+python -m mesmerglass test-run -v
 
-# Run with coverage report
-python run_tests.py -c
+# With coverage
+python -m mesmerglass test-run -c
 ```
 
 ### Test Categories
 ```bash
 # Unit tests only
-python run_tests.py unit
+python -m mesmerglass test-run unit
 
 # Integration tests
-python run_tests.py integration
+python -m mesmerglass test-run integration
 
 # Bluetooth functionality tests
-python run_tests.py bluetooth
+python -m mesmerglass test-run bluetooth
 
 # Slow tests only
-python run_tests.py slow
+python -m mesmerglass test-run slow
 ```
 
 ### Manual Testing
@@ -144,7 +145,7 @@ MesmerGlass/
 │   ├── user-guide/               # User documentation
 │   ├── development/              # Developer guides  
 │   └── technical/                # Technical references
-├── run_tests.py                   # Test runner script
+├── run.py                         # Deprecated shim (use python -m mesmerglass)
 └── requirements.txt              # Dependencies
 ```
 
