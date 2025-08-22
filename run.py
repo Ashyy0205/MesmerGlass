@@ -3,12 +3,8 @@
 Adds structured logging flags and config to aid debugging and support.
 """
 
-import sys
-import argparse
-import asyncio
-import logging
-import warnings
-from typing import Optional
+import sys, argparse, asyncio, logging, warnings
+import faulthandler
 from mesmerglass.app import run
 from mesmerglass.engine.pulse import PulseEngine
 from mesmerglass.engine.buttplug_server import ButtplugServer
@@ -110,6 +106,10 @@ def run_server(port: int):
         server.stop()
 
 if __name__ == "__main__":
+    try:
+        faulthandler.enable(all_threads=True)
+    except Exception:
+        pass
     args = parse_args()
 
     # Configure logging once per run

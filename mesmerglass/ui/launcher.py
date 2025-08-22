@@ -1,4 +1,4 @@
-import os, time, random, threading
+import os, time, random, threading, time as _time_mod
 from typing import List
 
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject
@@ -84,6 +84,8 @@ class Launcher(QMainWindow):
         self.device_scan_in_progress = False
         self.scan_signaler = ScanCompleteSignaler()
         self.scan_signaler.scan_completed.connect(self._scan_completed)
+        # Global shutdown flag (guards async callbacks during close)
+        self._shutting_down = False
 
         # UI / services ----------------------------------------------
         self._build_ui()
@@ -481,6 +483,8 @@ class Launcher(QMainWindow):
 
     def _scan_completed(self, device_list):
         """Handle scan completion."""
+        if self._shutting_down:
+            return
         self.device_scan_in_progress = False
         if device_list:
             self._update_device_list_ui(device_list)
@@ -711,37 +715,112 @@ class Launcher(QMainWindow):
         self._burst_timer.timeout.connect(tick); self._burst_timer.start(200)
 
     def stop_all(self):
-        if not self.running: return
-        self.running = False; self._refresh_status()
+        if not self.running:
+            return
+        log = logging.getLogger(__name__)
+        t0 = time.perf_counter()
+        def step(n, msg):
+            log.info("[SHUTDOWN launcher] step=%s dt=%.3f %s", n, time.perf_counter()-t0, msg)
+        self.running = False; self._refresh_status(); step(1, "running flag cleared")
         if hasattr(self, "_shared_flash_timer") and self._shared_flash_timer:
-            self._shared_flash_timer.stop(); self._shared_flash_timer = None
-        if hasattr(self, "_burst_timer") and self._burst_timer:
-            self._burst_timer.stop(); self._burst_timer = None
-        for ov in self.overlays:
-            try:
-                if hasattr(ov, "_flash_sync_timer"): ov._flash_sync_timer.stop()
-                ov.close()
+            try: self._shared_flash_timer.stop()
             except Exception: pass
-        self.overlays.clear()
-        self.audio.stop(); self.pulse.stop()
+            self._shared_flash_timer = None; step(2, "shared flash timer stopped")
+        if hasattr(self, "_burst_timer") and self._burst_timer:
+            try: self._burst_timer.stop()
+            except Exception: pass
+            self._burst_timer = None; step(3, "burst timer stopped")
+        for ov in list(self.overlays):
+            try:
+                if hasattr(ov, 'shutdown'):
+                    ov.shutdown()
+                if hasattr(ov, "_flash_sync_timer"):
+                    try: ov._flash_sync_timer.stop()
+                    except Exception: pass
+                ov.close(); step(4, "overlay closed")
+            except Exception:
+                pass
+        self.overlays.clear(); step(5, "overlays cleared")
+        try: self.audio.stop(); step(6, "audio stopped")
+        except Exception: pass
+        try: self.pulse.stop(); step(7, "pulse stopped")
+        except Exception: pass
 
-    def closeEvent(self, event):
-        """Handle application close."""
+    def closeEvent(self, event):  # type: ignore[override]
+        log = logging.getLogger(__name__)
+        t0 = time.perf_counter()
+        def step(n, msg):
+            """Structured shutdown step logger with immediate flush.
+
+            We flush handlers so if a native crash occurs *after* the call we
+            still have the most recent breadcrumb in the log file/console.
+            """
+            log.info("[SHUTDOWN close] step=%s dt=%.3f %s", n, time.perf_counter()-t0, msg)
+            for h in getattr(log, 'handlers', []):  # best‑effort flush
+                try:
+                    if hasattr(h, 'flush'):
+                        h.flush()
+                except Exception:
+                    pass
+        step(0, "closeEvent begin")
+        self._shutting_down = True
+        step(0.5, f"shutdown flag set scan_in_progress={self.device_scan_in_progress}")
+        try:
+            self.stop_all()
+        except Exception:
+            log.exception("stop_all failure")
+        step(8, "stop_all done")
+        # If a real scan is running, stop it cleanly before shutting server
+        try:
+            if self.mesmer_server and hasattr(self.mesmer_server, 'is_real_scanning') and self.mesmer_server.is_real_scanning():
+                step(8.5, "scan active - stopping")
+                import asyncio
+                loop = asyncio.new_event_loop(); asyncio.set_event_loop(loop)
+                step(8.51, f"loop created id={id(loop)}")
+                async def _stop_scan():  # inline coroutine for timeout control
+                    step(8.52, "stop coroutine begin")  # inside coroutine start
+                    try:
+                        try:
+                            await asyncio.wait_for(self.mesmer_server.stop_real_scanning(), timeout=6.0)
+                        except asyncio.TimeoutError:
+                            step(8.53, "scan stop timeout -> continuing")
+                        else:
+                            step(8.54, "scan stop coroutine returned")
+                    except Exception as e:  # capture unexpected internal errors
+                        step(8.55, f"scan stop error {e!r}")
+                try:
+                    loop.run_until_complete(_stop_scan())
+                finally:
+                    try:
+                        loop.close()
+                    except Exception:
+                        pass
+                step(8.56, "event loop closed")
+                # Short settle delay – some native stacks need a beat after scan stop
+                _ts = time.perf_counter()
+                while time.perf_counter() - _ts < 0.15:
+                    # tiny sleep slices to keep UI responsive while allowing BLE stack to settle
+                    _time_mod.sleep(0.01)
+                step(8.6, "scan stopped + settled")
+                # (If crash still happens after 8.6 we know it is *after* scan tear‑down.)
+        except Exception as e:
+            log.error("scan stop error: %s", e)
         if self.mesmer_server:
             try:
                 import asyncio
                 loop = asyncio.new_event_loop(); asyncio.set_event_loop(loop)
+                step(9, "mesmer server shutdown begin")
                 loop.run_until_complete(self.mesmer_server.shutdown())
-                loop.close()
-                logging.getLogger(__name__).info("MesmerIntiface server shut down")
+                loop.close(); step(9.5, "mesmer server shutdown done")
             except Exception as e:
-                logging.getLogger(__name__).error("Error shutting down MesmerIntiface server: %s", e)
-        super().closeEvent(event)
-        self.overlays.clear()
-        self.audio.stop()
-        try: self.pulse.set_level(0.0)
+                log.error("Mesmer shutdown error: %s", e)
+        try:
+            self.pulse.set_level(0.0); step(10, "pulse level zeroed")
         except Exception: pass
-        self.pulse.stop()
+        try:
+            super().closeEvent(event); step(11, "super closeEvent")
+        except Exception: pass
+        step(12, "closeEvent end")
     # ---------------- Message Pack (v1 mapping) ----------------
     def apply_session_pack(self, pack):  # duck-typed SessionPack
         try:
