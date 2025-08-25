@@ -12,7 +12,7 @@ from typing import Dict, Optional
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit,
-    QProgressBar, QGroupBox
+    QProgressBar, QGroupBox, QTabWidget
 )
 
 from ...devtools.virtual_toy import VirtualToy
@@ -90,10 +90,10 @@ class VirtualToyRunner:
 
 
 class DevToolsPage(QWidget):
-    """Simple DevTools UI page.
+    """Simple DevTools UI page (now tabbed).
 
-    - Input field for server port (defaults to 12350 for MesmerIntiface).
-    - Add/Remove virtual toys; each shows connection status and intensity.
+    Each Virtual Toy appears on its own tab similar to the main application's
+    feature tabs, showing a progress bar of the toy's current intensity.
     """
 
     def __init__(self, *, default_port: int = 12350):
@@ -105,22 +105,30 @@ class DevToolsPage(QWidget):
         self._timer.start(100)  # 10 Hz refresh
 
     def _build_ui(self, default_port: int) -> None:
-        root = QVBoxLayout(self); root.setContentsMargins(10,10,10,10); root.setSpacing(8)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(10, 10, 10, 10)
+        root.setSpacing(8)
 
-        # Controls
-        ctrl = QGroupBox("Virtual Toy Controls"); cl = QHBoxLayout(ctrl)
-        cl.setContentsMargins(10,8,10,8); cl.setSpacing(6)
-        self.edit_port = QLineEdit(str(default_port)); self.edit_port.setFixedWidth(90)
+        ctrl = QGroupBox("Virtual Toy Controls")
+        cl = QHBoxLayout(ctrl)
+        cl.setContentsMargins(10, 8, 10, 8)
+        cl.setSpacing(6)
+        self.edit_port = QLineEdit(str(default_port))
+        self.edit_port.setFixedWidth(90)
         self.btn_add = QPushButton("Add Virtual Toy")
         self.btn_add.clicked.connect(self._on_add)
         self.btn_remove_all = QPushButton("Remove All")
         self.btn_remove_all.clicked.connect(self._on_remove_all)
-        cl.addWidget(QLabel("Server port:")); cl.addWidget(self.edit_port); cl.addStretch(1)
-        cl.addWidget(self.btn_add); cl.addWidget(self.btn_remove_all)
+        cl.addWidget(QLabel("Server port:"))
+        cl.addWidget(self.edit_port)
+        cl.addStretch(1)
+        cl.addWidget(self.btn_add)
+        cl.addWidget(self.btn_remove_all)
         root.addWidget(ctrl)
 
-        # Status area
-        self.area = QVBoxLayout(); root.addLayout(self.area)
+        # Tabs host each toy
+        self.tabs = QTabWidget()
+        root.addWidget(self.tabs)
         root.addStretch(1)
 
     def _on_add(self) -> None:
@@ -128,40 +136,44 @@ class DevToolsPage(QWidget):
             port = int(self.edit_port.text().strip())
         except Exception:
             port = 12350
-        toy_idx = 9000 + len(self.runners)  # large index range to avoid BLE collisions
+        toy_idx = 9000 + len(self.runners)
         toy_id = f"toy_{len(self.runners)}"
         runner = VirtualToyRunner(name=f"Virtual Toy {len(self.runners)}", port=port, device_index=toy_idx)
         self.runners[toy_id] = runner
-        # Row widgets
-        row = QWidget()
-        rl = QHBoxLayout(row)
-        rl.setContentsMargins(4, 4, 4, 4)
-        rl.setSpacing(8)
+
+        page = QWidget()
+        v = QVBoxLayout(page)
+        v.setContentsMargins(8, 8, 8, 8)
+        v.setSpacing(6)
+        top = QHBoxLayout()
+        top.setContentsMargins(0, 0, 0, 0)
+        top.setSpacing(8)
         lab = QLabel(runner.name)
+        btn_rm = QPushButton("Remove Toy")
+        btn_rm.clicked.connect(lambda: self._remove_one(toy_id, page))
+        top.addWidget(lab)
+        top.addStretch(1)
+        top.addWidget(btn_rm)
+        v.addLayout(top)
         bar = QProgressBar()
         bar.setRange(0, 100)
-        bar.setFixedWidth(200)
-        btn_rm = QPushButton("Remove")
-        btn_rm.clicked.connect(lambda: self._remove_one(toy_id, row))
-        rl.addWidget(lab)
-        rl.addWidget(bar)
-        rl.addStretch(1)
-        rl.addWidget(btn_rm)
-        self.area.addWidget(row)
-
-        # Attach for refresh loop
-        row._dev_bar = bar  # type: ignore[attr-defined]
-        row._dev_runner = runner  # type: ignore[attr-defined]
+        v.addWidget(bar)
+        # Attach for refresh
+        page._dev_bar = bar  # type: ignore[attr-defined]
+        page._dev_runner = runner  # type: ignore[attr-defined]
+        self.tabs.addTab(page, runner.name)
         runner.start()
 
-    def _remove_one(self, toy_id: str, row: QWidget) -> None:
+    def _remove_one(self, toy_id: str, page: QWidget) -> None:
         if toy_id in self.runners:
             try:
                 self.runners[toy_id].stop()
             finally:
                 del self.runners[toy_id]
-        row.setParent(None)
-        row.deleteLater()
+        idx = self.tabs.indexOf(page)
+        if idx >= 0:
+            self.tabs.removeTab(idx)
+        page.deleteLater()
 
     def _on_remove_all(self) -> None:
         for k in list(self.runners.keys()):
@@ -169,22 +181,15 @@ class DevToolsPage(QWidget):
                 self.runners[k].stop()
             finally:
                 del self.runners[k]
-        # Clear UI rows
-        for i in range(self.area.count()):
-            item = self.area.itemAt(i)
-            if not item:
-                continue  # Guard: itemAt can be None
-            w = item.widget() if hasattr(item, "widget") else None
+        while self.tabs.count():
+            w = self.tabs.widget(0)
+            self.tabs.removeTab(0)
             if w is not None:
-                w.setParent(None); w.deleteLater()
+                w.deleteLater()
 
     def _refresh(self) -> None:
-        # Walk status rows and update bars
-        for i in range(self.area.count()):
-            item = self.area.itemAt(i)
-            if not item:
-                continue  # Guard: itemAt can be None
-            w = item.widget() if hasattr(item, "widget") else None
+        for i in range(self.tabs.count()):
+            w = self.tabs.widget(i)
             if not w:
                 continue
             runner = getattr(w, "_dev_runner", None)
@@ -192,7 +197,6 @@ class DevToolsPage(QWidget):
             if runner and bar:
                 bar.setValue(int(round(runner.level * 100)))
 
-    def closeEvent(self, a0):  # Ensure clean shutdown of runners
-        # Align parameter name with QWidget base to appease strict checkers
+    def closeEvent(self, a0):  # type: ignore[override]
         self._on_remove_all()
         return super().closeEvent(a0)

@@ -37,10 +37,14 @@ def test_devtools_page_add_remove(qapp):
 
 def test_launcher_opens_devtools(qapp):
     from mesmerglass.ui.launcher import Launcher
-
     win = Launcher("MesmerGlass", enable_device_sync_default=False)
     win._open_devtools()
-    # Verify a tab named DevTools exists and is selected
-    names = [win.tabs.tabText(i) for i in range(win.tabs.count())]
-    assert any(n == "DevTools" for n in names)
-    win.close()
+    # Process events so window is created
+    for _ in range(5): qapp.processEvents(); time.sleep(0.01)
+    dev_win = getattr(win, '_devtools_win', None)
+    assert dev_win is not None, "DevTools window should be created"
+    assert dev_win.windowTitle() == 'DevTools'
+    # Re-open should not create a second window
+    win._open_devtools(); qapp.processEvents(); time.sleep(0.01)
+    assert getattr(win, '_devtools_win', None) is dev_win
+    dev_win.close(); win.close()

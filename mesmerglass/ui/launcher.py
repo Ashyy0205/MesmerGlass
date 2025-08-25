@@ -28,7 +28,7 @@ from .overlay import OverlayWindow
 from .pages.textfx import TextFxPage
 from .pages.device import DevicePage
 from .pages.audio import AudioPage
-from .pages.devtools import DevToolsPage
+from .pages.devtools import DevToolsPage  # DevTools content (now hosted in separate window)
 import logging
 
 
@@ -334,31 +334,66 @@ class Launcher(QMainWindow):
         sc_dev = QShortcut(QKeySequence("Ctrl+Shift+D"), self); sc_dev.activated.connect(self._open_devtools)
 
     def _open_devtools(self):
+        """Open (or focus) DevTools in a separate window.
+
+        Replaces prior behavior of adding a tab. A 'DevTools' menu is created on first open
+        with actions to focus or close the window. Shortcut (Ctrl+Shift+D) reuses the same window.
+        """
         try:
-            for i in range(self.tabs.count()):
-                if self.tabs.tabText(i) == "DevTools":
-                    self.tabs.setCurrentIndex(i)
-                    return
-            default_port = 12350
-            if getattr(self, "mesmer_server", None):
+            # If already open, just raise/focus
+            if getattr(self, '_devtools_win', None):
                 try:
-                    default_port = int(self.mesmer_server.selected_port)
+                    self._devtools_win.show()
+                    self._devtools_win.raise_()
+                    self._devtools_win.activateWindow()
                 except Exception:
                     pass
+                return
+            # Determine default port (reuse active MesmerIntiface server if available)
+            default_port = 12350
+            if getattr(self, 'mesmer_server', None):
+                try: default_port = int(self.mesmer_server.selected_port)
+                except Exception: pass
             page = DevToolsPage(default_port=default_port)
+            # Host page in its own window
+            from PyQt6.QtWidgets import QMainWindow
+            # Create as top-level (no parent) so it does not stay always-on-top of main window
+            win = QMainWindow(None)
+            win.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+            win.setWindowTitle("DevTools")
             scroll = QScrollArea(); scroll.setWidgetResizable(True); scroll.setFrameShape(QFrame.Shape.NoFrame)
             scroll.setWidget(page)
-            self.tabs.addTab(scroll, "DevTools")
-            self.tabs.setCurrentIndex(self.tabs.count() - 1)
-            # In sidebar mode, append to nav
-            if getattr(self, "layout_mode", "tabbed") == "sidebar" and hasattr(self, "nav"):
-                try:
-                    self.nav.addItem("DevTools")
-                    self.nav.setCurrentRow(self.tabs.count() - 1)
-                except Exception:
-                    pass
+            win.setCentralWidget(scroll)
+            self._devtools_win = win  # hold reference
+            # Inject menu on first open
+            self._ensure_devtools_menu()
+            win.destroyed.connect(lambda *_: setattr(self, '_devtools_win', None))  # clear ref on close
+            win.resize(640, 480)
+            win.show()
         except Exception as e:
-            logging.getLogger(__name__).error("Failed to open DevTools page: %s", e)
+            logging.getLogger(__name__).error("Failed to open DevTools window: %s", e)
+
+    def _ensure_devtools_menu(self):
+        """Create a DevTools menu lazily (only when first opened)."""
+        try:
+            if getattr(self, '_devtools_menu_created', False):
+                return
+            mb = self.menuBar() if hasattr(self, 'menuBar') else None
+            if not mb:
+                return
+            m = mb.addMenu("DevTools")
+            act_focus = m.addAction("Focus / Open")
+            act_focus.triggered.connect(self._open_devtools)
+            act_close = m.addAction("Close")
+            def _close():
+                w = getattr(self, '_devtools_win', None)
+                if w:
+                    try: w.close()
+                    except Exception: pass
+            act_close.triggered.connect(_close)
+            self._devtools_menu_created = True
+        except Exception:
+            pass
 
     def _select_all_displays(self):
         for i in range(self.list_displays.count()):
