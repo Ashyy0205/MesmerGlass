@@ -134,9 +134,10 @@ class Launcher(QMainWindow):
         if not self._suppress_server:
             self._start_mesmer_server()
 
-        # Message pack placeholder (proper indentation inside __init__)
+        # Message pack & font placeholders (kept after UI init)
         self.session_pack = None
         self.current_pack_path = None  # path of last loaded session pack (not auto-loaded on state apply)
+        self.current_font_path = None  # user-imported font file path (persisted in session state)
 
     # ========================== UI build ==========================
     def _build_ui(self):
@@ -165,6 +166,11 @@ class Launcher(QMainWindow):
             self.page_textfx.createPackRequested.connect(self._on_create_message_pack)
             # removed cycle interval feature
         except Exception: pass
+        try:
+            # New font load button inside Text & FX tab
+            self.page_textfx.loadFontRequested.connect(self._on_load_font)
+        except Exception:
+            pass
         scroll_textfx = QScrollArea(); scroll_textfx.setWidgetResizable(True); scroll_textfx.setFrameShape(QFrame.Shape.NoFrame)
         scroll_textfx.setWidget(self.page_textfx); self.tabs.addTab(scroll_textfx, "Text & FX")
 
@@ -459,6 +465,7 @@ class Launcher(QMainWindow):
             "text_color": color_hex,
             "font_family": font_family,
             "font_point_size": font_size,
+            "font_path": getattr(self, "current_font_path", None),  # added: persist font file path
             "scale_pct": int(getattr(self, "text_scale_pct", 100)),
             "fx_mode": getattr(self, "fx_mode", None),
             "fx_intensity": int(getattr(self, "fx_intensity", 0)),
@@ -555,11 +562,34 @@ class Launcher(QMainWindow):
             # Font (optional restoration)
             fam = textfx.get("font_family")
             sz = textfx.get("font_point_size")
+            # Load raw font file first (if provided) so its family becomes available
+            fpath = textfx.get("font_path")
+            if fpath and os.path.isfile(fpath):
+                try:
+                    from PyQt6.QtGui import QFontDatabase
+                    fid = QFontDatabase.addApplicationFont(fpath)
+                    self.current_font_path = fpath
+                    if fid != -1 and (not fam):
+                        fams = QFontDatabase.applicationFontFamilies(fid)
+                        if fams:
+                            fam = fams[0]
+                except Exception as e:
+                    logging.getLogger(__name__).warning("Font load failed (%s): %s", fpath, e)
+                    self.current_font_path = fpath  # remember even if invalid
             if fam and sz:
                 try:
                     self.text_font = QFont(fam, int(sz))
                 except Exception:
                     pass
+            # Ensure current_font_path retained even if load failed
+            if fpath and not getattr(self, 'current_font_path', None):
+                self.current_font_path = fpath
+            # Update UI font label if page exists (ensures user sees restored font)
+            try:
+                if getattr(self, 'page_textfx', None) and hasattr(self.page_textfx, 'update_font_label'):
+                    self.page_textfx.update_font_label(fam)
+            except Exception:
+                pass
             # Message pack path (if provided) — now we attempt to load automatically for user convenience.
             pack_path = textfx.get("pack_path")
             if pack_path and os.path.isfile(pack_path):
@@ -597,8 +627,8 @@ class Launcher(QMainWindow):
         try:
             import os as _os
             # --- Text/FX Page ---
-            if getattr(self, 'page_textfx', None):
-                pt = self.page_textfx
+            pt = getattr(self, 'page_textfx', None)
+            if pt:
                 # Update text scale slider
                 if hasattr(pt, 'sld_txt_scale'):
                     try:
@@ -607,6 +637,33 @@ class Launcher(QMainWindow):
                     finally:
                         try: pt.sld_txt_scale.blockSignals(False)
                         except Exception: pass
+            # --- Video Opacity Controls (Primary / Secondary) ---
+            # Reflect restored opacity values in sliders & percentage labels; block signals to avoid feedback loops.
+            if hasattr(self, 'sld_primary_op'):
+                try:
+                    self.sld_primary_op.blockSignals(True)
+                    self.sld_primary_op.setValue(int(self.primary_op * 100))
+                    if hasattr(self, 'lab_primary_pct'):
+                        self.lab_primary_pct.setText(f"{int(self.primary_op * 100)}%")
+                finally:
+                    try: self.sld_primary_op.blockSignals(False)
+                    except Exception: pass
+            if hasattr(self, 'sld_secondary_op'):
+                try:
+                    self.sld_secondary_op.blockSignals(True)
+                    self.sld_secondary_op.setValue(int(self.secondary_op * 100))
+                    if hasattr(self, 'lab_secondary_pct'):
+                        self.lab_secondary_pct.setText(f"{int(self.secondary_op * 100)}%")
+                finally:
+                    try: self.sld_secondary_op.blockSignals(False)
+                    except Exception: pass
+            # Propagate to existing overlays if any (headless tests usually have none)
+            try:
+                for ov in getattr(self, 'overlays', []) or []:
+                    if hasattr(ov, 'primary_op'): ov.primary_op = self.primary_op
+                    if hasattr(ov, 'secondary_op'): ov.secondary_op = self.secondary_op
+            except Exception:
+                pass
                 # FX mode combobox
                 if hasattr(pt, 'cmb_fx') and self.fx_mode:
                     try: pt.cmb_fx.setCurrentText(self.fx_mode)
@@ -1284,6 +1341,7 @@ class Launcher(QMainWindow):
         try:
             act_save = file_menu.addAction("Save State…"); act_save.triggered.connect(self._action_save_state)  # type: ignore[attr-defined]
             act_load = file_menu.addAction("Load State…"); act_load.triggered.connect(self._action_load_state)  # type: ignore[attr-defined]
+            # Font load action removed (moved into Text & FX tab button)
             file_menu.addSeparator()
         except Exception:
             pass
@@ -1391,3 +1449,47 @@ class Launcher(QMainWindow):
         except Exception:
             pass
     # Legacy cycle timer removed: no action needed on color change beyond overlay propagation.
+
+    # ---------------- Font import support ----------------
+    def _on_load_font(self):
+        """Prompt user to select a font file and apply it (stores path for session state)."""
+        try:
+            from PyQt6.QtWidgets import QFileDialog, QMessageBox
+            from PyQt6.QtGui import QFontDatabase, QFont
+        except Exception:
+            return
+        try:
+            fn, _ = QFileDialog.getOpenFileName(self, "Load Font", "", "Fonts (*.ttf *.otf);;All Files (*.*)")
+            if not fn:
+                return
+            fam = None
+            try:
+                fid = QFontDatabase.addApplicationFont(fn)
+                if fid != -1:
+                    fams = QFontDatabase.applicationFontFamilies(fid)
+                    if fams:
+                        fam = fams[0]
+            except Exception as e:
+                logging.getLogger(__name__).warning("Font add failed: %s", e)
+            self.current_font_path = fn
+            if fam:
+                size = self.text_font.pointSize() if getattr(self, 'text_font', None) else 24
+                try:
+                    self.text_font = QFont(fam, size)
+                except Exception:
+                    pass
+            try:
+                if hasattr(self, 'page_textfx') and self.page_textfx and hasattr(self.page_textfx, 'update_font_label'):
+                    self.page_textfx.update_font_label(fam or '(font)')  # optional UI hook
+            except Exception:
+                pass
+            try:
+                QMessageBox.information(self, "Font", f"Loaded font: {fam or os.path.basename(fn)}")
+            except Exception:
+                pass
+        except Exception as e:
+            logging.getLogger(__name__).error("Font load error: %s", e)
+            try:
+                QMessageBox.critical(self, "Font", f"Failed to load font: {e}")
+            except Exception:
+                pass

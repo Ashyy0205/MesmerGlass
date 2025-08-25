@@ -35,7 +35,7 @@ Focused, incremental milestones in the exact order we’ll implement them. Each 
 - Success
   - End-to-end CLI/UI flows can run without real hardware.
 
-## 3) Sessions & “Message Packs” (JSON content bundles) 
+## 3) Sessions & “Message Packs” (JSON content bundles) [DONE]
 
 - Scope
   - Define minimal JSON format for session state: text sequences, pulsing stages, fallback behaviors.
@@ -57,7 +57,7 @@ Focused, incremental milestones in the exact order we’ll implement them. Each 
 - Success
   - Pack loads in < 200 ms and maps to current UI/engine state.
 
-## 4) Text editing, fonts, and simple layouts [Text Editor Already Complete]
+## 4) Text editing, fonts, and simple layouts [DONE]
 
 - Scope
   - Text page gains an editor feel: multiple sentences/entries; basic ordering.

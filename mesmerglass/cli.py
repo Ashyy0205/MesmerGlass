@@ -121,9 +121,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_ui.add_argument("--set-text-scale", type=int, default=None, help="Set text scale percent (0-100)")
     p_ui.add_argument("--set-fx-mode", type=str, default=None, help="Set FX mode by name")
     p_ui.add_argument("--set-fx-intensity", type=int, default=None, help="Set FX intensity (0-100)")
+    p_ui.add_argument("--set-font-path", type=str, default=None, help="Load a custom font file (ttf/otf) headlessly and update font family")
     p_ui.add_argument("--vol1", type=int, default=None, help="Set primary audio volume percent (0-100)")
     p_ui.add_argument("--vol2", type=int, default=None, help="Set secondary audio volume percent (0-100)")
     p_ui.add_argument("--displays", choices=["all", "primary", "none"], default=None, help="Quick-select displays")
+    p_ui.add_argument("--load-state", type=str, default=None, help="Load a previously saved session state JSON before applying other options")
     # Actions
     p_ui.add_argument("--launch", action="store_true", help="Launch overlays")
     p_ui.add_argument("--stop", action="store_true", help="Stop overlays and audio")
@@ -317,6 +319,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         # Import here to avoid unnecessary Qt init for non-UI subcommands.
         from PyQt6.QtWidgets import QApplication
         from .ui.launcher import Launcher
+        # For pure status queries (no launch/show) force suppress server to keep fast & isolated
+        if args.status and not (args.launch or args.show):
+            os.environ.setdefault("MESMERGLASS_NO_SERVER", "1")
         # Note: use no-show by default to avoid window popups in CI.
         app = QApplication.instance() or QApplication([])
         win = Launcher(
@@ -353,6 +358,43 @@ def main(argv: Optional[list[str]] = None) -> int:
                 return 1
             win.tabs.setCurrentIndex(idx)
             logging.getLogger(__name__).info("Selected tab: %s", win.tabs.tabText(idx))
+        # Load state first if requested (so subsequent setters override)
+        loaded_state_font_path = None
+        if getattr(args, 'load_state', None):
+            try:
+                from .content.loader import load_session_state
+                st = load_session_state(args.load_state)
+            except Exception as e:
+                # Fallback: accept minimal dict state (tests may omit kind/version)
+                st = None
+                try:
+                    import json as _json
+                    with open(args.load_state, 'r', encoding='utf-8') as fh:
+                        raw = _json.load(fh)
+                    if isinstance(raw, dict):
+                        st = raw  # pass raw dict directly to launcher (it can handle dict)
+                        logging.getLogger(__name__).warning("Using raw dict session state fallback (missing metadata): %s", args.load_state)
+                    else:
+                        raise ValueError("State JSON not an object")
+                except Exception as e2:
+                    logging.getLogger(__name__).error("Failed to load state: %s (%s / fallback %s)", args.load_state, e, e2)
+                    st = None
+            if st is not None:
+                try:
+                    win.apply_session_state(st)
+                except Exception:
+                    logging.getLogger(__name__).error("State apply failed: %s", args.load_state)
+                # Extract font path (supports object or dict forms)
+                try:
+                    if isinstance(st, dict):
+                        fp = (st.get('textfx') or {}).get('font_path')
+                    else:
+                        fp = getattr(st, 'textfx', {}).get('font_path') if hasattr(st, 'textfx') else None
+                    if fp and not getattr(win, 'current_font_path', None):
+                        win.current_font_path = fp
+                    loaded_state_font_path = fp
+                except Exception:
+                    pass
         # Apply setters
         if args.set_text is not None:
             win.text = args.set_text
@@ -366,6 +408,33 @@ def main(argv: Optional[list[str]] = None) -> int:
             win.fx_mode = args.set_fx_mode
         if args.set_fx_intensity is not None:
             win.fx_intensity = max(0, min(100, int(args.set_fx_intensity)))
+        if getattr(args, "set_font_path", None):
+            # Headless font load; best-effort (invalid fonts are ignored but path is recorded)
+            try:
+                from PyQt6.QtGui import QFontDatabase, QFont
+                fp = args.set_font_path
+                fam = None
+                if os.path.isfile(fp):  # only attempt load if file exists
+                    fid = QFontDatabase.addApplicationFont(fp)
+                    if fid != -1:
+                        fams = QFontDatabase.applicationFontFamilies(fid)
+                        if fams:
+                            fam = fams[0]
+                win.current_font_path = fp
+                if fam:
+                    try:
+                        # Preserve size if already set
+                        size = getattr(win, 'text_font', None).pointSize() if getattr(win, 'text_font', None) else 24
+                        win.text_font = QFont(fam, size)
+                    except Exception:
+                        pass
+                try:
+                    if hasattr(win, 'page_textfx') and hasattr(win.page_textfx, 'update_font_label'):
+                        win.page_textfx.update_font_label(fam or '(default)')
+                except Exception:
+                    pass
+            except Exception:
+                pass  # silent failure keeps CLI deterministic
         if args.vol1 is not None or args.vol2 is not None:
             v1 = win.vol1 if args.vol1 is None else max(0, min(100, int(args.vol1))) / 100.0
             v2 = win.vol2 if args.vol2 is None else max(0, min(100, int(args.vol2))) / 100.0
@@ -391,18 +460,39 @@ def main(argv: Optional[list[str]] = None) -> int:
         # Status as JSON (printed before the event loop runs for deterministic tests)
         if args.status:
             import json
+            # Prefer explicit UI label for font family (reflects state even if QFont not applied)
+            ui_font_family = None
+            try:
+                if hasattr(win, 'page_textfx') and hasattr(win.page_textfx, 'lab_font_family'):
+                    ui_font_family = win.page_textfx.lab_font_family.text()
+            except Exception:
+                pass
+            # Fallback: if current_font_path still None but state had one
+            font_path_val = getattr(win, "current_font_path", None) or loaded_state_font_path
             status = {
                 "tab": win.tabs.tabText(win.tabs.currentIndex()),
                 "running": bool(getattr(win, "running", False)),
                 "text": getattr(win, "text", None),
                 "fx_mode": getattr(win, "fx_mode", None),
                 "fx_intensity": getattr(win, "fx_intensity", None),
+                "font_path": font_path_val,
+                "font_family": ui_font_family or (
+                    getattr(getattr(win, 'text_font', None), 'family', lambda: None)() if getattr(win, 'text_font', None) else None
+                ),
                 "vol1": getattr(win, "vol1", None),
                 "vol2": getattr(win, "vol2", None),
                 "displays_checked": sum(1 for i in range(win.list_displays.count()) if win.list_displays.item(i).checkState() != 0),
             }
             print(json.dumps(status))
-        # Spin event loop briefly; a single-shot QTimer quits after timeout
+        # If only requesting status and not launching/showing, skip event loop to exit fast
+        if not (args.launch or args.show) and args.status and not any([
+            args.set_text, args.set_text_scale, args.set_fx_mode, args.set_fx_intensity,
+            args.set_font_path, args.vol1, args.vol2, args.displays, args.tab, args.load_state
+        ]):
+            try: win.close()
+            except Exception: pass
+            return 0
+        # Otherwise spin event loop briefly; a single-shot QTimer quits after timeout
         from PyQt6.QtCore import QTimer
         QTimer.singleShot(int(max(0.0, args.timeout) * 1000), app.quit)
         app.exec()

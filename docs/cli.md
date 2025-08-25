@@ -52,6 +52,7 @@ Flags:
 - `--set-text-scale <0..100>` — Set text scale percent.
 - `--set-fx-mode <name>` — Set FX mode.
 - `--set-fx-intensity <0..100>` — Set FX intensity.
+- `--set-font-path <path>` — Load a custom TTF/OTF font headlessly (best-effort; invalid files ignored) and update status JSON with font_path/family.
 - `--vol1 <0..100>` / `--vol2 <0..100>` — Set audio volumes.
 - `--displays {all|primary|none}` — Quick-select displays.
 - `--launch` / `--stop` — Start/stop overlays.
@@ -100,6 +101,10 @@ Actions (mutually exclusive):
 - `--print --file path.json` pretty-print canonical JSON to stdout
 
 Schema top-level keys: `version`, `kind="session_state"`, `saved_at`, `app_version`, `video`, `audio`, `textfx`, `device_sync`.
+
+`textfx` now may include:
+- `font_path` — user-imported font file (ttf/otf) reloaded on state apply (if still present)
+- `font_family`, `font_point_size` — resolved Qt font metrics
 
 Environment: for `state` and `session` commands the embedded Mesmer server is auto-suppressed via `MESMERGLASS_NO_SERVER=1` to keep operations fast and deterministic in CI.
 

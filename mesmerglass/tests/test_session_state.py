@@ -31,9 +31,11 @@ def test_session_state_roundtrip():
         loaded = load_session_state(p)
         assert loaded.video["primary"]["path"] == "P1.mp4"
         win2 = _make_launcher()
-        win2.apply_session_state(loaded)
-        assert win2.primary_path == "P1.mp4"
-        assert abs(win2.vol1 - 0.7) < 1e-6
+    win2.apply_session_state(loaded)
+    assert win2.primary_path == "P1.mp4"
+    assert abs(win2.primary_op - 0.9) < 1e-6, "Primary opacity should restore"
+    assert abs(win2.secondary_op - 0.4) < 1e-6, "Secondary opacity should restore"
+    assert abs(win2.vol1 - 0.7) < 1e-6
 
 
 def test_state_cli_save_and_print():
