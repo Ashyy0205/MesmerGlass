@@ -1,6 +1,7 @@
 # mesmerglass/engine/audio.py
 import pygame
 import logging
+import os
 
 def clamp(x, a, b): return max(a, min(b, x))
 
@@ -19,20 +20,25 @@ class Audio2:
         except Exception as e:
             logging.getLogger(__name__).error("audio init failed: %s", e)
             return
-
+        # Initialize state after successful (or failed) init attempt so callers
+        # can still inspect attributes even if init_ok is False.
         self.snd1 = None
         self.snd2 = None
         self.chan1 = None
         self.chan2 = None
         self.music1_path: str | None = None   # streaming fallback
+        self.snd1_path: str | None = None
+        self.snd2_path: str | None = None
 
     # -------- loading --------------------------------------------------------
     def load1(self, path: str):
         if not self.init_ok: return
         self.snd1 = None
+        self.snd1_path = None
         self.music1_path = None
         try:
             self.snd1 = pygame.mixer.Sound(path)  # full load
+            self.snd1_path = path
         except Exception as e:
             logging.getLogger(__name__).warning("load1 error: %s — falling back to streaming", e)
             # streaming fallback (uses global music channel)
@@ -42,9 +48,11 @@ class Audio2:
         if not self.init_ok: return
         try:
             self.snd2 = pygame.mixer.Sound(path)
+            self.snd2_path = path
         except Exception as e:
             logging.getLogger(__name__).error("load2 error: %s", e)
             self.snd2 = None
+            self.snd2_path = None
 
     # -------- playback -------------------------------------------------------
     def play(self, vol1=0.5, vol2=0.5):
@@ -92,3 +100,21 @@ class Audio2:
             self.chan1.set_volume(v1)
         if self.chan2:
             self.chan2.set_volume(v2)
+
+    # -------- performance helpers -----------------------------------------
+    def memory_usage_bytes(self) -> dict:
+        """Approximate memory footprint of loaded audio assets.
+
+        For fully loaded sounds we use file size as a proxy (decoded size may be
+        larger, but this keeps implementation lightweight). For streaming track
+        we return None bytes and flag streaming True.
+        """
+        def _size(p: str | None):
+            if not p: return None
+            try: return os.path.getsize(p)
+            except Exception: return None
+        return {
+            "audio1_bytes": _size(self.snd1_path),
+            "audio2_bytes": _size(self.snd2_path),
+            "audio1_streaming": bool(self.music1_path is not None),
+        }

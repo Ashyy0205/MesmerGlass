@@ -2,6 +2,7 @@ import time, threading, cv2, logging
 from typing import Optional
 from PyQt6.QtCore import QSize, Qt
 from PyQt6.QtGui import QImage, QPixmap
+from .perf import perf_metrics  # lightweight import
 
 class VideoStream:
     def __init__(self, path: Optional[str] = None):
@@ -41,6 +42,8 @@ class VideoStream:
         if not self.cap: return
         now = time.time()
         if now - self.last_ts < self.frame_interval: return
+        # Compute dt before updating last timestamp for metrics
+        dt = None if self.last_ts == 0 else (now - self.last_ts)
         self.last_ts = now
         ret, frame = self.cap.read()
         if not ret:
@@ -50,6 +53,9 @@ class VideoStream:
         import cv2 as _cv2
         frame = _cv2.cvtColor(frame, _cv2.COLOR_BGR2RGB)
         with self.lock: self.frame_rgb = frame
+        if dt is not None:
+            # Record frame time (seconds) for performance dashboard
+            perf_metrics.record_frame(dt)
 
     def get_qpixmap(self, target_size: QSize) -> Optional[QPixmap]:
         with self.lock:

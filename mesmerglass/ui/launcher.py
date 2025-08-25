@@ -29,6 +29,7 @@ from .pages.textfx import TextFxPage
 from .pages.device import DevicePage
 from .pages.audio import AudioPage
 from .pages.devtools import DevToolsPage  # DevTools content (now hosted in separate window)
+from .pages.performance import PerformancePage  # Performance metrics page
 import logging
 
 
@@ -333,7 +334,7 @@ class Launcher(QMainWindow):
             sc.activated.connect(lambda idx=i - 1: self.tabs.setCurrentIndex(idx))
         sc_dev = QShortcut(QKeySequence("Ctrl+Shift+D"), self); sc_dev.activated.connect(self._open_devtools)
 
-    def _open_devtools(self):
+    def _open_devtools(self, focus_performance: bool = False):
         """Open (or focus) DevTools in a separate window.
 
         Replaces prior behavior of adding a tab. A 'DevTools' menu is created on first open
@@ -343,9 +344,14 @@ class Launcher(QMainWindow):
             # If already open, just raise/focus
             if getattr(self, '_devtools_win', None):
                 try:
-                    self._devtools_win.show()
-                    self._devtools_win.raise_()
-                    self._devtools_win.activateWindow()
+                    self._devtools_win.show(); self._devtools_win.raise_(); self._devtools_win.activateWindow()
+                    if focus_performance and hasattr(self, '_devtools_tabs'):
+                        # Switch to performance tab if it exists
+                        tabs = getattr(self, '_devtools_tabs', None)
+                        if tabs:
+                            for i in range(tabs.count()):
+                                if tabs.tabText(i).lower().startswith('performance'):
+                                    tabs.setCurrentIndex(i); break
                 except Exception:
                     pass
                 return
@@ -354,16 +360,27 @@ class Launcher(QMainWindow):
             if getattr(self, 'mesmer_server', None):
                 try: default_port = int(self.mesmer_server.selected_port)
                 except Exception: pass
-            page = DevToolsPage(default_port=default_port)
-            # Host page in its own window
+            dev_page = DevToolsPage(default_port=default_port)
+            # Host pages in a tab widget inside its own window
             from PyQt6.QtWidgets import QMainWindow
             # Create as top-level (no parent) so it does not stay always-on-top of main window
             win = QMainWindow(None)
             win.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
             win.setWindowTitle("DevTools")
-            scroll = QScrollArea(); scroll.setWidgetResizable(True); scroll.setFrameShape(QFrame.Shape.NoFrame)
-            scroll.setWidget(page)
-            win.setCentralWidget(scroll)
+            from PyQt6.QtWidgets import QTabWidget
+            tabs = QTabWidget(); self._devtools_tabs = tabs
+            # DevTools (Virtual Toys) tab
+            scroll1 = QScrollArea(); scroll1.setWidgetResizable(True); scroll1.setFrameShape(QFrame.Shape.NoFrame)
+            scroll1.setWidget(dev_page)
+            tabs.addTab(scroll1, "DevTools")
+            # Performance tab (lazy optional add below)
+            perf_page = PerformancePage(self.audio)
+            scroll2 = QScrollArea(); scroll2.setWidgetResizable(True); scroll2.setFrameShape(QFrame.Shape.NoFrame)
+            scroll2.setWidget(perf_page)
+            tabs.addTab(scroll2, "Performance")
+            if focus_performance:
+                tabs.setCurrentIndex(1)
+            win.setCentralWidget(tabs)
             self._devtools_win = win  # hold reference
             # Inject menu on first open
             self._ensure_devtools_menu()
@@ -382,9 +399,11 @@ class Launcher(QMainWindow):
             if not mb:
                 return
             m = mb.addMenu("DevTools")
-            act_focus = m.addAction("Focus / Open")
-            act_focus.triggered.connect(self._open_devtools)
-            act_close = m.addAction("Close")
+            act_focus = m.addAction("Open / Focus DevTools")
+            act_focus.triggered.connect(lambda: self._open_devtools(False))
+            act_perf = m.addAction("Open Performance Metrics")
+            act_perf.triggered.connect(lambda: self._open_devtools(True))
+            act_close = m.addAction("Close DevTools")
             def _close():
                 w = getattr(self, '_devtools_win', None)
                 if w:

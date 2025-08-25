@@ -15,15 +15,25 @@ def _clamp(v: float, lo: float, hi: float) -> float:
 
 class _VideoReader:
     def __init__(self, path: Optional[str]):
-        self.path = path or ""; self.cap = None; self.cv2 = None
-        self.fps = 30.0; self._period = 1.0 / self.fps; self._last_t = 0.0; self._last_pix: Optional[QPixmap] = None
-        if not self.path: return
+        self.path = path or ""
+        self.cap = None
+        self.cv2 = None
+        self.fps = 30.0
+        self._period = 1.0 / self.fps
+        self._last_t = 0.0  # monotonic timestamp of last captured frame
+        self._last_pix: Optional[QPixmap] = None
+        if not self.path:
+            return
         try:
             import cv2  # type: ignore
-            self.cv2 = cv2; cap = cv2.VideoCapture(self.path)
+            self.cv2 = cv2
+            cap = cv2.VideoCapture(self.path)
             if cap.isOpened():
-                self.cap = cap; fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
-                if fps and fps > 1.0: self.fps = float(fps); self._period = 1.0 / self.fps
+                self.cap = cap
+                fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
+                if fps and fps > 1.0:
+                    self.fps = float(fps)
+                    self._period = 1.0 / self.fps
                 logging.getLogger(__name__).info("[video] opened %s @ %.2f fps", self.path, self.fps)
             else:
                 logging.getLogger(__name__).warning("[video] failed to open: %s", self.path)
@@ -47,7 +57,13 @@ class _VideoReader:
             rgb2 = self.cv2.resize(rgb, (new_w, new_h), interpolation=self.cv2.INTER_AREA)
             from PyQt6.QtGui import QImage
             qimg = QImage(rgb2.data, new_w, new_h, QImage.Format.Format_RGB888)
-            self._last_pix = QPixmap.fromImage(qimg); self._last_t = now
+            self._last_pix = QPixmap.fromImage(qimg)
+            # Record frame timing for performance metrics using elapsed since previous frame
+            from ..engine.perf import perf_metrics  # local import to avoid heavy import at module top
+            if self._last_t != 0.0:
+                dt = now - self._last_t
+                if dt > 0: perf_metrics.record_frame(dt)
+            self._last_t = now
         except Exception:
             return self._last_pix
         return self._last_pix
