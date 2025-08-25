@@ -159,6 +159,15 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--apply", action="store_true", help="Apply pack to headless launcher and print status JSON")
     g.add_argument("--summary", action="store_true", help="Print concise summary (default)")
 
+    # Runtime session state (save/load current UI configuration)
+    p_state = sub.add_parser("state", help="Save or apply runtime UI/device/audio/text settings")
+    act = p_state.add_mutually_exclusive_group(required=True)
+    act.add_argument("--save", action="store_true", help="Capture current defaults (headless) and write to file")
+    act.add_argument("--apply", action="store_true", help="Apply a saved state file (headless)")
+    act.add_argument("--print", action="store_true", help="Print a saved state file as canonical JSON")
+    p_state.add_argument("--file", required=True, help="Target state JSON file (input or output depending on action)")
+    p_state.add_argument("--from-live", action="store_true", help="(Reserved) Capture from a running instance (not yet implemented)")
+
     return parser
 
 
@@ -190,10 +199,83 @@ def main(argv: Optional[list[str]] = None) -> int:
         except Exception as e:
             logging.getLogger(__name__).error("Failed to load session pack: %s", e)
             return 1
-        # Determine mode
         summary_mode = (not args.print and not args.apply) or args.summary
         if args.print:
             print(_json.dumps(pack.to_canonical_dict(), separators=(",", ":"), ensure_ascii=False))
+            return 0
+        if args.apply:
+            # Headless apply (no event loop spin)
+            from PyQt6.QtWidgets import QApplication
+            from .ui.launcher import Launcher
+            app = QApplication.instance() or QApplication([])
+            win = Launcher("MesmerGlass", enable_device_sync_default=False)
+            try:
+                if hasattr(win, "apply_session_pack"):
+                    win.apply_session_pack(pack)
+            except Exception as e:
+                logging.getLogger(__name__).error("Error applying session pack: %s", e)
+                return 1
+            status = {"pack": pack.name, "text": getattr(win, "text", None), "buzz_intensity": getattr(win, "buzz_intensity", None)}
+            print(_json.dumps(status, ensure_ascii=False))
+            try:
+                win.close()
+            except Exception:
+                pass
+            return 0
+        if summary_mode:
+            ti = f"{len(pack.text.items)} text" if pack.text.items else "0 text"
+            ps = f"{len(pack.pulse.stages)} stages" if pack.pulse.stages else "0 stages"
+            print(f"SessionPack '{pack.name}' v{pack.version} — {ti}, {ps}")
+            return 0
+    if cmd == "state":
+        from .content.loader import load_session_state, save_session_state
+        from PyQt6.QtWidgets import QApplication
+        from .ui.launcher import Launcher
+        target = args.file
+        if args.save:
+            app = QApplication.instance() or QApplication([])
+            win = Launcher("MesmerGlass", enable_device_sync_default=False)
+            st = win.capture_session_state()
+            if st is None:
+                logging.getLogger(__name__).error("Failed to capture session state")
+                return 1
+            try:
+                save_session_state(st, target)
+            except Exception as e:
+                logging.getLogger(__name__).error("Failed to save state: %s", e)
+                return 1
+            return 0
+        if args.print:
+            try:
+                st = load_session_state(target)
+            except Exception as e:
+                logging.getLogger(__name__).error("Failed to load state: %s", e)
+                return 1
+            import json as _json
+            print(_json.dumps(st.to_json_dict(), ensure_ascii=False, separators=(",", ":")))
+            return 0
+        if args.apply:
+            try:
+                st = load_session_state(target)
+            except Exception as e:
+                logging.getLogger(__name__).error("Failed to load state: %s", e)
+                return 1
+            app = QApplication.instance() or QApplication([])
+            win = Launcher("MesmerGlass", enable_device_sync_default=False)
+            win.apply_session_state(st)
+            # Provide a minimal status JSON for callers
+            import json as _json
+            status = {
+                "video_primary": getattr(win, "primary_path", None),
+                "vol1": getattr(win, "vol1", None),
+                "fx_mode": getattr(win, "fx_mode", None),
+                "buzz_intensity": getattr(win, "buzz_intensity", None),
+            }
+            print(_json.dumps(status, ensure_ascii=False, separators=(",", ":")))
+            try:
+                win.close()
+            except Exception:
+                pass
             return 0
         if args.apply:
             # Headless apply (no event loop spin)

@@ -10,8 +10,10 @@ No scheduling logic here; the launcher only applies initial state.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from typing import List, Any, Dict, Optional
+from datetime import datetime, timezone
+import json
 
 
 @dataclass(slots=True)
@@ -159,7 +161,14 @@ class SessionPack:
 
 
 def build_session_pack(data: Dict[str, Any]) -> SessionPack:
-    version = data.get("version")
+    raw_version = data.get("version")
+    if raw_version is None:
+        version = -1  # invalid sentinel to trigger validation error
+    else:
+        try:
+            version = int(raw_version)  # type: ignore[arg-type]
+        except Exception:
+            version = -1  # will fail validation
     name = data.get("name", "")
     text_raw = data.get("text", {}) or {}
     pulse_raw = data.get("pulse", {}) or {}
@@ -187,3 +196,56 @@ def build_session_pack(data: Dict[str, Any]) -> SessionPack:
     )
     pack.validate()
     return pack
+
+
+# -------------------- Runtime Session State Save/Load --------------------
+@dataclass(slots=True)
+class SessionState:
+    """Serializable snapshot of current launcher/UI state.
+
+    Distinct from SessionPack (message packs). This captures user-selected
+    runtime configuration so it can be restored later.
+    """
+    version: int = 1
+    kind: str = "session_state"
+    saved_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    app_version: Optional[str] = None
+    video: Dict[str, Any] = field(default_factory=dict)
+    audio: Dict[str, Any] = field(default_factory=dict)
+    textfx: Dict[str, Any] = field(default_factory=dict)
+    device_sync: Dict[str, Any] = field(default_factory=dict)
+
+    def validate(self) -> None:
+        if self.kind != "session_state":
+            raise ValueError("Invalid session state kind")
+        if self.version != 1:
+            raise ValueError(f"Unsupported session state version {self.version}")
+        # Basic shape checks (lightweight; launcher clamps values on apply)
+        if not isinstance(self.video, dict):
+            raise ValueError("video must be object")
+        if not isinstance(self.audio, dict):
+            raise ValueError("audio must be object")
+        if not isinstance(self.textfx, dict):
+            raise ValueError("textfx must be object")
+        if not isinstance(self.device_sync, dict):
+            raise ValueError("device_sync must be object")
+
+    def to_json_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_json_dict(), ensure_ascii=False, separators=(",", ":"))
+
+def build_session_state(data: Dict[str, Any]) -> SessionState:
+    st = SessionState(
+        version=data.get("version", 1),
+        kind=data.get("kind", ""),
+        saved_at=data.get("saved_at") or datetime.now(timezone.utc).isoformat(),
+        app_version=data.get("app_version"),
+        video=data.get("video") or {},
+        audio=data.get("audio") or {},
+        textfx=data.get("textfx") or {},
+        device_sync=data.get("device_sync") or {},
+    )
+    st.validate()
+    return st

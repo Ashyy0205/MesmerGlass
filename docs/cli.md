@@ -24,6 +24,7 @@ Legacy: `python run.py` still works but is deprecated (see migration note).
 -- `toy` — Run a deterministic virtual toy simulator for dev/CI (no hardware required).
 -- `selftest` — Quick import/environment check; exit code 0 on success.
 -- `test-run [type]` — Run pytest selection (replaces `run_tests.py`).
+-- `state` — Save/apply/print a runtime session state snapshot (video/audio/textfx/device settings).
 ### test-run
 
 Wrapper around pytest for common selections.
@@ -86,6 +87,24 @@ Examples:
 ```
 python -m mesmerglass server --port 0  # start server on ephemeral port; note the port from logs
 python -m mesmerglass toy --port 12345 --latency-ms 50 --map ease --gamma 2.0 --run-for 1.0
+```
+
+### state
+
+Manage a lightweight snapshot of current UI-related configuration (distinct from message packs):
+
+Actions (mutually exclusive):
+- `--save --file path.json` capture a fresh launcher state to JSON
+- `--apply --file path.json` load a state file and apply to a headless launcher (prints minimal status JSON)
+- `--print --file path.json` pretty-print canonical JSON to stdout
+
+Schema top-level keys: `version`, `kind="session_state"`, `saved_at`, `app_version`, `video`, `audio`, `textfx`, `device_sync`.
+
+Examples:
+```
+python -m mesmerglass state --save --file my_state.json
+python -m mesmerglass state --print --file my_state.json
+python -m mesmerglass state --apply --file my_state.json
 ```
 
 ## Exit codes

@@ -9,7 +9,7 @@ from __future__ import annotations
 import json, time
 from pathlib import Path
 from typing import Union
-from .models import build_session_pack, SessionPack
+from .models import build_session_pack, SessionPack, build_session_state, SessionState
 
 MAX_SIZE_BYTES = 1_000_000
 
@@ -40,3 +40,26 @@ def load_session_pack(path: Union[str, Path]) -> SessionPack:
 
 def load_session_pack_from_json_str(raw: str) -> SessionPack:
     return build_session_pack(json.loads(raw))
+
+
+# ------------------- SessionState save/load (runtime state) -------------------
+def load_session_state(path: Union[str, Path]) -> SessionState:
+    p = Path(path)
+    if not p.is_file():
+        raise ValueError(f"Session state file not found: {p}")
+    if p.stat().st_size > MAX_SIZE_BYTES:
+        raise ValueError("Session state file too large (>1MB)")
+    try:
+        raw = p.read_text(encoding="utf-8-sig")
+        if raw.startswith("\ufeff"):
+            raw = raw.lstrip("\ufeff")
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid JSON: {e.msg} (line {e.lineno})") from None
+    if not isinstance(data, dict):
+        raise ValueError("Top-level JSON must be an object")
+    return build_session_state(data)
+
+def save_session_state(state: SessionState, path: Union[str, Path]) -> None:
+    p = Path(path)
+    p.write_text(state.to_json(), encoding="utf-8")

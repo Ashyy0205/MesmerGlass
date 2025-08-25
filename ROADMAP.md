@@ -57,7 +57,7 @@ Focused, incremental milestones in the exact order we’ll implement them. Each 
 - Success
   - Pack loads in < 200 ms and maps to current UI/engine state.
 
-## 4) Text editing, fonts, and simple layouts
+## 4) Text editing, fonts, and simple layouts [Text Editor Already Complete]
 
 - Scope
   - Text page gains an editor feel: multiple sentences/entries; basic ordering.

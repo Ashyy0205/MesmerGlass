@@ -1,11 +1,3 @@
-"""Launcher window (restored baseline).
-
-This file was fully replaced with a previously saved, known-good version
-(`launch_pre.py`) after structural corruption in earlier patches. Future
-enhancements (menu bar, pack path tracking) will be re-applied as small
-incremental diffs on top of this stable baseline.
-"""
-
 import os, time, random, threading, time as _time_mod, asyncio  # asyncio added for persistent BLE loop
 from typing import List
 
@@ -124,14 +116,10 @@ class Launcher(QMainWindow):
         self._ble_loop_thread = threading.Thread(target=_ble_loop_runner, name="BLELoop", daemon=True)
         self._ble_loop_thread.start()
 
-        # Environment flag to suppress starting MesmerIntiface server in headless/CI
-        self._suppress_server = bool(os.environ.get("MESMERGLASS_NO_SERVER"))
-
         # UI / services ----------------------------------------------
         self._build_ui()
         self._bind_shortcuts()
-        if not self._suppress_server:
-            self._start_mesmer_server()
+        self._start_mesmer_server()
 
         # Message pack placeholder
         self.session_pack = None
@@ -257,7 +245,7 @@ class Launcher(QMainWindow):
             fl.addWidget(self.chip_overlay); fl.addWidget(self.chip_device)
         self.chip_audio = QLabel('Audio: 0/2'); self.chip_audio.setObjectName('statusChip')
         fl.addWidget(self.chip_audio); main.addWidget(footer,0)
-        # Footer buttons (correct indentation within _build_ui)
+
         self.btn_launch.clicked.connect(self.launch)
         self.btn_stop.clicked.connect(self.stop_all)
         self._refresh_status()
@@ -411,175 +399,11 @@ class Launcher(QMainWindow):
         self.vol1, self.vol2 = v1, v2
         self.audio.set_vols(v1, v2)
 
-    # ---------------- Session State Capture / Apply ----------------
-    def capture_session_state(self):
-        """Build and return a SessionState snapshot (or None on failure).
-
-        Deferred import keeps launcher usable if content models evolve.
-        """
-        try:
-            from ..content.models import SessionState  # local import
-        except Exception:
-            return None
-        # Dynamic app version (if available); fall back to None silently.
-        try:
-            from .. import __version__ as _app_ver
-        except Exception:
-            _app_ver = None
-        # Video
-        video = {
-            "primary": {"path": getattr(self, "primary_path", None) or None, "opacity": float(getattr(self, "primary_op", 1.0))},
-            "secondary": {"path": getattr(self, "secondary_path", None) or None, "opacity": float(getattr(self, "secondary_op", 0.5))},
-        }
-        # Audio
-        audio = {
-            "a1": {"path": getattr(self, "audio1_path", None) or None, "volume": float(getattr(self, "vol1", 0.0))},
-            "a2": {"path": getattr(self, "audio2_path", None) or None, "volume": float(getattr(self, "vol2", 0.0))},
-        }
-        # Text / FX
-        col = getattr(self, "text_color", None)
-        if col is not None:
-            try:
-                color_hex = f"#{col.red():02X}{col.green():02X}{col.blue():02X}"
-            except Exception:
-                color_hex = "#FFFFFF"
-        else:
-            color_hex = "#FFFFFF"
-        font = getattr(self, "text_font", None)
-        font_family = None; font_size = None
-        if font is not None:
-            try:
-                font_family = font.family(); font_size = font.pointSize()
-            except Exception:
-                pass
-        textfx = {
-            "pack_path": getattr(self, "current_pack_path", None),
-            "text_color": color_hex,
-            "font_family": font_family,
-            "font_point_size": font_size,
-            "scale_pct": int(getattr(self, "text_scale_pct", 100)),
-            "fx_mode": getattr(self, "fx_mode", None),
-            "fx_intensity": int(getattr(self, "fx_intensity", 0)),
-            "flash_interval_ms": int(getattr(self, "flash_interval_ms", 0)),
-            "flash_width_ms": int(getattr(self, "flash_width_ms", 0)),
-        }
-        # Device sync
-        device_sync = {
-            "buzz_on_flash": bool(getattr(self, "enable_buzz_on_flash", False)),
-            "buzz_intensity": float(getattr(self, "buzz_intensity", 0.0)),
-            "enable_bursts": bool(getattr(self, "enable_bursts", False)),
-            "burst_min_s": int(getattr(self, "burst_min_s", 0)),
-            "burst_max_s": int(getattr(self, "burst_max_s", 0)),
-            "burst_peak": float(getattr(self, "burst_peak", 0.0)),
-            "burst_max_ms": int(getattr(self, "burst_max_ms", 0)),
-        }
-        try:
-            return SessionState(video=video, audio=audio, textfx=textfx, device_sync=device_sync, app_version=_app_ver)
-        except Exception:
-            return None
-
-    def apply_session_state(self, state):
-        """Apply a previously captured SessionState (or raw dict).
-
-        Ignores unknown/missing keys; clamps via existing setters where possible.
-        """
-        if state is None:
-            return
-        if isinstance(state, dict):
-            data = state
-        else:
-            try:
-                data = state.to_json_dict()  # type: ignore[attr-defined]
-            except Exception:
-                return
-        # Video
-        try:
-            video = data.get("video", {}) or {}
-            prim = video.get("primary", {})
-            self.primary_path = prim.get("path") or ""; self.primary_op = float(prim.get("opacity", self.primary_op))
-            sec = video.get("secondary", {})
-            self.secondary_path = sec.get("path") or ""; self.secondary_op = float(sec.get("opacity", self.secondary_op))
-        except Exception:
-            pass
-        # Audio
-        try:
-            audio = data.get("audio", {}) or {}
-            a1 = audio.get("a1", {}); self.audio1_path = a1.get("path") or self.audio1_path; self.vol1 = float(a1.get("volume", self.vol1))
-            a2 = audio.get("a2", {}); self.audio2_path = a2.get("path") or self.audio2_path; self.vol2 = float(a2.get("volume", self.vol2))
-            self._set_vols(self.vol1, self.vol2)
-        except Exception:
-            pass
-        # Text / FX
-        textfx = data.get("textfx", {}) or {}
-        try:
-            from PyQt6.QtGui import QColor
-            color_hex = textfx.get("text_color") or None
-            if color_hex:
-                self.text_color = QColor(color_hex)
-        except Exception:
-            pass
-        try:
-            self.text_scale_pct = int(textfx.get("scale_pct", self.text_scale_pct))
-            self.fx_mode = textfx.get("fx_mode", self.fx_mode)
-            self.fx_intensity = int(textfx.get("fx_intensity", self.fx_intensity))
-            self.flash_interval_ms = int(textfx.get("flash_interval_ms", self.flash_interval_ms))
-            self.flash_width_ms = int(textfx.get("flash_width_ms", self.flash_width_ms))
-            # Font (optional restoration)
-            fam = textfx.get("font_family")
-            sz = textfx.get("font_point_size")
-            if fam and sz:
-                try:
-                    self.text_font = QFont(fam, int(sz))
-                except Exception:
-                    pass
-            # Message pack path (if provided) — we do not auto-load the pack here for safety; just remember.
-            self.current_pack_path = textfx.get("pack_path", self.current_pack_path)
-        except Exception:
-            pass
-        # Propagate changes to UI widgets where safe (best-effort; guard for headless tests)
-        try:
-            if hasattr(self, 'page_textfx') and self.page_textfx:
-                if hasattr(self.page_textfx, 'set_text') and self.text:
-                    self.page_textfx.set_text(self.text)
-                if hasattr(self.page_textfx, 'set_fx_intensity'):
-                    try: self.page_textfx.set_fx_intensity(self.fx_intensity)
-                    except Exception: pass
-                if hasattr(self.page_textfx, 'set_fx_mode'):
-                    try: self.page_textfx.set_fx_mode(self.fx_mode)
-                    except Exception: pass
-            if hasattr(self, 'page_audio') and self.page_audio:
-                if hasattr(self.page_audio, 'set_vol1_pct'):
-                    try: self.page_audio.set_vol1_pct(int(self.vol1 * 100))
-                    except Exception: pass
-                if hasattr(self.page_audio, 'set_vol2_pct'):
-                    try: self.page_audio.set_vol2_pct(int(self.vol2 * 100))
-                    except Exception: pass
-        except Exception:
-            pass
-        # Device sync
-        try:
-            device_sync = data.get("device_sync", {}) or {}
-            self.enable_buzz_on_flash = bool(device_sync.get("buzz_on_flash", self.enable_buzz_on_flash))
-            self.buzz_intensity = float(device_sync.get("buzz_intensity", self.buzz_intensity))
-            self.enable_bursts = bool(device_sync.get("enable_bursts", self.enable_bursts))
-            self.burst_min_s = int(device_sync.get("burst_min_s", self.burst_min_s))
-            self.burst_max_s = int(device_sync.get("burst_max_s", self.burst_max_s))
-            self.burst_peak = float(device_sync.get("burst_peak", self.burst_peak))
-            self.burst_max_ms = int(device_sync.get("burst_max_ms", self.burst_max_ms))
-        except Exception:
-            pass
-        try:
-            self._refresh_status()
-        except Exception:
-            pass
-
     def _start_mesmer_server(self):
         """Start MesmerIntiface server if not already running."""
         # NOTE: Previous patch accidentally dedented the body leading to a class-level
         # 'if not self.mesmer_server' which executed at class creation and raised NameError.
         # This restores correct indentation so the logic runs only when method is invoked.
-        if self._suppress_server:
-            return
         if not self.mesmer_server and MesmerIntifaceServer is not None:  # type: ignore[truthy-bool]
             try:
                 self.mesmer_server = MesmerIntifaceServer(port=12350)
@@ -1051,12 +875,6 @@ class Launcher(QMainWindow):
             avg = getattr(pack, 'avg_intensity', None)
             if avg is not None:
                 self.buzz_intensity = max(0.0, min(1.0, float(avg)))
-            # Track source path (loader injects _source_path into raw dict)
-            try:
-                raw = getattr(pack, 'raw', {}) or {}
-                self.current_pack_path = raw.get('_source_path', self.current_pack_path)
-            except Exception:
-                pass
             logging.getLogger(__name__).info("Applied message pack '%s' (text_set=%s avg_intensity=%s)", getattr(pack, 'name', '?'), bool(first), avg)
             # Precompute weights for per-flash random selection
             self._prepare_pack_weights()
