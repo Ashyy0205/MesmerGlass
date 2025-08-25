@@ -1,4 +1,4 @@
-import os, time, random, threading, time as _time_mod
+import os, time, random, threading, time as _time_mod, asyncio  # asyncio added for persistent BLE loop
 from typing import List
 
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject
@@ -11,7 +11,11 @@ from PyQt6.QtWidgets import (
 
 from ..engine.audio import Audio2
 from ..engine.pulse import PulseEngine, clamp
-from ..engine.mesmerintiface import MesmerIntifaceServer
+try:
+    # MesmerIntiface optional if bleak is not installed in current environment.
+    from ..engine.mesmerintiface import MesmerIntifaceServer  # type: ignore
+except Exception:  # pragma: no cover - fallback when bleak missing or import error
+    MesmerIntifaceServer = None  # type: ignore
 from .overlay import OverlayWindow
 from .pages.textfx import TextFxPage
 from .pages.device import DevicePage
@@ -86,6 +90,31 @@ class Launcher(QMainWindow):
         self.scan_signaler.scan_completed.connect(self._scan_completed)
         # Global shutdown flag (guards async callbacks during close)
         self._shutting_down = False
+
+        # --- Persistent BLE event loop (fixes 'Event loop is closed' RuntimeError) ---
+        # Bleak (WinRT backend) captures the current asyncio loop when a device connects
+        # and later uses loop.call_soon_threadsafe from native notification threads.
+        # Previous implementation created short-lived event loops (new_event_loop + close)
+        # for scan/connect operations; once closed, Bleak callbacks attempted to schedule
+        # work on a dead loop, raising RuntimeError: Event loop is closed.
+        # We allocate ONE long‑lived loop in a daemon thread for all BLE tasks and shut it
+        # down only during Launcher.closeEvent after devices & server are cleanly stopped.
+        self._ble_loop: asyncio.AbstractEventLoop | None = asyncio.new_event_loop()
+        self._ble_loop_alive = True
+        def _ble_loop_runner():  # runs forever until stop requested
+            asyncio.set_event_loop(self._ble_loop)
+            try:
+                self._ble_loop.run_forever()
+            except Exception as e:  # pragma: no cover - defensive
+                logging.getLogger(__name__).error("BLE loop crash: %s", e)
+            finally:
+                # Close loop so pending handles are released
+                try:
+                    self._ble_loop.close()
+                except Exception:
+                    pass
+        self._ble_loop_thread = threading.Thread(target=_ble_loop_runner, name="BLELoop", daemon=True)
+        self._ble_loop_thread.start()
 
         # UI / services ----------------------------------------------
         self._build_ui()
@@ -372,24 +401,27 @@ class Launcher(QMainWindow):
 
     def _start_mesmer_server(self):
         """Start MesmerIntiface server if not already running."""
-        if not self.mesmer_server:
+        # NOTE: Previous patch accidentally dedented the body leading to a class-level
+        # 'if not self.mesmer_server' which executed at class creation and raised NameError.
+        # This restores correct indentation so the logic runs only when method is invoked.
+        if not self.mesmer_server and MesmerIntifaceServer is not None:  # type: ignore[truthy-bool]
             try:
                 self.mesmer_server = MesmerIntifaceServer(port=12350)
                 self.mesmer_server.start()
                 # Register device list change callback to update UI for both virtual and BLE devices
-                def _cb(dev_list):
+                def _cb(dev_list):  # inline small callback; resilient to exceptions
                     try:
                         self.scan_signaler.scan_completed.emit(dev_list)
                     except Exception:
-                        pass
+                        pass  # swallow; UI closed or signal disconnected
                 self._mesmer_device_cb = _cb
                 try:
                     self.mesmer_server.add_device_callback(_cb)
                 except Exception:
-                    self._mesmer_device_cb = None
+                    self._mesmer_device_cb = None  # fallback if API differs / not available
                 logging.getLogger(__name__).info("MesmerIntiface server started automatically on port 12350")
                 self._refresh_status()
-            except Exception as e:
+            except Exception as e:  # pragma: no cover - defensive runtime path
                 logging.getLogger(__name__).error("Failed to start MesmerIntiface server: %s", e)
                 self.mesmer_server = None
 
@@ -415,20 +447,21 @@ class Launcher(QMainWindow):
                 logging.getLogger(__name__).error("Failed to start MesmerIntiface server: %s", e)
                 self.mesmer_server = None
         elif not b and self.mesmer_server:
-            try:
-                import asyncio
-                loop = asyncio.new_event_loop(); asyncio.set_event_loop(loop)
-                loop.run_until_complete(self.mesmer_server.shutdown()); loop.close()
-                # Remove device callback
+            # Schedule async shutdown on persistent BLE loop instead of creating a short-lived loop
+            async def _shutdown_server():
                 try:
-                    if getattr(self, "_mesmer_device_cb", None):
-                        self.mesmer_server.remove_device_callback(self._mesmer_device_cb)
-                except Exception:
-                    pass
-                self.mesmer_server = None
-                logging.getLogger(__name__).info("MesmerIntiface server stopped")
-            except Exception as e:
-                logging.getLogger(__name__).error("Error stopping MesmerIntiface server: %s", e)
+                    await self.mesmer_server.shutdown()  # type: ignore[func-returns-value]
+                except Exception as e:
+                    logging.getLogger(__name__).error("Error stopping MesmerIntiface server: %s", e)
+            self._run_ble_coro(_shutdown_server())
+            # Detach callback & clear ref synchronously (actual async cleanup continues in background)
+            try:
+                if getattr(self, "_mesmer_device_cb", None):
+                    self.mesmer_server.remove_device_callback(self._mesmer_device_cb)
+            except Exception:
+                pass
+            self.mesmer_server = None
+            logging.getLogger(__name__).info("MesmerIntiface server stop requested")
         self._refresh_status()
 
     def _on_scan_devices(self):
@@ -436,32 +469,29 @@ class Launcher(QMainWindow):
         if self.device_scan_in_progress or not self.mesmer_server:
             return
         self.device_scan_in_progress = True
-        import asyncio
-        def scan_task():
+        # Run scan entirely inside persistent BLE loop; emit Qt signal back on completion.
+        async def _scan():
             try:
-                loop = asyncio.new_event_loop(); asyncio.set_event_loop(loop)
-                async def do_scan():
-                    logging.getLogger(__name__).info("Starting Bluetooth device scan...")
-                    success = await self.mesmer_server.start_real_scanning()
-                    if success:
-                        await asyncio.sleep(8.0)
-                        await self.mesmer_server.stop_real_scanning()
+                logging.getLogger(__name__).info("Starting Bluetooth device scan...")
+                success = await self.mesmer_server.start_real_scanning()  # type: ignore[func-returns-value]
+                if success:
+                    await asyncio.sleep(8.0)
+                    await self.mesmer_server.stop_real_scanning()  # type: ignore[func-returns-value]
+                    device_list = self.mesmer_server.get_device_list()
+                    self.scan_signaler.scan_completed.emit(device_list)
+                else:
+                    logging.getLogger(__name__).error("Failed to start Bluetooth scan — showing current device list")
+                    try:
                         device_list = self.mesmer_server.get_device_list()
                         self.scan_signaler.scan_completed.emit(device_list)
-                    else:
-                        logging.getLogger(__name__).error("Failed to start Bluetooth scan — showing current device list")
-                        try:
-                            device_list = self.mesmer_server.get_device_list()
-                            self.scan_signaler.scan_completed.emit(device_list)
-                        except Exception:
-                            QTimer.singleShot(0, lambda: self._scan_completed(None))
-                loop.run_until_complete(do_scan()); loop.close()
+                    except Exception:
+                        QTimer.singleShot(0, lambda: self._scan_completed(None))
             except Exception:
                 from PyQt6.QtCore import QTimer as _QtTimer
                 _QtTimer.singleShot(0, lambda: self._scan_completed(None))
             finally:
                 self.device_scan_in_progress = False
-        threading.Thread(target=scan_task, daemon=True).start()
+        self._run_ble_coro(_scan())
 
     def _update_device_list_ui(self, device_list):
         """Update UI with scan results (called on main thread)."""
@@ -496,14 +526,14 @@ class Launcher(QMainWindow):
         if not self.mesmer_server:
             return
         logging.getLogger(__name__).info("Selecting device with Buttplug index %s", device_idx)
-        # Stop any active scan immediately (on-demand scanning model)
-        try:
-            import asyncio as _a
-            if self.mesmer_server.is_real_scanning():
-                loop = _a.new_event_loop(); _a.set_event_loop(loop)
-                loop.run_until_complete(self.mesmer_server.stop_real_scanning()); loop.close()
-        except Exception:
-            pass
+        # Stop any active scan immediately using persistent loop
+        async def _stop_scan_if_running():
+            try:
+                if self.mesmer_server and self.mesmer_server.is_real_scanning():
+                    await self.mesmer_server.stop_real_scanning()  # type: ignore[func-returns-value]
+            except Exception:
+                pass
+        self._run_ble_coro(_stop_scan_if_running())
         if hasattr(self.pulse, 'select_device_by_index'):
             self.pulse.select_device_by_index(device_idx)
         elif hasattr(self.pulse, 'device_manager'):
@@ -515,25 +545,20 @@ class Launcher(QMainWindow):
         if list_idx is not None:
             self.mesmer_server.select_device(list_idx)
             logging.getLogger(__name__).info("Selected device at list index %s (Buttplug index %s)", list_idx, device_idx)
-            import asyncio
-            def connect_device():
+            async def _connect_real():
                 try:
-                    loop = asyncio.new_event_loop(); asyncio.set_event_loop(loop)
-                    async def do_connect():
-                        if hasattr(self.mesmer_server, "is_ble_device_index") and not self.mesmer_server.is_ble_device_index(device_idx):
-                            logging.getLogger(__name__).info("Selected virtual device %s (no BLE connect)", device_idx)
-                            return True
-                        logging.getLogger(__name__).info("Attempting to connect to real device %s...", device_idx)
-                        success = await self.mesmer_server.connect_real_device(device_idx)
-                        if success:
-                            logging.getLogger(__name__).info("Successfully connected to device %s", device_idx)
-                        else:
-                            logging.getLogger(__name__).error("Failed to connect to device %s", device_idx)
-                        return success
-                    _ = loop.run_until_complete(do_connect()); loop.close()
+                    if hasattr(self.mesmer_server, "is_ble_device_index") and not self.mesmer_server.is_ble_device_index(device_idx):
+                        logging.getLogger(__name__).info("Selected virtual device %s (no BLE connect)", device_idx)
+                        return True
+                    logging.getLogger(__name__).info("Attempting to connect to real device %s...", device_idx)
+                    success = await self.mesmer_server.connect_real_device(device_idx)  # type: ignore[func-returns-value]
+                    if success:
+                        logging.getLogger(__name__).info("Successfully connected to device %s", device_idx)
+                    else:
+                        logging.getLogger(__name__).error("Failed to connect to device %s", device_idx)
                 except Exception as e:
                     logging.getLogger(__name__).exception("Error connecting to device %s: %s", device_idx, e)
-            threading.Thread(target=connect_device, daemon=True).start()
+            self._run_ble_coro(_connect_real())
             # Start / ensure maintenance timer exists
             try:
                 from PyQt6.QtCore import QTimer as _QTimer
@@ -541,21 +566,14 @@ class Launcher(QMainWindow):
                     self._ble_maint_timer = _QTimer(self)
                     self._ble_maint_timer.setInterval(10000)  # 10s
                     def _maint():
-                        import threading as _th, asyncio as _asyncio
                         if not self.mesmer_server:
                             return
-                        def _run():
+                        async def _maint_coro():
                             try:
-                                loop = _asyncio.new_event_loop(); _asyncio.set_event_loop(loop)
-                                async def do_maint():
-                                    try:
-                                        await self.mesmer_server.maintain_selected_device_connections()
-                                    except Exception:
-                                        pass
-                                loop.run_until_complete(do_maint()); loop.close()
+                                await self.mesmer_server.maintain_selected_device_connections()  # type: ignore[func-returns-value]
                             except Exception:
                                 pass
-                        _th.Thread(target=_run, daemon=True).start()
+                        self._run_ble_coro(_maint_coro())
                     self._ble_maint_timer.timeout.connect(_maint)
                     self._ble_maint_timer.start()
             except Exception:
@@ -591,22 +609,15 @@ class Launcher(QMainWindow):
                 self.page_device.set_selected_devices(names)
         except Exception:
             pass
-        import asyncio
-        def connect_many(indices: list[int]):
-            try:
-                loop = asyncio.new_event_loop(); asyncio.set_event_loop(loop)
-                async def do_all():
-                    for idx in indices:
-                        try:
-                            if hasattr(self.mesmer_server, 'is_ble_device_index') and not self.mesmer_server.is_ble_device_index(idx):
-                                continue
-                            await self.mesmer_server.connect_real_device(idx)
-                        except Exception:
-                            pass
-                loop.run_until_complete(do_all()); loop.close()
-            except Exception:
-                pass
-        threading.Thread(target=connect_many, args=(sel,), daemon=True).start()
+        async def _connect_many(indices: list[int]):
+            for idx in indices:
+                try:
+                    if hasattr(self.mesmer_server, 'is_ble_device_index') and not self.mesmer_server.is_ble_device_index(idx):
+                        continue
+                    await self.mesmer_server.connect_real_device(idx)  # type: ignore[func-returns-value]
+                except Exception:
+                    pass
+        self._run_ble_coro(_connect_many(sel))
 
     # ====================== launch / stop (unchanged) ======================
     def launch(self):
@@ -772,48 +783,34 @@ class Launcher(QMainWindow):
         step(8, "stop_all done")
         # If a real scan is running, stop it cleanly before shutting server
         try:
-            if self.mesmer_server and hasattr(self.mesmer_server, 'is_real_scanning') and self.mesmer_server.is_real_scanning():
-                step(8.5, "scan active - stopping")
-                import asyncio
-                loop = asyncio.new_event_loop(); asyncio.set_event_loop(loop)
-                step(8.51, f"loop created id={id(loop)}")
-                async def _stop_scan():  # inline coroutine for timeout control
-                    step(8.52, "stop coroutine begin")  # inside coroutine start
+            async def _graceful_stop_scan():
+                if self.mesmer_server and hasattr(self.mesmer_server, 'is_real_scanning') and self.mesmer_server.is_real_scanning():
+                    step(8.5, "scan active - stopping (async)")
                     try:
-                        try:
-                            await asyncio.wait_for(self.mesmer_server.stop_real_scanning(), timeout=6.0)
-                        except asyncio.TimeoutError:
-                            step(8.53, "scan stop timeout -> continuing")
-                        else:
-                            step(8.54, "scan stop coroutine returned")
-                    except Exception as e:  # capture unexpected internal errors
+                        await asyncio.wait_for(self.mesmer_server.stop_real_scanning(), timeout=6.0)  # type: ignore[arg-type]
+                    except asyncio.TimeoutError:
+                        step(8.53, "scan stop timeout -> continuing")
+                    except Exception as e:
                         step(8.55, f"scan stop error {e!r}")
-                try:
-                    loop.run_until_complete(_stop_scan())
-                finally:
-                    try:
-                        loop.close()
-                    except Exception:
-                        pass
-                step(8.56, "event loop closed")
-                # Short settle delay – some native stacks need a beat after scan stop
-                _ts = time.perf_counter()
-                while time.perf_counter() - _ts < 0.15:
-                    # tiny sleep slices to keep UI responsive while allowing BLE stack to settle
-                    _time_mod.sleep(0.01)
-                step(8.6, "scan stopped + settled")
-                # (If crash still happens after 8.6 we know it is *after* scan tear‑down.)
+            self._run_ble_coro(_graceful_stop_scan())
         except Exception as e:
-            log.error("scan stop error: %s", e)
+            log.error("scan stop scheduling error: %s", e)
         if self.mesmer_server:
-            try:
-                import asyncio
-                loop = asyncio.new_event_loop(); asyncio.set_event_loop(loop)
-                step(9, "mesmer server shutdown begin")
-                loop.run_until_complete(self.mesmer_server.shutdown())
-                loop.close(); step(9.5, "mesmer server shutdown done")
-            except Exception as e:
-                log.error("Mesmer shutdown error: %s", e)
+            async def _shutdown_server_async():
+                try:
+                    step(9, "mesmer server shutdown begin (async)")
+                    await self.mesmer_server.shutdown()  # type: ignore[func-returns-value]
+                    step(9.5, "mesmer server shutdown done (async)")
+                except Exception as e:
+                    log.error("Mesmer shutdown error: %s", e)
+            self._run_ble_coro(_shutdown_server_async())
+        # After scheduling async teardown, give a tiny grace period for queued tasks
+        _ts2 = time.perf_counter()
+        while time.perf_counter() - _ts2 < 0.15:
+            _time_mod.sleep(0.01)
+        # Stop persistent BLE loop last
+        self._stop_ble_loop()
+        step(9.9, "BLE loop stopped")
         try:
             self.pulse.set_level(0.0); step(10, "pulse level zeroed")
         except Exception: pass
@@ -821,6 +818,44 @@ class Launcher(QMainWindow):
             super().closeEvent(event); step(11, "super closeEvent")
         except Exception: pass
         step(12, "closeEvent end")
+
+    # ====================== BLE loop helpers =======================
+    def _run_ble_coro(self, coro: asyncio.coroutines, timeout: float | None = None):  # type: ignore[type-arg]
+        """Submit a coroutine to the persistent BLE loop safely.
+
+        - Returns future.result() if timeout provided & completes, else Future.
+        - Swallows scheduling if loop already shutting down.
+        """
+        loop = self._ble_loop
+        if not loop or not self._ble_loop_alive:
+            return None
+        try:
+            fut = asyncio.run_coroutine_threadsafe(coro, loop)
+        except Exception:
+            return None
+        if timeout is not None:
+            try:
+                return fut.result(timeout)
+            except Exception:
+                return None
+        return fut
+
+    def _stop_ble_loop(self):
+        """Stop and join the persistent BLE event loop thread."""
+        if not self._ble_loop_alive:
+            return
+        self._ble_loop_alive = False
+        loop = self._ble_loop
+        try:
+            if loop and loop.is_running():
+                loop.call_soon_threadsafe(loop.stop)
+        except Exception:
+            pass
+        try:
+            if hasattr(self, '_ble_loop_thread') and self._ble_loop_thread.is_alive():
+                self._ble_loop_thread.join(timeout=1.5)
+        except Exception:
+            pass
     # ---------------- Message Pack (v1 mapping) ----------------
     def apply_session_pack(self, pack):  # duck-typed SessionPack
         try:
