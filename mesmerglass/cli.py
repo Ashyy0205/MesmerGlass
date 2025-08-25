@@ -194,6 +194,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         return selftest()
     if cmd == "session":
         import json as _json
+        # Suppress internal Mesmer server for headless session operations
+        import os as _os
+        _os.environ.setdefault("MESMERGLASS_NO_SERVER", "1")  # ensures Launcher skips server thread
         try:
             pack = load_session_pack(args.load)
         except Exception as e:
@@ -232,6 +235,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         from PyQt6.QtWidgets import QApplication
         from .ui.launcher import Launcher
         target = args.file
+        # Suppress server for rapid headless state capture/apply
+        import os as _os
+        _os.environ.setdefault("MESMERGLASS_NO_SERVER", "1")
         if args.save:
             app = QApplication.instance() or QApplication([])
             win = Launcher("MesmerGlass", enable_device_sync_default=False)
@@ -276,30 +282,6 @@ def main(argv: Optional[list[str]] = None) -> int:
                 win.close()
             except Exception:
                 pass
-            return 0
-        if args.apply:
-            # Headless apply (no event loop spin)
-            from PyQt6.QtWidgets import QApplication
-            from .ui.launcher import Launcher
-            app = QApplication.instance() or QApplication([])
-            win = Launcher("MesmerGlass", enable_device_sync_default=False)
-            try:
-                if hasattr(win, "apply_session_pack"):
-                    win.apply_session_pack(pack)
-            except Exception as e:
-                logging.getLogger(__name__).error("Error applying session pack: %s", e)
-                return 1
-            status = {"pack": pack.name, "text": getattr(win, "text", None), "buzz_intensity": getattr(win, "buzz_intensity", None)}
-            print(_json.dumps(status, ensure_ascii=False))
-            try:
-                win.close()
-            except Exception:
-                pass
-            return 0
-        if summary_mode:
-            ti = f"{len(pack.text.items)} text" if pack.text.items else "0 text"
-            ps = f"{len(pack.pulse.stages)} stages" if pack.pulse.stages else "0 stages"
-            print(f"SessionPack '{pack.name}' v{pack.version} — {ti}, {ps}")
             return 0
     if cmd == "test":  # backward compatibility alias
         warnings.warn("'test' subcommand is deprecated; use 'pulse' instead", DeprecationWarning, stacklevel=2)

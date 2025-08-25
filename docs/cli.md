@@ -25,6 +25,7 @@ Legacy: `python run.py` still works but is deprecated (see migration note).
 -- `selftest` — Quick import/environment check; exit code 0 on success.
 -- `test-run [type]` — Run pytest selection (replaces `run_tests.py`).
 -- `state` — Save/apply/print a runtime session state snapshot (video/audio/textfx/device settings).
+-- `session --load file` — Inspect or apply a session pack (prints summary by default).
 ### test-run
 
 Wrapper around pytest for common selections.
@@ -99,6 +100,8 @@ Actions (mutually exclusive):
 - `--print --file path.json` pretty-print canonical JSON to stdout
 
 Schema top-level keys: `version`, `kind="session_state"`, `saved_at`, `app_version`, `video`, `audio`, `textfx`, `device_sync`.
+
+Environment: for `state` and `session` commands the embedded Mesmer server is auto-suppressed via `MESMERGLASS_NO_SERVER=1` to keep operations fast and deterministic in CI.
 
 Examples:
 ```

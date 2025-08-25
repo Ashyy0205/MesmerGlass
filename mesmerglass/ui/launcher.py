@@ -129,12 +129,14 @@ class Launcher(QMainWindow):
 
         # UI / services ----------------------------------------------
         self._build_ui()
+        self._install_menu_bar()  # add menus (idempotent)
         self._bind_shortcuts()
         if not self._suppress_server:
             self._start_mesmer_server()
 
-        # Message pack placeholder
+        # Message pack placeholder (proper indentation inside __init__)
         self.session_pack = None
+        self.current_pack_path = None  # path of last loaded session pack (not auto-loaded on state apply)
 
     # ========================== UI build ==========================
     def _build_ui(self):
@@ -496,16 +498,42 @@ class Launcher(QMainWindow):
         try:
             video = data.get("video", {}) or {}
             prim = video.get("primary", {})
+            old_primary = getattr(self, 'primary_path', '')
             self.primary_path = prim.get("path") or ""; self.primary_op = float(prim.get("opacity", self.primary_op))
             sec = video.get("secondary", {})
+            old_secondary = getattr(self, 'secondary_path', '')
             self.secondary_path = sec.get("path") or ""; self.secondary_op = float(sec.get("opacity", self.secondary_op))
+            # Update labels if paths changed
+            import os as _os
+            if hasattr(self, 'lbl_primary') and self.primary_path and self.primary_path != old_primary:
+                try: self.lbl_primary.setText(_os.path.basename(self.primary_path))
+                except Exception: pass
+            if hasattr(self, 'lbl_secondary') and self.secondary_path and self.secondary_path != old_secondary:
+                try: self.lbl_secondary.setText(_os.path.basename(self.secondary_path))
+                except Exception: pass
         except Exception:
             pass
         # Audio
         try:
             audio = data.get("audio", {}) or {}
-            a1 = audio.get("a1", {}); self.audio1_path = a1.get("path") or self.audio1_path; self.vol1 = float(a1.get("volume", self.vol1))
-            a2 = audio.get("a2", {}); self.audio2_path = a2.get("path") or self.audio2_path; self.vol2 = float(a2.get("volume", self.vol2))
+            a1 = audio.get("a1", {}); new_a1 = a1.get("path") or self.audio1_path; self.vol1 = float(a1.get("volume", self.vol1))
+            a2 = audio.get("a2", {}); new_a2 = a2.get("path") or self.audio2_path; self.vol2 = float(a2.get("volume", self.vol2))
+            # If file paths changed, (re)load them via audio engine
+            if new_a1 != getattr(self, 'audio1_path', None) and new_a1:
+                try:
+                    self.audio1_path = new_a1; self.audio.load1(new_a1)
+                    if getattr(self, 'page_audio', None):
+                        try: self.page_audio.set_file1_label(os.path.basename(new_a1))
+                        except Exception: pass
+                except Exception: pass
+            if new_a2 != getattr(self, 'audio2_path', None) and new_a2:
+                try:
+                    self.audio2_path = new_a2; self.audio.load2(new_a2)
+                    if getattr(self, 'page_audio', None):
+                        try: self.page_audio.set_file2_label(os.path.basename(new_a2))
+                        except Exception: pass
+                except Exception: pass
+            # Always update volumes after (re)loads
             self._set_vols(self.vol1, self.vol2)
         except Exception:
             pass
@@ -532,31 +560,28 @@ class Launcher(QMainWindow):
                     self.text_font = QFont(fam, int(sz))
                 except Exception:
                     pass
-            # Message pack path (if provided) — we do not auto-load the pack here for safety; just remember.
-            self.current_pack_path = textfx.get("pack_path", self.current_pack_path)
+            # Message pack path (if provided) — now we attempt to load automatically for user convenience.
+            pack_path = textfx.get("pack_path")
+            if pack_path and os.path.isfile(pack_path):
+                try:
+                    from ..content.loader import load_session_pack
+                    pack = load_session_pack(pack_path)
+                    # IMPORTANT: remember path BEFORE apply so fallback inside apply_session_pack
+                    # (which checks raw['_source_path'] or existing current_pack_path) retains it.
+                    # Loader does not currently inject '_source_path', so without this the path
+                    # would be lost and tests expecting persistence would fail.
+                    self.current_pack_path = pack_path  # preserve for state restore
+                    self.apply_session_pack(pack)
+                except Exception as e:
+                    logging.getLogger(__name__).warning("Auto-load of pack failed: %s", e)
+                    self.current_pack_path = pack_path  # remember even if load failed
+            else:
+                # Just store path even if missing (user can resolve later)
+                if pack_path:
+                    self.current_pack_path = pack_path
         except Exception:
             pass
-        # Propagate changes to UI widgets where safe (best-effort; guard for headless tests)
-        try:
-            if hasattr(self, 'page_textfx') and self.page_textfx:
-                if hasattr(self.page_textfx, 'set_text') and self.text:
-                    self.page_textfx.set_text(self.text)
-                if hasattr(self.page_textfx, 'set_fx_intensity'):
-                    try: self.page_textfx.set_fx_intensity(self.fx_intensity)
-                    except Exception: pass
-                if hasattr(self.page_textfx, 'set_fx_mode'):
-                    try: self.page_textfx.set_fx_mode(self.fx_mode)
-                    except Exception: pass
-            if hasattr(self, 'page_audio') and self.page_audio:
-                if hasattr(self.page_audio, 'set_vol1_pct'):
-                    try: self.page_audio.set_vol1_pct(int(self.vol1 * 100))
-                    except Exception: pass
-                if hasattr(self.page_audio, 'set_vol2_pct'):
-                    try: self.page_audio.set_vol2_pct(int(self.vol2 * 100))
-                    except Exception: pass
-        except Exception:
-            pass
-        # Device sync
+        # Device sync (apply AFTER possible pack auto-load so state values win)
         try:
             device_sync = data.get("device_sync", {}) or {}
             self.enable_buzz_on_flash = bool(device_sync.get("buzz_on_flash", self.enable_buzz_on_flash))
@@ -566,6 +591,113 @@ class Launcher(QMainWindow):
             self.burst_max_s = int(device_sync.get("burst_max_s", self.burst_max_s))
             self.burst_peak = float(device_sync.get("burst_peak", self.burst_peak))
             self.burst_max_ms = int(device_sync.get("burst_max_ms", self.burst_max_ms))
+        except Exception:
+            pass
+        # Propagate changes to UI widgets where safe (best-effort; guard for headless tests)
+        try:
+            import os as _os
+            # --- Text/FX Page ---
+            if getattr(self, 'page_textfx', None):
+                pt = self.page_textfx
+                # Update text scale slider
+                if hasattr(pt, 'sld_txt_scale'):
+                    try:
+                        pt.sld_txt_scale.blockSignals(True)
+                        pt.sld_txt_scale.setValue(int(self.text_scale_pct))
+                    finally:
+                        try: pt.sld_txt_scale.blockSignals(False)
+                        except Exception: pass
+                # FX mode combobox
+                if hasattr(pt, 'cmb_fx') and self.fx_mode:
+                    try: pt.cmb_fx.setCurrentText(self.fx_mode)
+                    except Exception: pass
+                # FX intensity slider
+                if hasattr(pt, 'sld_fx_int'):
+                    try:
+                        pt.sld_fx_int.blockSignals(True)
+                        pt.sld_fx_int.setValue(int(self.fx_intensity))
+                    finally:
+                        try: pt.sld_fx_int.blockSignals(False)
+                        except Exception: pass
+                # Flash interval/width
+                if hasattr(pt, 'spin_interval'):
+                    try: pt.spin_interval.setValue(int(self.flash_interval_ms))
+                    except Exception: pass
+                if hasattr(pt, 'spin_width'):
+                    try: pt.spin_width.setValue(int(self.flash_width_ms))
+                    except Exception: pass
+                # Pack name label (derive from path if available)
+                if getattr(self, 'current_pack_path', None) and hasattr(pt, 'lab_pack_name'):
+                    try: pt.lab_pack_name.setText(_os.path.basename(self.current_pack_path) or '(none)')
+                    except Exception: pass
+                # Text colour preview
+                if hasattr(pt, 'lab_color_preview') and getattr(self, 'text_color', None) is not None:
+                    try:
+                        col = self.text_color
+                        hexv = f"#{col.red():02X}{col.green():02X}{col.blue():02X}"
+                        pt.lab_color_preview.setText(hexv)
+                        pt.lab_color_preview.setStyleSheet(f"background:{hexv}; border:1px solid #555; padding:2px;")
+                    except Exception: pass
+            # --- Audio Page ---
+            if getattr(self, 'page_audio', None):
+                pa = self.page_audio
+                # Update volume sliders using provided helper
+                if hasattr(pa, 'set_vols'):
+                    try: pa.set_vols(int(self.vol1 * 100), int(self.vol2 * 100))
+                    except Exception: pass
+                # Update file labels if paths present
+                if getattr(self, 'audio1_path', None) and hasattr(pa, 'set_file1_label'):
+                    try: pa.set_file1_label(_os.path.basename(self.audio1_path))
+                    except Exception: pass
+                if getattr(self, 'audio2_path', None) and hasattr(pa, 'set_file2_label'):
+                    try: pa.set_file2_label(_os.path.basename(self.audio2_path))
+                    except Exception: pass
+            # --- Device Page ---
+            if getattr(self, 'page_device', None):
+                pd = self.page_device
+                # Buzz on flash toggle & intensity
+                if hasattr(pd, 'sw_buzz'):
+                    try: pd.sw_buzz.blockSignals(True); pd.sw_buzz.setChecked(bool(self.enable_buzz_on_flash))
+                    finally:
+                        try: pd.sw_buzz.blockSignals(False)
+                        except Exception: pass
+                if hasattr(pd, 'sld_buzz'):
+                    try:
+                        pd.sld_buzz.blockSignals(True)
+                        pd.sld_buzz.setValue(int(self.buzz_intensity * 100))
+                        pd.lab_buzz.setText(f"{int(self.buzz_intensity*100)}%")
+                    finally:
+                        try: pd.sld_buzz.blockSignals(False)
+                        except Exception: pass
+                # Bursts enable & parameters
+                if hasattr(pd, 'sw_bursts'):
+                    try: pd.sw_bursts.blockSignals(True); pd.sw_bursts.setChecked(bool(self.enable_bursts))
+                    finally:
+                        try: pd.sw_bursts.blockSignals(False)
+                        except Exception: pass
+                if hasattr(pd, 'spin_min'):
+                    try: pd.spin_min.blockSignals(True); pd.spin_min.setValue(int(self.burst_min_s))
+                    finally:
+                        try: pd.spin_min.blockSignals(False)
+                        except Exception: pass
+                if hasattr(pd, 'spin_max'):
+                    try: pd.spin_max.blockSignals(True); pd.spin_max.setValue(int(self.burst_max_s))
+                    finally:
+                        try: pd.spin_max.blockSignals(False)
+                        except Exception: pass
+                if hasattr(pd, 'sld_peak'):
+                    try:
+                        pd.sld_peak.blockSignals(True)
+                        pd.sld_peak.setValue(int(self.burst_peak * 100))
+                        pd.lab_peak.setText(f"{int(self.burst_peak*100)}%")
+                    finally:
+                        try: pd.sld_peak.blockSignals(False)
+                        except Exception: pass
+                if hasattr(pd, 'spin_max_ms'):
+                    try: pd.spin_max_ms.blockSignals(True); pd.spin_max_ms.setValue(int(self.burst_max_ms))
+                    finally:
+                        try: pd.spin_max_ms.blockSignals(False)
+                        except Exception: pass
         except Exception:
             pass
         try:
@@ -1039,15 +1171,16 @@ class Launcher(QMainWindow):
             self._cycle_index = 0
             self._cycle_weights = []
             first = getattr(pack, 'first_text', None)
-            if first:
+            # Always show first message if current text empty OR we're reloading from state
+            if first and (not getattr(self, 'text', None)):
                 self.text = first
-                try:
-                    if hasattr(self.page_textfx, 'set_text'):
-                        self.page_textfx.set_text(first)
-                    if hasattr(self.page_textfx, 'set_pack_name'):
-                        self.page_textfx.set_pack_name(getattr(pack, 'name', '(pack)'))
-                except Exception:
-                    pass
+            try:
+                if first and hasattr(self, 'page_textfx') and self.page_textfx and hasattr(self.page_textfx, 'set_text'):
+                    self.page_textfx.set_text(self.text)
+                if hasattr(self, 'page_textfx') and self.page_textfx and hasattr(self.page_textfx, 'set_pack_name'):
+                    self.page_textfx.set_pack_name(getattr(pack, 'name', '(pack)'))
+            except Exception:
+                pass
             avg = getattr(pack, 'avg_intensity', None)
             if avg is not None:
                 self.buzz_intensity = max(0.0, min(1.0, float(avg)))
@@ -1074,6 +1207,7 @@ class Launcher(QMainWindow):
             from ..content.loader import load_session_pack
             pack = load_session_pack(fn)
             self.apply_session_pack(pack)
+            self.current_pack_path = fn  # remember explicit user load path
             QMessageBox.information(self, "Message Pack", f"Loaded pack '{pack.name}'")
         except Exception as e:
             logging.getLogger(__name__).error("Error loading message pack: %s", e)
@@ -1122,6 +1256,85 @@ class Launcher(QMainWindow):
                     pass
         except Exception as e:
             logging.getLogger(__name__).error("Editor failed: %s", e)
+
+    # ---------------- Menu Bar Integration ----------------
+    def _install_menu_bar(self):  # idempotent; safe to call multiple times
+        # Guard so repeated calls do not rebuild menus (tests may invoke)
+        if getattr(self, "_menu_installed", False):  # inline quick check
+            return
+        try:
+            from PyQt6.QtWidgets import QMenuBar, QMessageBox
+        except Exception:
+            return  # headless tests without full Qt
+        mb = self.menuBar() if hasattr(self, 'menuBar') else None
+        if mb is None:
+            try:
+                mb = QMenuBar(self)
+                self.setMenuBar(mb)
+            except Exception:
+                return
+        # Remove existing actions to ensure a clean slate the FIRST time we install.
+        try:
+            while mb.actions():
+                mb.removeAction(mb.actions()[0])
+        except Exception:
+            pass
+        file_menu = mb.addMenu("File")  # top-level File menu
+        # Only state actions remain (pack management moved/removed per user request)
+        try:
+            act_save = file_menu.addAction("Save State…"); act_save.triggered.connect(self._action_save_state)  # type: ignore[attr-defined]
+            act_load = file_menu.addAction("Load State…"); act_load.triggered.connect(self._action_load_state)  # type: ignore[attr-defined]
+            file_menu.addSeparator()
+        except Exception:
+            pass
+        try:
+            exit_act = file_menu.addAction("Exit")
+            exit_act.triggered.connect(self.close)  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        # Mark as installed so subsequent calls are cheap no-ops.
+        self._menu_installed = True
+
+    def _action_save_state(self):
+        """Interactive save of current runtime state."""
+        try:
+            from PyQt6.QtWidgets import QFileDialog, QMessageBox
+            fn, _ = QFileDialog.getSaveFileName(self, "Save Session State", "session_state.json", "State (*.json);;All Files (*.*)")
+            if not fn:
+                return
+            st = self.capture_session_state()
+            if not st:
+                QMessageBox.critical(self, "Save State", "Failed to capture state")
+                return
+            from ..content.loader import save_session_state
+            save_session_state(st, fn)
+            QMessageBox.information(self, "Save State", f"Saved to {os.path.basename(fn)}")
+        except Exception as e:
+            logging.getLogger(__name__).error("State save failed: %s", e)
+            try:
+                from PyQt6.QtWidgets import QMessageBox
+                QMessageBox.critical(self, "Save State", f"Failed: {e}")
+            except Exception:
+                pass
+
+    def _action_load_state(self):
+        """Interactive load of a previously saved runtime state."""
+        try:
+            from PyQt6.QtWidgets import QFileDialog, QMessageBox
+            fn, _ = QFileDialog.getOpenFileName(self, "Load Session State", "", "State (*.json);;All Files (*.*)")
+            if not fn:
+                return
+            from ..content.loader import load_session_state
+            st = load_session_state(fn)
+            self.apply_session_state(st)
+            QMessageBox.information(self, "Load State", f"Loaded {os.path.basename(fn)}")
+        except Exception as e:
+            logging.getLogger(__name__).error("State load failed: %s", e)
+            try:
+                from PyQt6.QtWidgets import QMessageBox
+                QMessageBox.critical(self, "Load State", f"Failed: {e}")
+            except Exception:
+                pass
 
     # Legacy cycle timer methods removed (replaced by per-flash pre-pick logic above)
 
