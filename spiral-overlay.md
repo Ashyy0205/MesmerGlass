@@ -115,11 +115,9 @@ All colors are controlled **live from the UI**.
 - **Speed Limit**: |effective phase speed(r)| ≤ 0.18 cps.
 - **Bar Width Clamp**: [0.36, 0.62].
 - **Contrast Clamp**: [0.85, 1.25].
-- **Opacity Clamp**: [0.55, 0.95].
 - **Per-Frame Delta Caps** (@60 fps):
   - Δbar_width ≤ 0.0016.
   - Δopacity ≤ 0.003.
-  - Δcontrast ≤ 0.004.
   - Δbase_speed ≤ 0.0015.
 - **Chromatic Shift Limit**: ≤ 0.3 px.
 
