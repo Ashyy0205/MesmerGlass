@@ -115,7 +115,7 @@ All colors are controlled **live from the UI**.
 - **Speed Limit**: |effective phase speed(r)| ≤ 0.18 cps.
 - **Bar Width Clamp**: [0.36, 0.62].
 - **Contrast Clamp**: [0.85, 1.25].
-- **Per-Frame Delta Caps** (@60 fps):
+- **Per-Frame Delta Caps** (@30 fps):
   - Δbar_width ≤ 0.0016.
   - Δopacity ≤ 0.003.
   - Δbase_speed ≤ 0.0015.
@@ -162,7 +162,7 @@ Add a **Spiral Overlay Panel** in the MesmerGlass settings UI:
 
 ### Performance Requirements
 
-- **Target:** 60 fps at 1080p on a mid-tier GPU.
+- **Target:** 30 fps at 1080p on a mid-tier GPU.
 - **Render Scale Option:** Spiral pass may render at 0.75–1.0× resolution and upscale.
 - **No shader recompilation** during runtime; update via uniforms only.
 - **Stable texture uploads** (consistent format, no stalls).
