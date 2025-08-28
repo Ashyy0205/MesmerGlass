@@ -17,8 +17,10 @@ from PyQt6.QtWidgets import (
     QListWidget, QListWidgetItem
 )
 
+import time  # needed for spiral evolution timer
 from ..engine.audio import Audio2
 from ..engine.pulse import PulseEngine, clamp
+from ..engine.spiral import SpiralDirector  # spiral parameter director (phase 1 logic only)
 try:
     # MesmerIntiface optional if bleak is not installed in current environment.
     from ..engine.mesmerintiface import MesmerIntifaceServer  # type: ignore
@@ -30,6 +32,12 @@ from .pages.device import DevicePage
 from .pages.audio import AudioPage
 from .pages.devtools import DevToolsPage  # DevTools content (now hosted in separate window)
 from .pages.performance import PerformancePage  # Performance metrics page
+from .pages.spiral import SpiralPage  # Spiral settings page (minimal)
+from .panel_mesmerloom import PanelMesmerLoom
+try:
+    from ..mesmerloom.compositor import Compositor as LoomCompositor
+except Exception:  # pragma: no cover
+    LoomCompositor = None  # type: ignore
 import logging
 
 
@@ -65,12 +73,7 @@ from .. import __app_name__
 
 class Launcher(QMainWindow):
     def __init__(self, title: str, enable_device_sync_default: bool = True, layout_mode: str = "tabbed"):
-        """Main application launcher / controller window.
-
-        Rebuilt cleanly after earlier indentation damage; all state lives inside
-        this method. Initial display text left blank so message packs fully drive
-        content (was previously hard-coded 'MESMERGLASS').
-        """
+        """Main application launcher / controller window (reconstructed cleanly)."""
         super().__init__()
         self.setWindowTitle(title)
         self.layout_mode = layout_mode if layout_mode in ("tabbed", "sidebar") else "tabbed"
@@ -78,7 +81,7 @@ class Launcher(QMainWindow):
         # Core state -------------------------------------------------
         self.primary_path = ""; self.secondary_path = ""
         self.primary_op = 1.0; self.secondary_op = 0.5
-        self.text = ""  # blank initial message
+        self.text = ""
         self.text_color = QColor("white"); self.text_font = QFont("Segoe UI", 28)
         self.text_scale_pct = 100; self.fx_mode = "Breath + Sway"; self.fx_intensity = 50
         self.flash_interval_ms = 1200; self.flash_width_ms = 250
@@ -86,8 +89,33 @@ class Launcher(QMainWindow):
         self.enable_device_sync = bool(enable_device_sync_default)
         self.enable_buzz_on_flash = True; self.buzz_intensity = 0.6
         self.enable_bursts = False; self.burst_min_s = 30; self.burst_max_s = 120; self.burst_peak = 0.9; self.burst_max_ms = 1200
-        self.overlays: list = []
+        self.overlays: list[Any] = []
+
+        # Spiral (phase 1 logic only + MesmerLoom compositor wiring)
+        self.spiral_enabled = False
+        self.spiral_director = SpiralDirector()
+        self._spiral_timer: QTimer | None = None  # legacy alias (not used here)
+        self.spiral_timer: QTimer | None = QTimer(self)
+        self.spiral_timer.setInterval(33)
+        # Legacy director (pre-loom) used cfg; MesmerLoom director exposes state
+        self.spiral_opacity = 0.5
+        try:
+            if hasattr(self.spiral_director, 'cfg'):
+                self.spiral_opacity = getattr(self.spiral_director.cfg, 'opacity', 0.5)
+            elif hasattr(self.spiral_director, 'state'):
+                self.spiral_opacity = getattr(self.spiral_director.state, 'opacity', 0.5)
+        except Exception:
+            pass
         self.running = False
+        # MesmerLoom compositor (may be None / unavailable headless)
+        self.compositor = None
+        try:
+            if LoomCompositor is not None:
+                self.compositor = LoomCompositor(self.spiral_director, parent=self)
+                # Start inactive; activation gated by spiral toggle
+                self.compositor.set_active(False)
+        except Exception:
+            self.compositor = None
 
         # Engines ----------------------------------------------------
         self.audio = Audio2()
@@ -97,27 +125,18 @@ class Launcher(QMainWindow):
         self.device_scan_in_progress = False
         self.scan_signaler = ScanCompleteSignaler()
         self.scan_signaler.scan_completed.connect(self._scan_completed)
-        # Global shutdown flag (guards async callbacks during close)
         self._shutting_down = False
 
-        # --- Persistent BLE event loop (fixes 'Event loop is closed' RuntimeError) ---
-        # Bleak (WinRT backend) captures the current asyncio loop when a device connects
-        # and later uses loop.call_soon_threadsafe from native notification threads.
-        # Previous implementation created short-lived event loops (new_event_loop + close)
-        # for scan/connect operations; once closed, Bleak callbacks attempted to schedule
-        # work on a dead loop, raising RuntimeError: Event loop is closed.
-        # We allocate ONE long‑lived loop in a daemon thread for all BLE tasks and shut it
-        # down only during Launcher.closeEvent after devices & server are cleanly stopped.
+        # Persistent BLE loop ---------------------------------------
         self._ble_loop: asyncio.AbstractEventLoop | None = asyncio.new_event_loop()
         self._ble_loop_alive = True
-        def _ble_loop_runner():  # runs forever until stop requested
+        def _ble_loop_runner():
             asyncio.set_event_loop(self._ble_loop)
             try:
                 self._ble_loop.run_forever()
-            except Exception as e:  # pragma: no cover - defensive
+            except Exception as e:  # pragma: no cover
                 logging.getLogger(__name__).error("BLE loop crash: %s", e)
             finally:
-                # Close loop so pending handles are released
                 try:
                     self._ble_loop.close()
                 except Exception:
@@ -125,34 +144,41 @@ class Launcher(QMainWindow):
         self._ble_loop_thread = threading.Thread(target=_ble_loop_runner, name="BLELoop", daemon=True)
         self._ble_loop_thread.start()
 
-        # Environment flag to suppress starting MesmerIntiface server in headless/CI
+        # Environment flags -----------------------------------------
         self._suppress_server = bool(os.environ.get("MESMERGLASS_NO_SERVER"))
 
         # UI / services ----------------------------------------------
         self._build_ui()
-        self._install_menu_bar()  # add menus (idempotent)
+        self._install_menu_bar()
         self._bind_shortcuts()
         if not self._suppress_server:
             self._start_mesmer_server()
 
-        # Message pack & font placeholders (kept after UI init)
+        # Session / font placeholders --------------------------------
         self.session_pack = None
-        self.current_pack_path = None  # path of last loaded session pack (not auto-loaded on state apply)
-        self.current_font_path = None  # user-imported font file path (persisted in session state)
+        self.current_pack_path = None
+        self.current_font_path = None
 
     # ========================== UI build ==========================
     def _build_ui(self):
-        # Clean reimplementation to fix prior indentation issues
-        root = QWidget(); self.setCentralWidget(root)
-        main = QVBoxLayout(root); main.setContentsMargins(10, 10, 10, 10); main.setSpacing(10)
+        """Build primary UI (tabs or sidebar) with footer + status chips.
+
+        Rewritten to correct prior indentation corruption. Keep logic minimal
+        and defer heavy/optional wiring inside try/except so headless tests pass.
+        """
+        root = QWidget()
+        self.setCentralWidget(root)
+        main = QVBoxLayout(root)
+        main.setContentsMargins(10, 10, 10, 10)
+        main.setSpacing(10)
 
         self.tabs = QTabWidget()
 
-        # Media
-        scroll_media = QScrollArea(); scroll_media.setWidgetResizable(True); scroll_media.setFrameShape(QFrame.Shape.NoFrame)
-        scroll_media.setWidget(self._page_media()); self.tabs.addTab(scroll_media, "Media")
+        # Media tab
+        scr_media = QScrollArea(); scr_media.setWidgetResizable(True); scr_media.setFrameShape(QFrame.Shape.NoFrame)
+        scr_media.setWidget(self._page_media()); self.tabs.addTab(scr_media, "Media")
 
-        # Text & FX
+        # Text & FX tab
         self.page_textfx = TextFxPage(
             text=self.text,
             text_scale_pct=self.text_scale_pct,
@@ -163,29 +189,24 @@ class Launcher(QMainWindow):
         )
         try: self.page_textfx.loadPackRequested.connect(self._on_load_session_pack)
         except Exception: pass
-        try:
-            self.page_textfx.createPackRequested.connect(self._on_create_message_pack)
-            # removed cycle interval feature
+        try: self.page_textfx.createPackRequested.connect(self._on_create_message_pack)
         except Exception: pass
-        try:
-            # New font load button inside Text & FX tab
-            self.page_textfx.loadFontRequested.connect(self._on_load_font)
-        except Exception:
-            pass
-        scroll_textfx = QScrollArea(); scroll_textfx.setWidgetResizable(True); scroll_textfx.setFrameShape(QFrame.Shape.NoFrame)
-        scroll_textfx.setWidget(self.page_textfx); self.tabs.addTab(scroll_textfx, "Text & FX")
+        try: self.page_textfx.loadFontRequested.connect(self._on_load_font)
+        except Exception: pass
+        scr_txt = QScrollArea(); scr_txt.setWidgetResizable(True); scr_txt.setFrameShape(QFrame.Shape.NoFrame)
+        scr_txt.setWidget(self.page_textfx); self.tabs.addTab(scr_txt, "Text & FX")
 
-        # Audio
+        # Audio tab
         self.page_audio = AudioPage(
             file1=os.path.basename(self.audio1_path),
             file2=os.path.basename(self.audio2_path),
             vol1_pct=int(self.vol1 * 100),
             vol2_pct=int(self.vol2 * 100),
         )
-        scroll_audio = QScrollArea(); scroll_audio.setWidgetResizable(True); scroll_audio.setFrameShape(QFrame.Shape.NoFrame)
-        scroll_audio.setWidget(self.page_audio); self.tabs.addTab(scroll_audio, "Audio")
+        scr_audio = QScrollArea(); scr_audio.setWidgetResizable(True); scr_audio.setFrameShape(QFrame.Shape.NoFrame)
+        scr_audio.setWidget(self.page_audio); self.tabs.addTab(scr_audio, "Audio")
 
-        # Device
+        # Device tab
         self.page_device = DevicePage(
             enable_sync=self.enable_device_sync,
             buzz_on_flash=self.enable_buzz_on_flash,
@@ -196,66 +217,100 @@ class Launcher(QMainWindow):
             peak_pct=int(self.burst_peak * 100),
             max_ms=self.burst_max_ms,
         )
-        scroll_device = QScrollArea(); scroll_device.setWidgetResizable(True); scroll_device.setFrameShape(QFrame.Shape.NoFrame)
-        scroll_device.setWidget(self.page_device); self.tabs.addTab(scroll_device, "Device Sync")
+        scr_dev = QScrollArea(); scr_dev.setWidgetResizable(True); scr_dev.setFrameShape(QFrame.Shape.NoFrame)
+        scr_dev.setWidget(self.page_device); self.tabs.addTab(scr_dev, "Device Sync")
 
-        # Displays
-        scroll_displays = QScrollArea(); scroll_displays.setWidgetResizable(True); scroll_displays.setFrameShape(QFrame.Shape.NoFrame)
-        scroll_displays.setWidget(self._page_displays()); self.tabs.addTab(scroll_displays, "Displays")
+        # Displays tab
+        scr_disp = QScrollArea(); scr_disp.setWidgetResizable(True); scr_disp.setFrameShape(QFrame.Shape.NoFrame)
+        scr_disp.setWidget(self._page_displays()); self.tabs.addTab(scr_disp, "Displays")
 
-        if self.layout_mode == "sidebar":
-            topbar = QWidget(); topbar.setObjectName("topBar")
-            tbl = QHBoxLayout(topbar); tbl.setContentsMargins(12,8,12,8); tbl.setSpacing(8)
-            title_lab = QLabel("MesmerGlass"); title_lab.setObjectName("topTitle")
-            tbl.addWidget(title_lab,0); tbl.addStretch(1)
-            self.chip_overlay = QLabel("Overlay: Idle"); self.chip_overlay.setObjectName("statusChip")
-            self.chip_device = QLabel("Device: Off"); self.chip_device.setObjectName("statusChip")
-            tbl.addWidget(self.chip_overlay,0); tbl.addWidget(self.chip_device,0)
-            main.addWidget(topbar,0)
+        # Spiral tab (logic-only phase)
+        try:
+            self.page_spiral = SpiralPage(self, self.spiral_director)
+            scr_spiral = QScrollArea(); scr_spiral.setWidgetResizable(True); scr_spiral.setFrameShape(QFrame.Shape.NoFrame)
+            scr_spiral.setWidget(self.page_spiral); self.tabs.addTab(scr_spiral, "Spiral")
+        except Exception:
+            self.page_spiral = None  # type: ignore
+
+        # MesmerLoom panel (Step 3)
+        try:
+            self.page_mesmerloom = PanelMesmerLoom(self.spiral_director, self.compositor, self)
+            scr_ml = QScrollArea(); scr_ml.setWidgetResizable(True); scr_ml.setFrameShape(QFrame.Shape.NoFrame)
+            scr_ml.setWidget(self.page_mesmerloom); self.tabs.addTab(scr_ml, "MesmerLoom")
+            # Sync enable checkbox with existing spiral toggle state
+            self.page_mesmerloom.spiralEnabledChanged.connect(self._on_spiral_toggled)
+            # Initialize checkbox state to reflect current spiral flag
+            try: self.page_mesmerloom.chk_enable.setChecked(self.spiral_enabled)
+            except Exception: pass
+        except Exception:
+            self.page_mesmerloom = None  # type: ignore
+
+        if self.layout_mode == 'sidebar':
+            # Simple sidebar nav replicating prior behavior
+            top = QWidget(); top.setObjectName('topBar')
+            tl = QHBoxLayout(top); tl.setContentsMargins(12,8,12,8); tl.setSpacing(8)
+            lab_title = QLabel('MesmerGlass'); lab_title.setObjectName('topTitle')
+            tl.addWidget(lab_title,0); tl.addStretch(1)
+            self.chip_overlay = QLabel('Overlay: Idle'); self.chip_overlay.setObjectName('statusChip')
+            self.chip_device = QLabel('Device: Off'); self.chip_device.setObjectName('statusChip')
+            tl.addWidget(self.chip_overlay); tl.addWidget(self.chip_device)
+            main.addWidget(top,0)
             center = QWidget(); ch = QHBoxLayout(center); ch.setContentsMargins(0,0,0,0); ch.setSpacing(10)
-            self.nav = QListWidget(); self.nav.setObjectName("sideNav")
-            for name in ("Media","Text & FX","Audio","Device Sync","Displays"): self.nav.addItem(name)
+            self.nav = QListWidget(); self.nav.setObjectName('sideNav')
+            for name in ("Media","Text & FX","Audio","Device Sync","Displays","Spiral"): self.nav.addItem(name)
             self.nav.setCurrentRow(0)
             try: self.tabs.tabBar().setVisible(False)
             except Exception: pass
             ch.addWidget(self.nav,0); ch.addWidget(self.tabs,1); main.addWidget(center,1)
-            def _on_nav(i:int):
-                if 0 <= i < self.tabs.count(): self.tabs.setCurrentIndex(i)
-            self.nav.currentRowChanged.connect(_on_nav)
+            self.nav.currentRowChanged.connect(lambda i: 0 <= i < self.tabs.count() and self.tabs.setCurrentIndex(i))
             self.tabs.currentChanged.connect(lambda i: self.nav.setCurrentRow(i))
         else:
             try: self.tabs.tabBar().setVisible(True)
             except Exception: pass
             main.addWidget(self.tabs,1)
 
-        # Wire signals
-        self.page_textfx.textChanged.connect(lambda s: setattr(self, 'text', s))
-        self.page_textfx.textScaleChanged.connect(lambda v: setattr(self, 'text_scale_pct', v))
-        self.page_textfx.fxModeChanged.connect(lambda s: setattr(self, 'fx_mode', s))
-        self.page_textfx.fxIntensityChanged.connect(lambda v: setattr(self, 'fx_intensity', v))
-        self.page_textfx.flashIntervalChanged.connect(lambda v: setattr(self, 'flash_interval_ms', v))
-        self.page_textfx.flashWidthChanged.connect(lambda v: setattr(self, 'flash_width_ms', v))
-        # Apply chosen text colour live
-        if hasattr(self.page_textfx, 'colorChanged'):
-            self.page_textfx.colorChanged.connect(self._on_text_color_changed)
+        # Signal wiring ------------------------------------------------
+        # Text / FX
+        try:
+            self.page_textfx.textChanged.connect(lambda s: setattr(self, 'text', s))
+            self.page_textfx.textScaleChanged.connect(lambda v: setattr(self, 'text_scale_pct', v))
+            self.page_textfx.fxModeChanged.connect(lambda s: setattr(self, 'fx_mode', s))
+            self.page_textfx.fxIntensityChanged.connect(lambda v: setattr(self, 'fx_intensity', v))
+            self.page_textfx.flashIntervalChanged.connect(lambda v: setattr(self, 'flash_interval_ms', v))
+            self.page_textfx.flashWidthChanged.connect(lambda v: setattr(self, 'flash_width_ms', v))
+            if hasattr(self.page_textfx, 'colorChanged'):
+                self.page_textfx.colorChanged.connect(self._on_text_color_changed)
+        except Exception: pass
+        # Audio
+        try:
+            self.page_audio.load1Requested.connect(self._pick_a1)
+            self.page_audio.load2Requested.connect(self._pick_a2)
+            self.page_audio.vol1Changed.connect(lambda pct: self._set_vols(pct/100.0, self.vol2))
+            self.page_audio.vol2Changed.connect(lambda pct: self._set_vols(self.vol1, pct/100.0))
+        except Exception: pass
+        # Device
+        try:
+            self.page_device.enableSyncChanged.connect(self._on_toggle_device_sync)
+            self.page_device.scanDevicesRequested.connect(self._on_scan_devices)
+            self.page_device.deviceSelected.connect(self._on_device_selected)
+            self.page_device.devicesSelected.connect(self._on_devices_selected)
+            self.page_device.buzzOnFlashChanged.connect(lambda b: setattr(self,'enable_buzz_on_flash', b))
+            self.page_device.buzzIntensityChanged.connect(lambda v: setattr(self,'buzz_intensity', v/100.0))
+            self.page_device.burstsEnableChanged.connect(lambda b: setattr(self,'enable_bursts', b))
+            self.page_device.burstMinChanged.connect(lambda v: setattr(self,'burst_min_s', v))
+            self.page_device.burstMaxChanged.connect(lambda v: setattr(self,'burst_max_s', v))
+            self.page_device.burstPeakChanged.connect(lambda v: setattr(self,'burst_peak', v/100.0))
+            self.page_device.burstMaxMsChanged.connect(lambda v: setattr(self,'burst_max_ms', v))
+        except Exception: pass
+        # Spiral
+        if getattr(self, 'page_spiral', None):
+            try:
+                self.page_spiral.spiralToggled.connect(self._on_spiral_toggled)
+                self.page_spiral.opacityChanged.connect(lambda f: setattr(self, 'spiral_opacity', f))
+                self.page_spiral.intensityChanged.connect(lambda *_: None)
+            except Exception: pass
 
-        self.page_audio.load1Requested.connect(self._pick_a1)
-        self.page_audio.load2Requested.connect(self._pick_a2)
-        self.page_audio.vol1Changed.connect(lambda pct: self._set_vols(pct/100.0, self.vol2))
-        self.page_audio.vol2Changed.connect(lambda pct: self._set_vols(self.vol1, pct/100.0))
-
-        self.page_device.enableSyncChanged.connect(self._on_toggle_device_sync)
-        self.page_device.scanDevicesRequested.connect(self._on_scan_devices)
-        self.page_device.deviceSelected.connect(self._on_device_selected)
-        self.page_device.devicesSelected.connect(self._on_devices_selected)
-        self.page_device.buzzOnFlashChanged.connect(lambda b: setattr(self,'enable_buzz_on_flash', b))
-        self.page_device.buzzIntensityChanged.connect(lambda v: setattr(self,'buzz_intensity', v/100.0))
-        self.page_device.burstsEnableChanged.connect(lambda b: setattr(self,'enable_bursts', b))
-        self.page_device.burstMinChanged.connect(lambda v: setattr(self,'burst_min_s', v))
-        self.page_device.burstMaxChanged.connect(lambda v: setattr(self,'burst_max_s', v))
-        self.page_device.burstPeakChanged.connect(lambda v: setattr(self,'burst_peak', v/100.0))
-        self.page_device.burstMaxMsChanged.connect(lambda v: setattr(self,'burst_max_ms', v))
-
+        # Footer -------------------------------------------------------
         footer = QWidget(); footer.setObjectName('footerBar')
         fl = QHBoxLayout(footer); fl.setContentsMargins(10,6,10,6)
         self.btn_launch = QPushButton('Launch'); self.btn_stop = QPushButton('Stop')
@@ -264,12 +319,64 @@ class Launcher(QMainWindow):
             self.chip_overlay = QLabel('Overlay: Idle'); self.chip_overlay.setObjectName('statusChip')
             self.chip_device = QLabel('Device: Off'); self.chip_device.setObjectName('statusChip')
             fl.addWidget(self.chip_overlay); fl.addWidget(self.chip_device)
-        self.chip_audio = QLabel('Audio: 0/2'); self.chip_audio.setObjectName('statusChip')
-        fl.addWidget(self.chip_audio); main.addWidget(footer,0)
-        # Footer buttons (correct indentation within _build_ui)
+        self.chip_audio = QLabel('Audio: 0/2'); self.chip_audio.setObjectName('statusChip'); fl.addWidget(self.chip_audio)
+        self.chip_spiral = QLabel('Spiral: Off'); self.chip_spiral.setObjectName('statusChip'); fl.addWidget(self.chip_spiral)
+        main.addWidget(footer,0)
         self.btn_launch.clicked.connect(self.launch)
         self.btn_stop.clicked.connect(self.stop_all)
         self._refresh_status()
+
+    # ---------------- Spiral logic (Phase 1.1 stub) ----------------
+    def _on_spiral_toggled(self, enabled: bool):  # connected by SpiralPage
+        self.spiral_enabled = bool(enabled)
+        # Lazily create timer
+        if self.spiral_enabled:
+            if self.spiral_timer is None:
+                self.spiral_timer = QTimer(self)
+                self.spiral_timer.setInterval(33)  # ~30 FPS logic tick (no rendering yet)
+                # Guard against duplicate connection
+                try:
+                    self.spiral_timer.timeout.disconnect()  # type: ignore[arg-type]
+                except Exception:
+                    pass
+                self.spiral_timer.timeout.connect(self._on_spiral_tick)
+            if not self.spiral_timer.isActive():
+                self.spiral_timer.start()
+        else:
+            if self.spiral_timer and self.spiral_timer.isActive():
+                self.spiral_timer.stop()
+        # Compositor activation gate
+        try:
+            if self.compositor and getattr(self.compositor, 'available', True):
+                self.compositor.set_active(self.spiral_enabled)
+        except Exception:
+            pass
+        # Status chip update
+        if hasattr(self, 'chip_spiral'):
+            try:
+                self.chip_spiral.setText('Spiral: On' if self.spiral_enabled else 'Spiral: Off')
+                self.chip_spiral.setStyleSheet('background:#2d5; color:#000; padding:2px 6px; border-radius:4px;' if self.spiral_enabled else 'background:#555; color:#ddd; padding:2px 6px; border-radius:4px;')
+            except Exception:
+                pass
+        # Refresh global status if it reflects spiral (future extension)
+        try: self._refresh_status()
+        except Exception: pass
+
+    def _on_spiral_tick(self):  # placeholder: evolve parameters only
+        if not self.spiral_enabled:
+            return
+        try:
+            # Deterministic dt for tests
+            self.spiral_director.update(1/30.0)
+            uniforms = self.spiral_director.export_uniforms() if hasattr(self.spiral_director, 'export_uniforms') else getattr(self.spiral_director, 'uniforms', lambda: {})()
+            if self.compositor and getattr(self.compositor, 'available', True):
+                try:
+                    self.compositor.set_uniforms_from_director(uniforms)
+                    self.compositor.request_draw()
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     def _page_media(self):
         def _pct_label(v: float) -> QLabel:
@@ -1006,6 +1113,10 @@ class Launcher(QMainWindow):
         a_count = (1 if self.audio1_path else 0) + (1 if self.audio2_path else 0)
         self.chip_audio.setText(f"Audio: {a_count}/2")
         self.chip_device.setText("Device: On" if self.enable_device_sync else "Device: Off")
+        if hasattr(self, 'chip_spiral'):
+            self.chip_spiral.setText(f"Spiral: {'On' if self.spiral_enabled else 'Off'}")
+
+    # (Removed legacy spiral integration block in favor of minimal Phase 1.1 handlers earlier)
 
     def _on_devices_selected(self, indices: object):
         """Handle multi-device selection: connect BLE ones and mirror UI label."""

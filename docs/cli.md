@@ -26,6 +26,7 @@ Legacy: `python run.py` still works but is deprecated (see migration note).
 -- `test-run [type]` — Run pytest selection (replaces `run_tests.py`).
 -- `state` — Save/apply/print a runtime session state snapshot (video/audio/textfx/device settings).
 -- `session --load file` — Inspect or apply a session pack (prints summary by default).
+-- `spiral-test` — Run a bounded MesmerLoom spiral render loop for diagnostics.
 ### test-run
 
 Wrapper around pytest for common selections.
@@ -120,3 +121,26 @@ python -m mesmerglass state --apply --file my_state.json
 - 0 on success
 - 1 on selftest/import failure or UI action error (e.g., unknown tab)
 - 2 on argument errors
+
+### spiral-test
+
+Run a short GPU spiral render for benchmarking / CI availability checks.
+
+Arguments:
+- `--video <path>` optional background video (default: solid fallback)
+- `--intensity 0..1` starting intensity (default: 0.5)
+- `--blend {multiply,screen,softlight}` blend mode (default: multiply)
+- `--duration <seconds>` run time (default: 5.0)
+- `--render-scale {1.0,0.85,0.75}` offscreen scale (default: 1.0)
+
+Exit Codes:
+- 0 success (prints average FPS summary)
+- 77 OpenGL unavailable (environment without GL context)
+- 1 unexpected error
+
+Examples:
+```
+python -m mesmerglass spiral-test --duration 2
+python -m mesmerglass spiral-test --intensity 0.8 --blend screen --render-scale 0.85
+python -m mesmerglass spiral-test --video sample.mp4 --duration 4 --blend softlight
+```

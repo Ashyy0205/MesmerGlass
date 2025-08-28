@@ -21,6 +21,8 @@ from .logging_utils import setup_logging, get_default_log_path
 from .devtools.virtual_toy import VirtualToy  # dev-only, used by 'toy' subcommand
 from .content.loader import load_session_pack  # session packs
 import subprocess, sys, warnings, pathlib
+class GLUnavailableError(RuntimeError):
+    pass
 
 
 def _add_logging_args(parser: argparse.ArgumentParser) -> None:
@@ -146,6 +148,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_toy.add_argument("--run-for", type=float, default=5.0, help="Seconds to run before exiting")
 
     sub.add_parser("selftest", help="Quick environment/import check")
+    # MesmerLoom spiral visual test (Phase 2 real implementation)
+    p_spiral = sub.add_parser("spiral-test", help="Run a bounded MesmerLoom spiral render test")
+    p_spiral.add_argument("--video", type=str, default="none", help="Video path or 'none' for neutral")
+    p_spiral.add_argument("--intensity", type=float, default=0.75, help="Initial intensity 0..1 (default: 0.75)")
+    p_spiral.add_argument("--blend", choices=["multiply","screen","softlight"], default="multiply", help="Blend mode (default: multiply)")
+    p_spiral.add_argument("--duration", type=float, default=5.0, help="Seconds to run (default: 5)")
+    p_spiral.add_argument("--render-scale", choices=["1.0","0.85","0.75"], default="1.0", help="Render scale (default: 1.0)")
+    p_spiral.add_argument("--force", action="store_true", help="Bypass GL availability probe and attempt to run anyway")
 
     # Test runner integration (wraps previous run_tests.py functionality)
     p_tr = sub.add_parser("test-run", help="Run pytest with selection shortcuts (replaces run_tests.py)")
@@ -172,6 +182,94 @@ def build_parser() -> argparse.ArgumentParser:
 
     return parser
 
+def cmd_spiral_test(args) -> None:
+    """Run bounded MesmerLoom spiral render with strict exit codes.
+
+    Exit codes:
+      0 success
+      77 OpenGL unavailable (import/probe/context failure)
+      1 unexpected error
+    """
+    import sys, time as _time
+    # Imports
+    try:
+        from .mesmerloom.spiral import SpiralDirector as LoomDirector
+        from .mesmerloom.compositor import Compositor, probe_available
+    except Exception as e:
+        print("MesmerLoom spiral-test: GL unavailable: import failure", e)
+        sys.exit(77)
+    # Probe
+    if not getattr(args, 'force', False):
+        probe_ok = True
+        try:
+            if 'probe_available' in locals() and callable(probe_available):
+                probe_ok = bool(probe_available())
+        except Exception:
+            probe_ok = False
+        if not probe_ok:
+            print("MesmerLoom spiral-test: probe inconclusive; attempting context anyway...")
+    from PyQt6.QtWidgets import QApplication
+    try:
+        app = QApplication.instance() or QApplication([])
+        director = LoomDirector(seed=7)
+        try:
+            director.set_intensity(max(0.0, min(1.0, float(getattr(args, "intensity", 0.75)))))
+        except Exception:
+            pass
+        comp = Compositor(director)
+        comp.resize(640, 360)
+        comp.set_active(True)
+        comp.show()
+        # Process events to allow initializeGL to run regardless of force.
+        cycles = 10 if not getattr(args, 'force', False) else 4
+        for _ in range(cycles):
+            app.processEvents()
+            if getattr(comp, 'available', False):
+                break
+        if not getattr(comp, 'available', False):
+            print("MesmerLoom spiral-test: GL unavailable: context failure")
+            sys.exit(77)
+        # Configure and run loop
+        blend_map = {"multiply": 0, "screen": 1, "softlight": 2}
+        try: comp.set_blend_mode(blend_map.get(getattr(args, 'blend', 'multiply').lower(), 0))
+        except Exception: pass
+        try: comp.set_render_scale(float(getattr(args, 'render_scale', '1.0')))
+        except Exception: pass
+        dur = max(0.1, float(getattr(args, 'duration', 5.0)))
+        t0 = _time.perf_counter(); last = t0; frames = 0
+        target_frame = 1.0 / 60.0
+        while True:
+            now = _time.perf_counter(); elapsed = now - t0
+            if elapsed >= dur:
+                break
+            dt = now - last; last = now
+            director.update(dt)
+            comp.set_uniforms_from_director(director.export_uniforms())
+            comp.request_draw()
+            app.processEvents()
+            frames += 1
+            # Frame pacing (~60fps) to avoid runaway CPU loop on headless
+            frame_spent = _time.perf_counter() - now
+            remaining = target_frame - frame_spent
+            if remaining > 0:
+                try:
+                    import time as __t; __t.sleep(remaining)
+                except Exception:
+                    pass
+        total = max(1e-6, _time.perf_counter() - t0)
+        if frames == 0:
+            print("MesmerLoom spiral-test: GL unavailable: no frames")
+            sys.exit(77)
+        fps = frames / total
+        print(f"MesmerLoom spiral-test duration={dur:.2f}s frames={frames} avg_frame_ms={(total/frames*1000.0 if frames else 0):.2f} fps={fps:.1f}")
+        try: comp.close()
+        except Exception: pass
+        sys.exit(0)
+    except SystemExit:
+        raise
+    except Exception as e:
+        print("MesmerLoom spiral-test: error:", e)
+        sys.exit(1)
 
 def main(argv: Optional[list[str]] = None) -> int:
     parser = build_parser()
@@ -194,6 +292,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 0
     if cmd == "selftest":
         return selftest()
+    if cmd == "spiral-test":
+        cmd_spiral_test(args)  # exits via sys.exit inside handler
+        return 0  # not reached
     if cmd == "session":
         import json as _json
         # Suppress internal Mesmer server for headless session operations

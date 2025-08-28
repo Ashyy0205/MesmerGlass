@@ -12,4 +12,8 @@ cffi>=1.15.0           # C Foreign Function Interface for Rust bindings
 pytest
 pytest-asyncio
 pytest-timeout
+pytest-qt
+
+PyOpenGL>=3.1.6
+PyOpenGL_accelerate>=3.1.6
 

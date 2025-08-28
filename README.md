@@ -1,16 +1,17 @@
 # MesmerGlass 🌟
 
-**MesmerGlass** is a sophisticated desktop overlay application that creates hypnotic visual experiences with synchronized device control. Built with PyQt6, it provides real-time video effects, text animations, and seamless device synchronization through our pure Python **MesmerIntiface** system.
+**MesmerGlass** is a sophisticated desktop overlay application that creates hypnotic visual experiences with synchronized device control. Built with PyQt6, it provides real-time video effects (via the **MesmerLoom** visuals engine), text animations, and seamless device synchronization through our pure Python **MesmerIntiface** system.
 
 ## ✨ Features
 
-- **🎬 Video Overlay System** - Real-time video effects and overlays across multiple displays
+- **🎬 MesmerLoom (visuals engine)** - Real-time video compositor & spiral overlay
 - **📝 Text & Visual Effects** - Customizable text animations with hypnotic effects
 - **🎮 Device Control** - Native Bluetooth device control without external dependencies
 - **🎵 Audio Synchronization** - Audio-reactive effects and synchronization
 - **🔧 Developer Tools** - Built-in debugging and testing tools
 - **🖥️ Multi-Display Support** - Span effects across multiple monitors
 - **🎯 Click-Through Interface** - Non-intrusive overlay that doesn't interfere with other applications
+ - **🌀 Spiral Overlay** - GPU-driven animated spiral composited over video with live UI controls (intensity, blend, parameters)
 
 ## 🚀 Quick Start
 
@@ -85,6 +86,8 @@ MesmerGlass includes **MesmerIntiface** - a pure Python implementation for direc
 - [🎵 Audio Engine](docs/technical/audio-engine.md) - Audio processing system
 - [🎬 Video Engine](docs/technical/video-engine.md) - Video overlay architecture
 - [📡 Device Control](docs/technical/device-control.md) - Communication protocols
+ - [🌀 Spiral Overlay](docs/technical/spiral-overlay.md) - MesmerLoom spiral parameters & rendering
+ - [🛠 CLI Reference](docs/cli.md)
 
 ## 🧪 Testing
 

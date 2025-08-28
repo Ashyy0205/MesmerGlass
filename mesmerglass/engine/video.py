@@ -1,4 +1,4 @@
-import time, threading, cv2, logging
+import time, threading, cv2, logging, warnings
 from typing import Optional
 from PyQt6.QtCore import QSize, Qt
 from PyQt6.QtGui import QImage, QPixmap
@@ -38,34 +38,49 @@ class VideoStream:
     def close(self):
         if self.cap: self.cap.release(); self.cap = None
 
-    def read_next_if_due(self):
-        if not self.cap: return
-        now = time.time()
-        if now - self.last_ts < self.frame_interval: return
-        # Compute dt before updating last timestamp for metrics
-        dt = None if self.last_ts == 0 else (now - self.last_ts)
-        self.last_ts = now
-        ret, frame = self.cap.read()
-        if not ret:
-            self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-            ret, frame = self.cap.read()
-            if not ret: return
-        import cv2 as _cv2
-        frame = _cv2.cvtColor(frame, _cv2.COLOR_BGR2RGB)
-        with self.lock: self.frame_rgb = frame
-        if dt is not None:
-            # Record frame time (seconds) for performance dashboard
-            perf_metrics.record_frame(dt)
+# Shim re-export placeholder (Phase 2 deprecation)
+try:
+    from ..mesmerloom import Compositor as MesmerLoomCompositor  # noqa: F401
+    _warned = False
+    def get_mesmerloom_compositor():  # simple accessor to trigger warning once
+        global _warned
+        if not _warned:
+            warnings.warn("mesmerglass.engine.video: MesmerLoom compositor has moved to mesmerglass.mesmerloom (will remove shim in a future release)", DeprecationWarning, stacklevel=2)
+            _warned = True
+        from ..mesmerloom import Compositor
+        return Compositor
+except Exception:  # pragma: no cover
+    pass
 
-    def get_qpixmap(self, target_size: QSize) -> Optional[QPixmap]:
-        with self.lock:
-            fr = None if self.frame_rgb is None else self.frame_rgb.copy()
-        if fr is None: return None
-        h, w, ch = fr.shape
-        qimg = QImage(fr.data, w, h, w * ch, QImage.Format.Format_RGB888)
-        pix = QPixmap.fromImage(qimg)
-        if pix.isNull(): return None
-        if target_size.isValid():
-            pix = pix.scaled(target_size, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
-        return pix
+    # Methods below were mis-indented previously; ensured they belong to VideoStream
+def read_next_if_due(self: VideoStream):  # type: ignore[valid-type]
+    if not self.cap: return
+    now = time.time()
+    if now - self.last_ts < self.frame_interval: return
+    dt = None if self.last_ts == 0 else (now - self.last_ts)
+    self.last_ts = now
+    ret, frame = self.cap.read()
+    if not ret:
+        self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        ret, frame = self.cap.read()
+        if not ret: return
+    import cv2 as _cv2
+    frame = _cv2.cvtColor(frame, _cv2.COLOR_BGR2RGB)
+    with self.lock: self.frame_rgb = frame
+    if dt is not None:
+        perf_metrics.record_frame(dt)
+VideoStream.read_next_if_due = read_next_if_due  # patch method
+
+def get_qpixmap(self: VideoStream, target_size: QSize):  # type: ignore[valid-type]
+    with self.lock:
+        fr = None if self.frame_rgb is None else self.frame_rgb.copy()
+    if fr is None: return None
+    h, w, ch = fr.shape
+    qimg = QImage(fr.data, w, h, w * ch, QImage.Format.Format_RGB888)
+    pix = QPixmap.fromImage(qimg)
+    if pix.isNull(): return None
+    if target_size.isValid():
+        pix = pix.scaled(target_size, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+    return pix
+VideoStream.get_qpixmap = get_qpixmap  # patch method
 

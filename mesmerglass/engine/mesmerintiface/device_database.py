@@ -101,6 +101,20 @@ class DeviceDatabase:
             },
             capabilities={"vibrate": 1}
         ),
+
+        # Lovense Diamo (cock ring) shares classic Lovense service/characteristics
+        DeviceDefinition(
+            name="Lovense Diamo",
+            manufacturer="Lovense",
+            protocol="lovense",
+            bluetooth_names=["LVS-Diamo", "LVS-R001"],  # R001 observed in BLE adverts
+            service_uuids=["0000fff0-0000-1000-8000-00805f9b34fb"],  # standard Lovense service
+            characteristics={
+                "tx": "0000fff2-0000-1000-8000-00805f9b34fb",  # write
+                "rx": "0000fff1-0000-1000-8000-00805f9b34fb"   # notify
+            },
+            capabilities={"vibrate": 1}
+        ),
         
         # We-Vibe devices
         DeviceDefinition(
