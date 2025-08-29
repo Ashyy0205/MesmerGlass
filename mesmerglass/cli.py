@@ -276,6 +276,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     # Configure logging before doing any work
+    # Suppress pygame support prompt globally for all commands (ensures JSON-only stdout for tests)
+    import os as _os_global
+    _os_global.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
     setup_logging(
         level=args.log_level,
         log_file=args.log_file,
@@ -310,11 +313,19 @@ def main(argv: Optional[list[str]] = None) -> int:
             print(_json.dumps(pack.to_canonical_dict(), separators=(",", ":"), ensure_ascii=False))
             return 0
         if args.apply:
-            # Headless apply (no event loop spin)
+            # Headless apply (no event loop spin). Silence stdout during construction
+            # to avoid pygame banner or incidental prints contaminating JSON output.
             from PyQt6.QtWidgets import QApplication
             from .ui.launcher import Launcher
+            import sys as _sys, io as _io
             app = QApplication.instance() or QApplication([])
-            win = Launcher("MesmerGlass", enable_device_sync_default=False)
+            _real_stdout = _sys.stdout
+            _sys.stdout = _io.StringIO()
+            try:
+                win = Launcher("MesmerGlass", enable_device_sync_default=False)
+            finally:
+                # Discard any captured banner text
+                _sys.stdout = _real_stdout
             try:
                 if hasattr(win, "apply_session_pack"):
                     win.apply_session_pack(pack)
@@ -423,6 +434,17 @@ def main(argv: Optional[list[str]] = None) -> int:
         # For pure status queries (no launch/show) force suppress server to keep fast & isolated
         if args.status and not (args.launch or args.show):
             os.environ.setdefault("MESMERGLASS_NO_SERVER", "1")
+        _pure_status = bool(args.status and not (args.launch or args.show))
+        # If pure status: capture stdout and temporarily remove console log handlers to avoid
+        # contaminating JSON output (tests expect first printed line to be JSON)
+        import sys as _sys, io as _io, logging as _logging
+        _captured_buf = None; _removed_handlers = []
+        if _pure_status:
+            _captured_buf = _io.StringIO(); _real_stdout = _sys.stdout; _sys.stdout = _captured_buf
+            root_logger = _logging.getLogger()
+            for h in list(root_logger.handlers):
+                if isinstance(h, _logging.StreamHandler):
+                    root_logger.removeHandler(h); _removed_handlers.append(h)
         # Note: use no-show by default to avoid window popups in CI.
         app = QApplication.instance() or QApplication([])
         win = Launcher(
@@ -430,6 +452,9 @@ def main(argv: Optional[list[str]] = None) -> int:
             enable_device_sync_default=False,  # disable device sync for CLI actions to keep tests deterministic
             layout_mode=getattr(args, "layout", "tabbed"),  # pass through layout selection
         )
+        if _pure_status:
+            # Discard any captured construction noise (pygame banner, etc.)
+            _sys.stdout = _real_stdout
         if getattr(args, "show", False):
             win.show()
         # Perform actions
@@ -585,6 +610,11 @@ def main(argv: Optional[list[str]] = None) -> int:
                 "displays_checked": sum(1 for i in range(win.list_displays.count()) if win.list_displays.item(i).checkState() != 0),
             }
             print(json.dumps(status))
+            # Restore console handlers if removed
+            if _pure_status and _removed_handlers:
+                root_logger = _logging.getLogger()
+                for h in _removed_handlers:
+                    root_logger.addHandler(h)
         # If only requesting status and not launching/showing, skip event loop to exit fast
         if not (args.launch or args.show) and args.status and not any([
             args.set_text, args.set_text_scale, args.set_fx_mode, args.set_fx_intensity,

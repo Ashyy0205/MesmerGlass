@@ -191,8 +191,13 @@ class SpiralDirector:
         return cur + math.copysign(max_delta, delta)
 
     # ---------------- Export ----------------
-    def export_uniforms(self) -> dict[str, float | int]:
+    def export_uniforms(self) -> dict:
         s = self.state
+        # Add time, color, and resolution for shader compatibility
+        now = time.time()
+        # Color and resolution can be set via setters if needed; fallback to defaults
+        color = getattr(self, 'color', (1.0, 1.0, 1.0))
+        resolution = getattr(self, 'resolution', (1920, 1080))
         return {
             "uPhase": s.phase,
             "uBaseSpeed": s.base_speed,
@@ -207,4 +212,7 @@ class SpiralDirector:
             "uFlipState": s.flip_state,
             "uIntensity": s.intensity,
             "uSafetyClamped": 1 if s.safety_clamped else 0,
+            "u_time": now,
+            "u_color": color,
+            "u_resolution": resolution,
         }

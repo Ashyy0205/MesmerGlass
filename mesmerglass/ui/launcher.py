@@ -7,7 +7,7 @@ incremental diffs on top of this stable baseline.
 """
 
 import os, time, random, threading, time as _time_mod, asyncio  # asyncio added for persistent BLE loop
-from typing import List
+from typing import List, Any
 
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject
 from PyQt6.QtGui import QColor, QFont, QGuiApplication, QShortcut, QKeySequence
@@ -20,7 +20,7 @@ from PyQt6.QtWidgets import (
 import time  # needed for spiral evolution timer
 from ..engine.audio import Audio2
 from ..engine.pulse import PulseEngine, clamp
-from ..engine.spiral import SpiralDirector  # spiral parameter director (phase 1 logic only)
+from mesmerglass.mesmerloom.spiral import SpiralDirector  # spiral parameter director (GL overlay)
 try:
     # MesmerIntiface optional if bleak is not installed in current environment.
     from ..engine.mesmerintiface import MesmerIntifaceServer  # type: ignore
@@ -35,7 +35,19 @@ from .pages.performance import PerformancePage  # Performance metrics page
 from .pages.spiral import SpiralPage  # Spiral settings page (minimal)
 from .panel_mesmerloom import PanelMesmerLoom
 try:
-    from ..mesmerloom.compositor import Compositor as LoomCompositor
+    import logging
+    try:
+        from ..mesmerloom.compositor import Compositor as LoomCompositor
+        logging.getLogger(__name__).info("[spiral.trace] LoomCompositor import succeeded in launcher.py")
+    except Exception as e:
+        logging.getLogger(__name__).error(f"[spiral.trace] LoomCompositor import failed in launcher.py: {e}")
+        LoomCompositor = None  # type: ignore
+    try:
+        from .spiral_window import SpiralWindow
+        logging.getLogger(__name__).info("[spiral.trace] SpiralWindow import succeeded in launcher.py")
+    except Exception as e:
+        logging.getLogger(__name__).error(f"[spiral.trace] SpiralWindow import failed in launcher.py: {e}")
+        SpiralWindow = None
 except Exception:  # pragma: no cover
     LoomCompositor = None  # type: ignore
 import logging
@@ -89,15 +101,14 @@ class Launcher(QMainWindow):
         self.enable_device_sync = bool(enable_device_sync_default)
         self.enable_buzz_on_flash = True; self.buzz_intensity = 0.6
         self.enable_bursts = False; self.burst_min_s = 30; self.burst_max_s = 120; self.burst_peak = 0.9; self.burst_max_ms = 1200
-        self.overlays: list[Any] = []
+        self.overlays = []  # list of OverlayWindow instances
 
         # Spiral (phase 1 logic only + MesmerLoom compositor wiring)
         self.spiral_enabled = False
         self.spiral_director = SpiralDirector()
-        self._spiral_timer: QTimer | None = None  # legacy alias (not used here)
-        self.spiral_timer: QTimer | None = QTimer(self)
+        self._spiral_timer = None  # legacy alias (not used here)
+        self.spiral_timer = QTimer(self)
         self.spiral_timer.setInterval(33)
-        # Legacy director (pre-loom) used cfg; MesmerLoom director exposes state
         self.spiral_opacity = 0.5
         try:
             if hasattr(self.spiral_director, 'cfg'):
@@ -112,10 +123,30 @@ class Launcher(QMainWindow):
         try:
             if LoomCompositor is not None:
                 self.compositor = LoomCompositor(self.spiral_director, parent=self)
-                # Start inactive; activation gated by spiral toggle
                 self.compositor.set_active(False)
         except Exception:
             self.compositor = None
+        # Runtime spiral windows (one per selected display)
+        self.spiral_windows = []
+
+        # Auto diagnostic spiral enable/launch (no UI click) if env set
+        try:
+            if os.environ.get("MESMERGLASS_SPIRAL_AUTO") == '1':
+                # Defer until event loop starts to avoid premature screen queries
+                from PyQt6.QtCore import QTimer as _QT
+                def _auto_start():
+                    try:
+                        if not self.spiral_enabled:
+                            self._on_spiral_toggled(True)
+                        # Ensure at least first display checked
+                        if self.list_displays.count()>0 and all(self.list_displays.item(i).checkState()!=Qt.CheckState.Checked for i in range(self.list_displays.count())):
+                            self.list_displays.item(0).setCheckState(Qt.CheckState.Checked)
+                        self.launch()
+                    except Exception as e:
+                        logging.getLogger(__name__).error("Auto spiral launch failed: %s", e)
+                _QT.singleShot(250, _auto_start)
+        except Exception:
+            pass
 
         # Engines ----------------------------------------------------
         self.audio = Audio2()
@@ -128,7 +159,7 @@ class Launcher(QMainWindow):
         self._shutting_down = False
 
         # Persistent BLE loop ---------------------------------------
-        self._ble_loop: asyncio.AbstractEventLoop | None = asyncio.new_event_loop()
+        self._ble_loop = asyncio.new_event_loop()
         self._ble_loop_alive = True
         def _ble_loop_runner():
             asyncio.set_event_loop(self._ble_loop)
@@ -146,6 +177,16 @@ class Launcher(QMainWindow):
 
         # Environment flags -----------------------------------------
         self._suppress_server = bool(os.environ.get("MESMERGLASS_NO_SERVER"))
+        sim_flag = os.environ.get("MESMERGLASS_GL_SIMULATE") == "1"
+        force_flag = os.environ.get("MESMERGLASS_GL_FORCE") == "1"
+        test_or_ci = bool(os.environ.get("PYTEST_CURRENT_TEST") or os.environ.get("CI"))
+        self._gl_simulation = bool(sim_flag and not force_flag and test_or_ci)
+        try:
+            logging.getLogger(__name__).info(
+                "Launcher env: MESMERGLASS_GL_SIMULATE=%r MESMERGLASS_GL_FORCE=%r test_or_ci=%s _gl_simulation=%s", os.environ.get("MESMERGLASS_GL_SIMULATE"), os.environ.get("MESMERGLASS_GL_FORCE"), test_or_ci, self._gl_simulation
+            )
+        except Exception:
+            pass
 
         # UI / services ----------------------------------------------
         self._build_ui()
@@ -329,6 +370,11 @@ class Launcher(QMainWindow):
     # ---------------- Spiral logic (Phase 1.1 stub) ----------------
     def _on_spiral_toggled(self, enabled: bool):  # connected by SpiralPage
         self.spiral_enabled = bool(enabled)
+        try:
+            logging.getLogger(__name__).info(
+                "Spiral toggled -> enabled=%s running=%s sim=%s", self.spiral_enabled, self.running, getattr(self,'_gl_simulation', None)
+            )
+        except Exception: pass
         # Lazily create timer
         if self.spiral_enabled:
             if self.spiral_timer is None:
@@ -361,6 +407,24 @@ class Launcher(QMainWindow):
         # Refresh global status if it reflects spiral (future extension)
         try: self._refresh_status()
         except Exception: pass
+        # If user toggles spiral while overlays already running, create or
+        # destroy spiral windows immediately so feedback is instant.
+        try:
+            if self.running:
+                if self.spiral_enabled:
+                    # In simulation mode we don't attempt real GL windows
+                    if self._gl_simulation:
+                        if hasattr(self, 'chip_spiral'):
+                            try:
+                                self.chip_spiral.setText('Spiral: Sim')
+                                self.chip_spiral.setToolTip('GL simulation mode active – no real spiral rendering')
+                            except Exception: pass
+                    else:
+                        self._create_spiral_windows()
+                else:
+                    self._destroy_spiral_windows()
+        except Exception:
+            pass
 
     def _on_spiral_tick(self):  # placeholder: evolve parameters only
         if not self.spiral_enabled:
@@ -375,8 +439,166 @@ class Launcher(QMainWindow):
                     self.compositor.request_draw()
                 except Exception:
                     pass
+            # Broadcast to any active runtime spiral windows
+            for win in list(getattr(self, 'spiral_windows', [])):
+                try:
+                    if getattr(win, 'available', True) and getattr(win, 'set_uniforms_from_director', None):
+                        win.set_uniforms_from_director(uniforms)
+                        if hasattr(win, 'request_draw'):
+                            win.request_draw()
+                except Exception:
+                    pass
         except Exception:
             pass
+
+    # ---------------- Spiral compositor window management ----------------
+    def _create_spiral_windows(self):
+        """Create per-display spiral compositor windows if spiral enabled.
+
+        Called from launch() and when enabling spiral mid-run. Idempotent: if
+        windows already exist they are refreshed only if screen count changed.
+        """
+        if not self.spiral_enabled:
+            try: logging.getLogger(__name__).info("_create_spiral_windows early-exit: spiral not enabled")
+            except Exception: pass
+            return
+        # Suppress in simulation mode (no real GL); update chip if present.
+        if getattr(self, '_gl_simulation', False):
+            try: logging.getLogger(__name__).info("_create_spiral_windows early-exit: simulation flag true")
+            except Exception: pass
+            if hasattr(self, 'chip_spiral'):
+                try:
+                    self.chip_spiral.setText('Spiral: Sim')
+                    self.chip_spiral.setToolTip('GL simulation mode – disable MESMERGLASS_GL_SIMULATE for real rendering')
+                except Exception: pass
+            return
+        # Skip if we already have windows matching current selection
+        try:
+            checked_idx = [i for i in range(self.list_displays.count()) if self.list_displays.item(i).checkState()==Qt.CheckState.Checked]
+        except Exception:
+            checked_idx = []
+        if not checked_idx:
+            try: logging.getLogger(__name__).info("_create_spiral_windows early-exit: no displays selected (list_displays.count=%s)", getattr(self, 'list_displays', None).count() if hasattr(self,'list_displays') else '?')
+            except Exception: pass
+            return
+        # If we already have same count assume up-to-date
+        if self.spiral_windows and len(self.spiral_windows) == len(checked_idx):
+            try: logging.getLogger(__name__).info("_create_spiral_windows early-exit: existing windows count matches selection (%d)", len(self.spiral_windows))
+            except Exception: pass
+            return
+        self._destroy_spiral_windows()
+        if LoomCompositor is None:
+            try: logging.getLogger(__name__).warning("_create_spiral_windows abort: LoomCompositor unavailable")
+            except Exception: pass
+            return
+        try:
+            screens = QGuiApplication.screens()
+        except Exception:
+            screens = []
+        try: logging.getLogger(__name__).info("_create_spiral_windows building windows for displays=%s total_screens=%d", checked_idx, len(screens))
+        except Exception: pass
+        for i in checked_idx:
+            sc = screens[i] if (i < len(screens) and screens) else (screens[0] if screens else None)
+            if sc is None:
+                continue
+            try:
+                # Use container window hosting the compositor to improve odds of GL context creation
+                win = SpiralWindow(self.spiral_director)
+                try:
+                    relax = os.environ.get('MESMERGLASS_RELAX_FLAGS') == '1'
+                    flags = Qt.WindowType.FramelessWindowHint | (Qt.WindowType.WindowStaysOnTopHint if not relax else Qt.WindowType.Window)
+                    if getattr(win, '_debug_surface', False):
+                        flags = Qt.WindowType.FramelessWindowHint | Qt.WindowType.Window
+                    if os.name == 'nt' and not relax:
+                        flags |= Qt.WindowType.Tool
+                    if relax:
+                        logging.getLogger(__name__).warning("Launcher: using relaxed window flags (no always-on-top/tool) for GL diagnostic")
+                    win.setWindowFlags(flags)
+                except Exception: pass
+                try: win.setGeometry(sc.geometry())
+                except Exception: pass
+                try: win.set_active(True)
+                except Exception: pass
+                try: win.showFullScreen(); win.raise_()
+                except Exception:
+                    try: win.show()
+                    except Exception: pass
+                # Diagnostic logging (container proxies inner compositor state)
+                try:
+                    logging.getLogger(__name__).info(
+                        "Spiral window created hwnd=%s init=%s avail=%s flags=0x%x", 
+                        (int(win.winId()) if hasattr(win,'winId') else '?'), getattr(win,'_initialized', None), getattr(win,'available', None), int(win.windowFlags())
+                    )
+                except Exception: pass
+                # Probe loop
+                try:
+                    from PyQt6.QtCore import QTimer as _QT
+                    def _probe(status_try=[1]):
+                        try:
+                            logging.getLogger(__name__).info(
+                                "Spiral window probe #%d init=%s avail=%s program=%s", status_try[0], getattr(win,'_initialized', None), getattr(win,'available', None), getattr(win,'_program', None)
+                            )
+                        except Exception: pass
+                        status_try[0] += 1
+                        if status_try[0] <= 6 and not getattr(win,'_initialized', False):
+                            _QT.singleShot(250, _probe)
+                        # Manual kick: if still not initialized on final probe, request an update (may trigger context)
+                        if status_try[0] == 7 and not getattr(win,'_initialized', False):
+                            try:
+                                if win.comp and hasattr(win.comp, 'update'):
+                                    logging.getLogger(__name__).warning("Spiral window forcing manual update() to trigger GL init")
+                                    win.comp.update()
+                                    try:
+                                        if hasattr(win.comp, 'force_init_context'):
+                                            win.comp.force_init_context()
+                                    except Exception: pass
+                                    # One-time attempt to re-create compositor in debug surface mode
+                                    if getattr(win, '_debug_surface', False) and not getattr(win.comp, '_initialized', False):
+                                        logging.getLogger(__name__).warning("Spiral window attempting compositor re-create (debug surface mode)")
+                                        try:
+                                            from ..mesmerloom.compositor import Compositor as _LC
+                                            old = win.comp
+                                            win.comp = _LC(self.spiral_director, parent=win)
+                                            lay = win.layout(); lay.addWidget(win.comp)  # type: ignore
+                                            old.hide()
+                                            win.comp.update()
+                                        except Exception as e:
+                                            logging.getLogger(__name__).error("Re-create failed: %s", e)
+                            except Exception: pass
+                    _QT.singleShot(250, _probe)
+                except Exception: pass
+                # Windows specific extended styles for click-through (best-effort)
+                if os.name == 'nt':  # pragma: no cover - platform specific
+                    try:
+                        from ctypes import windll
+                        GWL_EXSTYLE = -20; WS_EX_LAYERED = 0x00080000; WS_EX_TRANSPARENT = 0x00000020; WS_EX_TOOLWINDOW = 0x00000080
+                        hwnd = int(win.winId()); style = windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+                        style |= WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW
+                        windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
+                    except Exception:
+                        pass
+                self.spiral_windows.append(win)
+            except Exception:
+                continue
+        try:
+            logging.getLogger(__name__).info("_create_spiral_windows done: created=%d", len(self.spiral_windows))
+        except Exception:
+            pass
+
+    def _destroy_spiral_windows(self):
+        """Destroy all runtime spiral compositor windows."""
+        for win in list(self.spiral_windows):
+            try:
+                if hasattr(win, 'set_active'):
+                    try: win.set_active(False)
+                    except Exception: pass
+                win.close()
+                if hasattr(win, 'deleteLater'):
+                    try: win.deleteLater()
+                    except Exception: pass
+            except Exception:
+                pass
+        self.spiral_windows.clear()
 
     def _page_media(self):
         def _pct_label(v: float) -> QLabel:
@@ -1179,6 +1401,12 @@ class Launcher(QMainWindow):
             self._wire_shared_flash_timer(shared_start_time)
         if self.enable_device_sync and self.enable_bursts:
             self._start_burst_scheduler()
+        # Create spiral windows last so they sit above overlays.
+        try:
+            if self.spiral_enabled:
+                self._create_spiral_windows()
+        except Exception:
+            pass
 
     def _wire_shared_flash_timer(self, shared_start_time: float):
         """Single synchronized flash timer (always used).
@@ -1286,6 +1514,12 @@ class Launcher(QMainWindow):
         except Exception: pass
         try: self.pulse.stop(); step(7, "pulse stopped")
         except Exception: pass
+        # Destroy spiral windows after other teardown to ensure GL contexts
+        # release cleanly without referencing shutting-down director.
+        try:
+            self._destroy_spiral_windows(); step(8, "spiral windows destroyed")
+        except Exception:
+            pass
 
     def closeEvent(self, event):  # type: ignore[override]
         log = logging.getLogger(__name__)
