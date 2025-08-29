@@ -1,6 +1,6 @@
 # MesmerGlass Spiral Overlay Feature
 
----
+--
 
 ## 1. Full Feature Design
 
