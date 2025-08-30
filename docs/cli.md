@@ -132,6 +132,7 @@ Arguments:
 - `--blend {multiply,screen,softlight}` blend mode (default: multiply)
 - `--duration <seconds>` run time (default: 5.0)
 - `--render-scale {1.0,0.85,0.75}` offscreen scale (default: 1.0)
+- `--screen <N>` select display index (0=primary, 1=secondary, ...)
 
 Exit Codes:
 - 0 success (prints average FPS summary)
@@ -140,7 +141,7 @@ Exit Codes:
 
 Examples:
 ```
-python -m mesmerglass spiral-test --duration 2
+python -m mesmerglass spiral-test --screen 1 --duration 2
 python -m mesmerglass spiral-test --intensity 0.8 --blend screen --render-scale 0.85
 python -m mesmerglass spiral-test --video sample.mp4 --duration 4 --blend softlight
 ```

@@ -1,5 +1,9 @@
 from __future__ import annotations
+from PyQt6.QtCore import pyqtSignal
 """MesmerLoom OpenGL compositor (Step 1 minimal pipeline).
+
+
+    frame_drawn = pyqtSignal()
 
 Implements:
  - Shader program build (pass-through video only)
@@ -12,7 +16,7 @@ Mouse transparency & focus avoided; no parent window flag changes.
 from typing import Any, Optional
 import logging, time, pathlib, os
 from PyQt6.QtWidgets import QWidget
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 try:  # Set a conservative default surface format early (can be disabled via env)
     from PyQt6.QtGui import QSurfaceFormat  # type: ignore
     if not os.environ.get("MESMERGLASS_NO_SURFACE_FMT"):
@@ -57,6 +61,7 @@ def probe_available() -> bool:
     if os.environ.get("MESMERGLASS_GL_SIMULATE") == "1":
         return True
     if os.environ.get("MESMERGLASS_GL_ASSUME") == "1":
+        self.frame_drawn.emit()
         return True
     if _HAS_QT_GL:
         return True
@@ -71,9 +76,19 @@ def probe_available() -> bool:
             return False
     return False
 
-class Compositor(QOpenGLWidget):  # type: ignore[misc]
-    def __init__(self, director, parent=None):
+class LoomCompositor(QOpenGLWidget):  # type: ignore[misc]
+    frame_drawn = pyqtSignal()
+    def __init__(self, director, parent=None, trace=False, sim_flag=False, force_flag=False, test_or_ci=False):
         import logging
+        # Log parent and screen assignment
+        try:
+            screen = self.window().screen() if hasattr(self.window(), 'screen') else None
+            screen_name = screen.name() if screen else 'unknown'
+            logging.getLogger(__name__).info(f"[spiral.trace] LoomCompositor.__init__: parent={parent} screen={screen_name} geometry={self.geometry()} size={self.size()}")
+            if screen:
+                logging.getLogger(__name__).info(f"[spiral.trace] LoomCompositor.__init__: screen geometry={screen.geometry()} available={screen.availableGeometry()} logical DPI={screen.logicalDotsPerInch()} physical DPI={screen.physicalDotsPerInch()}")
+        except Exception as e:
+            logging.getLogger(__name__).warning(f"[spiral.trace] LoomCompositor.__init__: could not get screen info: {e}")
         logging.getLogger(__name__).info(f"[spiral.trace] LoomCompositor.__init__ called: director={director} parent={parent}")
         super().__init__(parent)
         self.director = director
@@ -98,40 +113,58 @@ class Compositor(QOpenGLWidget):  # type: ignore[misc]
             logging.getLogger(__name__).warning(f"[spiral.trace] LoomCompositor.__init__ setFocusPolicy failed: {e}")
         self._timer = None  # type: ignore[assignment]
         self._trace = bool(os.environ.get("MESMERGLASS_SPIRAL_TRACE"))
+        self._log_interval = 60  # Log every 60 frames
+        self._draw_count = 0
+        self._last_size = None
+        self._last_visible = None
         # Force spiral intensity to 1.0 for diagnostic visibility
         try:
             if hasattr(self.director, 'set_intensity'):
                 self.director.set_intensity(1.0)
         except Exception as e:
             logging.getLogger(__name__).warning(f"[spiral.trace] LoomCompositor: failed to set intensity: {e}")
-        self._draw_count = 0
         self._watermark = os.environ.get("MESMERGLASS_SPIRAL_WATERMARK", "1") != "0"
         sim_flag = os.environ.get("MESMERGLASS_GL_SIMULATE") == "1"
         force_flag = os.environ.get("MESMERGLASS_GL_FORCE") == "1"
         test_or_ci = bool(os.environ.get("PYTEST_CURRENT_TEST") or os.environ.get("CI"))
         logging.getLogger(__name__).info(f"[spiral.trace] LoomCompositor.__init__ sim_flag={sim_flag} force_flag={force_flag} test_or_ci={test_or_ci}")
-        if sim_flag and not force_flag:
-            if test_or_ci:
-                try:
-                    self.available = True; self._initialized = True
-                    self._program = 1; self._vao = 1; self._vbo = 1
-                    self._start_timer()
-                except Exception as e:
-                    logging.getLogger(__name__).error(f"[spiral.trace] LoomCompositor.__init__ simulation mode error: {e}")
-                if not self._announced_available:
-                    print("MesmerLoom: GL SIMULATION MODE (early) active")
-                    self._announced_available = True
-            else:
-                if not self._announced_available:
-                    logging.getLogger(__name__).warning(
-                        "Ignoring MESMERGLASS_GL_SIMULATE=1 outside test/CI (set MESMERGLASS_GL_FORCE=1 to suppress this warning)."
-                    )
-                    self._announced_available = True
+        try:
+            if sim_flag and not force_flag:
+                if test_or_ci:
+                    try:
+                        self.available = True
+                        self._initialized = True
+                        self._program = 1
+                        self._vao = 1
+                        self._vbo = 1
+                        self._start_timer()
+                    except Exception as e:
+                        logging.getLogger(__name__).error(f"[spiral.trace] LoomCompositor.__init__ simulation mode error: {e}")
+                    if not self._announced_available:
+                        print("MesmerLoom: GL SIMULATION MODE (early) active")
+                        self._announced_available = True
+                else:
+                    if not self._announced_available:
+                        logging.getLogger(__name__).warning(
+                            "Ignoring MESMERGLASS_GL_SIMULATE=1 outside test/CI (set MESMERGLASS_GL_FORCE=1 to suppress this warning)."
+                        )
+                        self._announced_available = True
+        except Exception as e:
+            logging.getLogger(__name__).warning(f"[spiral.trace] LoomCompositor.__init__ simulation mode outer error: {e}")
         # (No optimistic probe marking; availability flips on real initializeGL)
         # Force context creation attempt
         try:
             self.makeCurrent()
             logging.getLogger(__name__).info("[spiral.trace] LoomCompositor.__init__: makeCurrent called")
+            ctx = self.context() if hasattr(self, 'context') else None
+            ctx_id = hex(id(ctx)) if ctx else 'None'
+            fb_status = None
+            try:
+                if ctx:
+                    fb_status = ctx.defaultFramebufferObject() if hasattr(ctx, 'defaultFramebufferObject') else 'N/A'
+            except Exception as e:
+                fb_status = f'Error: {e}'
+            logging.getLogger(__name__).info(f"[spiral.trace] LoomCompositor.__init__: gl_ctx_id={ctx_id} fb_status={fb_status}")
         except Exception as e:
             logging.getLogger(__name__).warning(f"[spiral.trace] LoomCompositor.__init__: makeCurrent failed: {e}")
         try:
@@ -140,9 +173,46 @@ class Compositor(QOpenGLWidget):  # type: ignore[misc]
         except Exception as e:
             logging.getLogger(__name__).warning(f"[spiral.trace] LoomCompositor.__init__: update failed: {e}")
 
+    def get_framebuffer_image(self):
+        """Return QImage of the current framebuffer (for duplication)."""
+        import logging
+        try:
+            from PyQt6.QtGui import QImage
+            from OpenGL.GL import glReadPixels, GL_RGBA, GL_UNSIGNED_BYTE
+            w, h = self.width(), self.height()
+            if w <= 0 or h <= 0:
+                logging.getLogger(__name__).warning(f"[spiral.trace] get_framebuffer_image: Invalid size w={w} h={h}")
+                return None
+            data = glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE)
+            image = QImage(data, w, h, QImage.Format.Format_RGBA8888)
+            image = image.mirrored(False, True)  # Flip vertically for correct orientation
+            if image.isNull() or image.width() == 0 or image.height() == 0:
+                logging.getLogger(__name__).warning(f"[spiral.trace] get_framebuffer_image: INVALID image (null or zero size) w={image.width()} h={image.height()}")
+            else:
+                logging.getLogger(__name__).info(f"[spiral.trace] get_framebuffer_image: VALID image w={image.width()} h={image.height()} format={image.format()}")
+            return image
+        except Exception as e:
+            logging.getLogger(__name__).error(f"[spiral.trace] get_framebuffer_image: Exception {e}")
+            return None
+
     def showEvent(self, event):
         import logging
-        logging.getLogger(__name__).info(f"[spiral.trace] LoomCompositor.showEvent: visible={self.isVisible()} mapped={self.isVisible()} size={self.size()}")
+        # Log screen, geometry, context, and framebuffer status
+        screen = self.window().screen() if hasattr(self.window(), 'screen') else None
+        screen_name = screen.name() if screen else 'unknown'
+        geom = self.window().geometry() if hasattr(self.window(), 'geometry') else None
+        win_id = int(self.window().winId()) if hasattr(self.window(),'winId') else '?'
+        logging.getLogger(__name__).info(f"[spiral.trace] LoomCompositor.showEvent: screen={screen_name} geometry={geom} winId={win_id} initialized={self._initialized} available={self.available}")
+        # Diagnostic: OpenGL context and framebuffer
+        ctx = self.context() if hasattr(self, 'context') else None
+        ctx_id = hex(id(ctx)) if ctx else 'None'
+        fb_status = None
+        try:
+            if ctx:
+                fb_status = ctx.defaultFramebufferObject() if hasattr(ctx, 'defaultFramebufferObject') else 'N/A'
+        except Exception as e:
+            fb_status = f'Error: {e}'
+        logging.getLogger(__name__).info(f"[spiral.trace] LoomCompositor.showEvent: screen={screen_name} geometry={geom} winId={win_id} initialized={self._initialized} available={self.available} gl_ctx_id={ctx_id} fb_status={fb_status}")
         super().showEvent(event)
         try:
             self.makeCurrent()
@@ -167,7 +237,20 @@ class Compositor(QOpenGLWidget):  # type: ignore[misc]
 
     def event(self, event):
         import logging
-        logging.getLogger(__name__).info(f"[spiral.trace] LoomCompositor.event: type={event.type()} visible={self.isVisible()} size={self.size()}")
+        size = self.size()
+        visible = self.isVisible()
+        # Throttle excessive event logs for type=12 (Paint/Update)
+        if self._trace:
+            etype = event.type()
+            # Only log type=12 every 60 frames, or if geometry/visibility changes
+            if etype == 12:
+                self._event12_count = getattr(self, '_event12_count', 0) + 1
+                if self._event12_count % 60 == 0:
+                    logging.getLogger(__name__).info(f"[spiral.trace] LoomCompositor.event: type=12 visible={visible} size={size} frame={self._event12_count}")
+            else:
+                logging.getLogger(__name__).info(f"[spiral.trace] LoomCompositor.event: type={etype} visible={visible} size={size}")
+            self._last_size = size
+            self._last_visible = visible
         return super().event(event)
 
     # ---- Manual context force attempt (experimental) ----
@@ -304,6 +387,12 @@ class Compositor(QOpenGLWidget):  # type: ignore[misc]
         try:
             self.gl = QOpenGLFunctions(); self.gl.initializeOpenGLFunctions()
             logging.getLogger(__name__).info(f"[spiral.trace] LoomCompositor.initializeGL OpenGLFunctions initialized")
+            # Diagnostic: log OpenGL context and sharing status
+            self._gl_context = self.context()
+            self._gl_context_id = id(self._gl_context) if self._gl_context else None
+            self._gl_share_context = self._gl_context.shareContext() if self._gl_context else None
+            self._gl_share_context_id = id(self._gl_share_context) if self._gl_share_context else None
+            logging.getLogger(__name__).info(f"[spiral.trace] LoomCompositor.initializeGL: context={self._gl_context} id={self._gl_context_id} shareContext={self._gl_share_context} shareContext_id={self._gl_share_context_id} window={self.window()} winId={self.winId()} parent={self.parent()} initialized={getattr(self, '_initialized', False)}")
             try:
                 logging.getLogger(__name__).info("[spiral.trace] LoomCompositor.initializeGL compiling main shader program...")
                 self._program = self._build_program()
@@ -365,10 +454,13 @@ class Compositor(QOpenGLWidget):  # type: ignore[misc]
                     self._announced_available = True
                 logging.getLogger(__name__).warning("MesmerLoom running in simulated GL mode (no real rendering)")
                 logging.getLogger(__name__).warning("[spiral.trace] initializeGL simulation fallback engaged")
+        # Diagnostic: log framebuffer and context
+        ctx = self.context()
+        fb = self.defaultFramebufferObject()
+        logging.getLogger(__name__).info(f"[spiral.trace] initializeGL: context={ctx} framebuffer={fb} visible={self.isVisible()} geometry={self.geometry()} size={self.size()}")
 
     def paintGL(self):  # pragma: no cover
         import logging
-        logging.getLogger(__name__).info(f"[spiral.trace] LoomCompositor.paintGL called: self={self} initialized={self._initialized} program={self._program}")
         if not (_HAS_QT_GL and self._initialized and self._program):
             try: self.director.update()
             except Exception: pass
@@ -390,11 +482,10 @@ class Compositor(QOpenGLWidget):  # type: ignore[misc]
             # clear after use to avoid stale reuse if ticking stops
             self._uniforms_cache = None
         self._draw_count += 1
-        # Log all uniform values for diagnosis
+        # Log all uniform values for diagnosis every N frames
         uniform_log = {k: round(float(v),4) if isinstance(v,(int,float)) else v for k,v in uniforms.items()}
-        logging.getLogger(__name__).info(f"[spiral.trace] LoomCompositor.paintGL frame={self._draw_count} active={self._active} uniforms={uniform_log}")
-        # Additional spiral parameter logging in trace mode
-        if self._trace:
+        if self._trace and (self._draw_count % self._log_interval == 0):
+            logging.getLogger(__name__).info(f"[spiral.trace] LoomCompositor.paintGL frame={self._draw_count} active={self._active} uniforms={uniform_log}")
             st = getattr(self.director, 'state', None)
             if st:
                 logging.getLogger(__name__).info(
@@ -406,12 +497,8 @@ class Compositor(QOpenGLWidget):  # type: ignore[misc]
                     f"chromatic_shift={getattr(st, 'chromatic_shift', None):.3f} "
                     f"intensity={getattr(st, 'intensity', None):.3f} "
                 )
-                # Tune spiral parameters for clear spiral stripes
-                uniforms['uTwist'] = 0.3
-                uniforms['uBarWidth'] = 0.3
-                uniforms['uPhase'] = time.time() % 1.0
-                uniforms['uContrast'] = 1.0  # Maximum contrast
-                uniforms['uOpacity'] = 1.0  # Maximum opacity
+        # Force update/redraw after compositor attachment to improve spiral visibility
+        QTimer.singleShot(100, self.update)
         w,h = self.width(), self.height()
         GL.glViewport(0,0,w,h)
         GL.glDisable(GL.GL_DEPTH_TEST)
@@ -434,6 +521,34 @@ class Compositor(QOpenGLWidget):  # type: ignore[misc]
         _seti('uBlendMode', getattr(self, '_blend_mode', 0))
         # Draw
         self._draw_fullscreen_quad()
+        # --- Spiral draw diagnostics: framebuffer pixel sample ---
+        try:
+            import numpy as np
+            from OpenGL.GL import glReadPixels, GL_RGBA, GL_UNSIGNED_BYTE
+            frame = self._draw_count
+            if frame == 1 or frame % 120 == 0:
+                cx, cy = w // 2, h // 2
+                pixel_center = glReadPixels(cx, cy, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE)
+                pixel_topleft = glReadPixels(0, 0, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE)
+                pixel_bottomright = glReadPixels(w-1, h-1, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE)
+                pc = np.frombuffer(pixel_center, dtype=np.uint8)
+                pt = np.frombuffer(pixel_topleft, dtype=np.uint8)
+                pb = np.frombuffer(pixel_bottomright, dtype=np.uint8)
+                logging.getLogger(__name__).info(f"[spiral.trace] Framebuffer pixel samples: center={pc.tolist()} tl={pt.tolist()} br={pb.tolist()} size=({w},{h}) frame={frame}")
+        except Exception as e:
+            logging.getLogger(__name__).error(f"[spiral.trace] paintGL diagnostics error: {e}")
+        # Diagnostic: log framebuffer and context every 60 frames
+        self._frame_counter = getattr(self, '_frame_counter', 0) + 1
+        if self._frame_counter % 60 == 0:
+            ctx = self.context()
+            fb = self.defaultFramebufferObject()
+            logging.getLogger(__name__).info(f"[spiral.trace] paintGL: context={ctx} framebuffer={fb} visible={self.isVisible()} geometry={self.geometry()} size={self.size()} frame={self._frame_counter}")
+        self.frame_drawn.emit()  # Signal after spiral is drawn and framebuffer is ready
+        self._frame_counter = getattr(self, '_frame_counter', 0) + 1
+        if self._frame_counter % 60 == 0:
+            ctx = self.context()
+            fb = self.defaultFramebufferObject()
+            logging.getLogger(__name__).info(f"[spiral.trace] paintGL: context={ctx} framebuffer={fb} visible={self.isVisible()} geometry={self.geometry()} size={self.size()} frame={self._frame_counter}")
 
     def _start_timer(self):
         self._timer = QTimer(self)
@@ -492,11 +607,7 @@ class Compositor(QOpenGLWidget):  # type: ignore[misc]
         GL.glBindVertexArray(0)
         import logging
         try:
-            # ...existing code...
             logging.getLogger(__name__).info("[spiral.trace] Draw call executing")
-            err = self.gl.glGetError()
-            if err != 0:
-                logging.getLogger(__name__).error(f"[spiral.trace] OpenGL error after draw call: {err}")
         except Exception as e:
             logging.getLogger(__name__).error(f"[spiral.trace] Exception in paintGL: {e}")
         from OpenGL import GL; import array

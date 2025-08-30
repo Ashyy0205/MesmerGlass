@@ -3,13 +3,13 @@ warnings.filterwarnings("ignore", message=".*address already in use.*")
 
 def _probe_gl_available():
     try:
-        from mesmerglass.mesmerloom.compositor import Compositor, probe_available  # type: ignore
+        from mesmerglass.mesmerloom.compositor import LoomCompositor, probe_available  # type: ignore
         # Prefer lightweight probe if exported
         try:
             return bool(probe_available())
         except BaseException:
-            # Fallback: presence of Compositor implies potential availability
-            return True if Compositor else False
+            # Fallback: presence of LoomCompositor implies potential availability
+            return True if LoomCompositor else False
     except BaseException:
         return False
 

@@ -1,4 +1,26 @@
 # MesmerLoom Spiral Overlay
+## Troubleshooting: Secondary Screen Black
+
+If the spiral overlay is black or not rendering on a secondary display:
+
+1. Enable trace logging: `MESMERGLASS_SPIRAL_TRACE=1`
+2. Check logs for `[spiral.trace]` entries for both screens. Look for geometry, context, framebuffer, and visibility.
+3. Confirm that the secondary screen is listed in `[launcher] Available screens:` and `[spiral.trace] Assigned to screen index ...`.
+4. Check for errors in `LoomCompositor.__init__`, `showEvent`, and `initializeGL` for the secondary window.
+5. If geometry is incorrect, verify that `setScreen` and `setGeometry` are called with the correct QScreen and QRect.
+6. If context/fb is missing, try running with `MESMERGLASS_SPIRAL_DEBUG_SURFACE=1` to disable translucency/click-through.
+7. If still black, try swapping screen indices or running with only the secondary display enabled.
+8. Report logs and system details for further diagnosis.
+
+**Note:** Some Windows/Qt/driver combinations may fail to create a valid OpenGL context on non-primary screens. The logs will help pinpoint if the compositor is initializing, if the framebuffer/context is valid, and if the window is visible/fullscreen.
+## Logging & Diagnostics
+
+To enable verbose spiral trace logging (for debugging multi-display or context issues), set the environment variable:
+
+	MESMERGLASS_SPIRAL_TRACE=1
+
+When enabled, detailed logs from the OpenGL compositor (LoomCompositor) will be emitted for each window and frame. By default, these logs are suppressed to avoid log spam.
+
 
 ## Overview
 MesmerLoom is the MesmerGlass visuals engine providing a GPU spiral overlay composited over video. It consists of a SpiralDirector (parameter evolution + intensity scaling + flip choreography) and an OpenGL compositor (fullscreen triangle shader pipeline). The legacy `mesmerglass.engine.spiral` path now re-exports the MesmerLoom implementation and emits a `DeprecationWarning`.

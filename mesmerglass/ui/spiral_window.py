@@ -18,7 +18,7 @@ from typing import Any
 import logging
 
 try:
-    from ..mesmerloom.compositor import Compositor as LoomCompositor
+    from ..mesmerloom.compositor import LoomCompositor
     logging.getLogger(__name__).info("[spiral.trace] LoomCompositor import succeeded in spiral_window.py")
 except Exception as e:
     logging.getLogger(__name__).error(f"[spiral.trace] LoomCompositor import failed in spiral_window.py: {e}")
@@ -26,8 +26,35 @@ except Exception as e:
 
 
 class SpiralWindow(QWidget):  # pragma: no cover - runtime/UI centric
-    def __init__(self, director, parent=None):
+    def __init__(self, director, parent=None, screen_index=0):
+        # --- SpiralWindow diagnostics: compositor/screen assignment ---
+        try:
+            from PyQt6.QtWidgets import QApplication
+            from PyQt6.QtGui import QGuiApplication
+            screens = QApplication.screens()
+            screen = screens[screen_index] if 0 <= screen_index < len(screens) else screens[0]
+            logging.getLogger(__name__).info(f"[spiral.trace] SpiralWindow: LoomCompositor will be attached to screen={screen.name()} index={screen_index} geometry={screen.geometry()} size={screen.geometry().size()}")
+            logging.getLogger(__name__).info("[spiral.trace] Available screens:")
+            for idx, sc in enumerate(QGuiApplication.screens()):
+                logging.getLogger(__name__).info(f"  Screen {idx}: name={sc.name()} geometry={sc.geometry()}")
+            logging.getLogger(__name__).info(f"[spiral.trace] Assigned to screen index {screen_index}: {screen.name()} ({screen.geometry()})")
+            logging.getLogger(__name__).info(f"[spiral.trace] Post-assignment: screen={screen.name()} geometry={self.geometry()} pos={self.pos()} size={self.size()}")
+            # Fallback: forcibly move window if not on target screen
+            if self.screen() != screen:
+                logging.getLogger(__name__).warning(f"[spiral.trace] Fallback: forced geometry to {screen.geometry()}")
+                self.setGeometry(screen.geometry())
+            # DPI and availableGeometry
+            try:
+                dpi = screen.logicalDotsPerInch()
+                avail = screen.availableGeometry()
+                logging.getLogger(__name__).info(f"[spiral.trace] DPI={dpi} availableGeometry={avail}")
+            except Exception as e:
+                logging.getLogger(__name__).warning(f"[spiral.trace] DPI/availableGeometry error: {e}")
+        except Exception as e:
+            logging.getLogger(__name__).warning(f"[spiral.trace] SpiralWindow: error logging LoomCompositor/screen assignment: {e}")
         super().__init__(parent)
+        # Diagnostic: log SpiralWindow creation and window info
+        logging.getLogger(__name__).info(f"[spiral.trace] SpiralWindow.__init__: screen_index={screen_index} parent={parent} winId={self.winId()} windowFlags={self.windowFlags():#x}")
         # Optional debug surface mode disables translucency & click-through (can help some drivers)
         self._debug_surface = bool(os.environ.get("MESMERGLASS_SPIRAL_DEBUG_SURFACE"))
         if not self._debug_surface:
@@ -38,17 +65,63 @@ class SpiralWindow(QWidget):  # pragma: no cover - runtime/UI centric
         self.setObjectName("SpiralWindow")
         lay = QVBoxLayout(self); lay.setContentsMargins(0,0,0,0)
         self._glwindow_attempted = False
+        # Forced QScreen assignment
+        try:
+            from PyQt6.QtWidgets import QApplication
+            screens = QApplication.screens()
+            logging.getLogger(__name__).info(f"[spiral.trace] Available screens:")
+            for idx, screen in enumerate(screens):
+                logging.getLogger(__name__).info(f"  Screen {idx}: name={screen.name()} geometry={screen.geometry()}")
+            if 0 <= screen_index < len(screens):
+                self.setScreen(screens[screen_index])
+                logging.getLogger(__name__).info(f"[spiral.trace] Assigned to screen index {screen_index}: {screens[screen_index].name()} ({screens[screen_index].geometry()})")
+                # Log after assignment
+                assigned_screen = self.screen() if hasattr(self, 'screen') else None
+                assigned_name = assigned_screen.name() if assigned_screen else None
+                logging.getLogger(__name__).info(f"[spiral.trace] Post-assignment: screen={assigned_name} geometry={self.geometry()} pos={self.pos()} size={self.size()}")
+                # Fallback: force geometry to match screen if not fullscreen
+                try:
+                    geom = screens[screen_index].geometry()
+                    self.setGeometry(geom)
+                    logging.getLogger(__name__).info(f"[spiral.trace] Fallback: forced geometry to {geom}")
+                    dpi = screens[screen_index].logicalDotsPerInch()
+                    avail_geom = screens[screen_index].availableGeometry()
+                    logging.getLogger(__name__).info(f"[spiral.trace] DPI={dpi} availableGeometry={avail_geom}")
+                except Exception as e:
+                    logging.getLogger(__name__).warning(f"[spiral.trace] Fallback geometry/DPI error: {e}")
+            else:
+                logging.getLogger(__name__).warning(f"[spiral.trace] Invalid screen_index {screen_index}, defaulting to primary.")
+        except Exception as e:
+            logging.getLogger(__name__).warning(f"[spiral.trace] Error assigning QScreen: {e}")
+        # Diagnostic: log screen assignment and geometry
+        try:
+            screen = self.screen() if hasattr(self, 'screen') else None
+            screen_name = screen.name() if screen else None
+            logging.getLogger(__name__).info(
+                f"[spiral.trace] SpiralWindow.__init__: screen={screen_name} geometry={self.geometry()} pos={self.pos()} size={self.size()}"
+            )
+        except Exception as e:
+            logging.getLogger(__name__).warning(f"[spiral.trace] SpiralWindow.__init__: error logging screen info: {e}")
         # Restore main compositor as child widget
         try:
-            from ..mesmerloom.compositor import Compositor as LoomCompositor
+            from ..mesmerloom.compositor import LoomCompositor
             self.showFullScreen()  # Make SpiralWindow itself fullscreen/top-level
-            comp = LoomCompositor(director, parent=self)
-            comp.resize(self.width(), self.height())
-            comp.show()
-            comp.raise_()
-            comp.update()  # Force GL context creation
-            logging.getLogger(__name__).info("SpiralWindow: forced showFullScreen, LoomCompositor show/raise/update for GL context")
-            self.comp = comp  # redirect facade
+            self.raise_()
+            self.activateWindow()
+            # Log after showFullScreen
+            assigned_screen = self.screen() if hasattr(self, 'screen') else None
+            assigned_name = assigned_screen.name() if assigned_screen else None
+            logging.getLogger(__name__).info(f"[spiral.trace] After showFullScreen: screen={assigned_name} geometry={self.geometry()} pos={self.pos()} size={self.size()}")
+            self.comp = LoomCompositor(director, parent=self)
+            lay.addWidget(self.comp)  # Ensure compositor is attached to layout
+            self.comp.resize(self.width(), self.height())
+            self.comp.show()
+            self.comp.raise_()
+            self.comp.activateWindow()
+            self.comp.update()  # Force GL context creation
+            logging.getLogger(__name__).info("SpiralWindow: LoomCompositor attached to layout and shown")
+            # Diagnostic: log widget visibility and GL context
+            logging.getLogger(__name__).info(f"[spiral.trace] SpiralWindow visible={self.isVisible()} comp visible={self.comp.isVisible()} comp geometry={self.comp.geometry()} size={self.comp.size()}")
             # QTimer to force delayed update
             from PyQt6.QtCore import QTimer
             def _delayed_update():
@@ -155,32 +228,36 @@ class SpiralWindow(QWidget):  # pragma: no cover - runtime/UI centric
     # Event logging -------------------------------------------------
     def showEvent(self, ev):  # pragma: no cover
         try:
+            screen = self.screen() if hasattr(self, 'screen') else None
+            screen_name = screen.name() if screen else None
             logging.getLogger(__name__).info(
-                "SpiralWindow showEvent (fullscreen) size=%dx%d comp_init=%s avail=%s", self.width(), self.height(), getattr(self.comp,'_initialized',None), getattr(self.comp,'available',None)
+                f"[spiral.trace] SpiralWindow.showEvent: screen={screen_name} geometry={self.geometry()} pos={self.pos()} size={self.size()} comp_init={getattr(self.comp,'_initialized',None)} avail={getattr(self.comp,'available',None)}"
             )
             # Force child LoomCompositor to match parent geometry
             if hasattr(self, 'comp') and self.comp:
                 self.comp.setGeometry(self.geometry())
                 self.comp.resize(self.width(), self.height())
                 logging.getLogger(__name__).info(
-                    "SpiralWindow showEvent: forced comp geometry to %s size=%s", self.comp.geometry(), self.comp.size()
+                    f"[spiral.trace] SpiralWindow.showEvent: forced comp geometry to {self.comp.geometry()} size={self.comp.size()}"
                 )
         except Exception as e:
-            logging.getLogger(__name__).warning(f"SpiralWindow showEvent: error forcing comp geometry: {e}")
+            logging.getLogger(__name__).warning(f"[spiral.trace] SpiralWindow.showEvent: error forcing comp geometry: {e}")
         return super().showEvent(ev)
 
     def resizeEvent(self, ev):  # pragma: no cover
         try:
-            logging.getLogger(__name__).debug(
-                "SpiralWindow resizeEvent size=%dx%d comp_init=%s", self.width(), self.height(), getattr(self.comp,'_initialized',None)
+            screen = self.screen() if hasattr(self, 'screen') else None
+            screen_name = screen.name() if screen else None
+            logging.getLogger(__name__).info(
+                f"[spiral.trace] SpiralWindow.resizeEvent: screen={screen_name} geometry={self.geometry()} pos={self.pos()} size={self.size()} comp_init={getattr(self.comp,'_initialized',None)}"
             )
             # Force child SpiralSimpleGL to match parent geometry
             if hasattr(self, 'comp') and self.comp:
                 self.comp.setGeometry(self.geometry())
                 self.comp.resize(self.width(), self.height())
-                logging.getLogger(__name__).debug(
-                    "SpiralWindow resizeEvent: forced comp geometry to %s size=%s", self.comp.geometry(), self.comp.size()
+                logging.getLogger(__name__).info(
+                    f"[spiral.trace] SpiralWindow.resizeEvent: forced comp geometry to {self.comp.geometry()} size={self.comp.size()}"
                 )
         except Exception as e:
-            logging.getLogger(__name__).warning(f"SpiralWindow resizeEvent: error forcing comp geometry: {e}")
+            logging.getLogger(__name__).warning(f"[spiral.trace] SpiralWindow.resizeEvent: error forcing comp geometry: {e}")
         return super().resizeEvent(ev)

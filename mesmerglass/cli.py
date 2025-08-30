@@ -21,6 +21,8 @@ from .logging_utils import setup_logging, get_default_log_path
 from .devtools.virtual_toy import VirtualToy  # dev-only, used by 'toy' subcommand
 from .content.loader import load_session_pack  # session packs
 import subprocess, sys, warnings, pathlib
+from mesmerglass.mesmerloom.compositor import LoomCompositor
+
 class GLUnavailableError(RuntimeError):
     pass
 
@@ -156,6 +158,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_spiral.add_argument("--duration", type=float, default=5.0, help="Seconds to run (default: 5)")
     p_spiral.add_argument("--render-scale", choices=["1.0","0.85","0.75"], default="1.0", help="Render scale (default: 1.0)")
     p_spiral.add_argument("--force", action="store_true", help="Bypass GL availability probe and attempt to run anyway")
+    p_spiral.add_argument("--screen", type=int, default=0, help="Screen index to target for spiral overlay (default: 0)")
 
     # Test runner integration (wraps previous run_tests.py functionality)
     p_tr = sub.add_parser("test-run", help="Run pytest with selection shortcuts (replaces run_tests.py)")
@@ -198,28 +201,36 @@ def cmd_spiral_test(args) -> None:
     except Exception as e:
         print("MesmerLoom spiral-test: GL unavailable: import failure", e)
         sys.exit(77)
-    # Probe
-    if not getattr(args, 'force', False):
-        probe_ok = True
-        try:
-            if 'probe_available' in locals() and callable(probe_available):
-                probe_ok = bool(probe_available())
-        except Exception:
-            probe_ok = False
-        if not probe_ok:
-            print("MesmerLoom spiral-test: probe inconclusive; attempting context anyway...")
-    from PyQt6.QtWidgets import QApplication
     try:
+        # Probe
+        if not getattr(args, 'force', False):
+            probe_ok = True
+            try:
+                if 'probe_available' in locals() and callable(probe_available):
+                    probe_ok = bool(probe_available())
+            except Exception:
+                probe_ok = False
+            if not probe_ok:
+                print("MesmerLoom spiral-test: probe inconclusive; attempting context anyway...")
+        from PyQt6.QtWidgets import QApplication
         app = QApplication.instance() or QApplication([])
         director = LoomDirector(seed=7)
         try:
             director.set_intensity(max(0.0, min(1.0, float(getattr(args, "intensity", 0.75)))))
         except Exception:
             pass
-        comp = Compositor(director)
+        comp = LoomCompositor(director)
         comp.resize(640, 360)
         comp.set_active(True)
-        comp.show()
+        # Assign to requested screen if available
+        try:
+            screens = app.screens()
+            screen_idx = getattr(args, "screen", 0)
+            if screens and 0 <= screen_idx < len(screens):
+                comp.setScreen(screens[screen_idx])
+        except Exception as e:
+            print(f"spiral-test: could not assign to screen {getattr(args, 'screen', 0)}: {e}")
+        comp.showFullScreen()
         # Process events to allow initializeGL to run regardless of force.
         cycles = 10 if not getattr(args, 'force', False) else 4
         for _ in range(cycles):
@@ -231,10 +242,14 @@ def cmd_spiral_test(args) -> None:
             sys.exit(77)
         # Configure and run loop
         blend_map = {"multiply": 0, "screen": 1, "softlight": 2}
-        try: comp.set_blend_mode(blend_map.get(getattr(args, 'blend', 'multiply').lower(), 0))
-        except Exception: pass
-        try: comp.set_render_scale(float(getattr(args, 'render_scale', '1.0')))
-        except Exception: pass
+        try:
+            comp.set_blend_mode(blend_map.get(getattr(args, 'blend', 'multiply').lower(), 0))
+        except Exception:
+            pass
+        try:
+            comp.set_render_scale(float(getattr(args, 'render_scale', '1.0')))
+        except Exception:
+            pass
         dur = max(0.1, float(getattr(args, 'duration', 5.0)))
         t0 = _time.perf_counter(); last = t0; frames = 0
         target_frame = 1.0 / 60.0
@@ -262,8 +277,10 @@ def cmd_spiral_test(args) -> None:
             sys.exit(77)
         fps = frames / total
         print(f"MesmerLoom spiral-test duration={dur:.2f}s frames={frames} avg_frame_ms={(total/frames*1000.0 if frames else 0):.2f} fps={fps:.1f}")
-        try: comp.close()
-        except Exception: pass
+        try:
+            comp.close()
+        except Exception:
+            pass
         sys.exit(0)
     except SystemExit:
         raise
@@ -304,14 +321,20 @@ def main(argv: Optional[list[str]] = None) -> int:
         import os as _os
         _os.environ.setdefault("MESMERGLASS_NO_SERVER", "1")  # ensures Launcher skips server thread
         try:
-            pack = load_session_pack(args.load)
+            cmd = args.command or "run"
+            if cmd == "run":
+                # Import app lazily so that commands like 'session' don't trigger pygame/audio init
+                # which would emit banners on stdout and break JSON parsing in tests.
+                from .app import run as run_gui  # local import
+                run_gui()
+                return 0
+            if cmd == "spiral-test":
+                cmd_spiral_test(args)  # exits via sys.exit inside handler
+                return 0  # not reached
+            return 0
         except Exception as e:
             logging.getLogger(__name__).error("Failed to load session pack: %s", e)
             return 1
-        summary_mode = (not args.print and not args.apply) or args.summary
-        if args.print:
-            print(_json.dumps(pack.to_canonical_dict(), separators=(",", ":"), ensure_ascii=False))
-            return 0
         if args.apply:
             # Headless apply (no event loop spin). Silence stdout during construction
             # to avoid pygame banner or incidental prints contaminating JSON output.
@@ -481,7 +504,6 @@ def main(argv: Optional[list[str]] = None) -> int:
             if idx is None:
                 logging.getLogger(__name__).error("Unknown tab: %s", target)
                 win.close()
-                return 1
             win.tabs.setCurrentIndex(idx)
             logging.getLogger(__name__).info("Selected tab: %s", win.tabs.tabText(idx))
         # Load state first if requested (so subsequent setters override)

@@ -37,7 +37,7 @@ from .panel_mesmerloom import PanelMesmerLoom
 try:
     import logging
     try:
-        from ..mesmerloom.compositor import Compositor as LoomCompositor
+        from ..mesmerloom.compositor import LoomCompositor
         logging.getLogger(__name__).info("[spiral.trace] LoomCompositor import succeeded in launcher.py")
     except Exception as e:
         logging.getLogger(__name__).error(f"[spiral.trace] LoomCompositor import failed in launcher.py: {e}")
@@ -473,8 +473,22 @@ class Launcher(QMainWindow):
                 except Exception: pass
             return
         # Skip if we already have windows matching current selection
+        # Diagnostic: force overlays on all screens if MESMERGLASS_SPIRAL_ALL=1
+        force_all = os.environ.get('MESMERGLASS_SPIRAL_ALL') == '1'
         try:
-            checked_idx = [i for i in range(self.list_displays.count()) if self.list_displays.item(i).checkState()==Qt.CheckState.Checked]
+            if force_all:
+                screens = QGuiApplication.screens()
+                checked_idx = list(range(len(screens)))
+                logging.getLogger(__name__).warning("[spiral.trace] MESMERGLASS_SPIRAL_ALL=1: Forcing overlays on all screens: %s", checked_idx)
+            else:
+                checked_idx = [i for i in range(self.list_displays.count()) if self.list_displays.item(i).checkState()==Qt.CheckState.Checked]
+                logging.getLogger(__name__).info(f"[spiral.trace] UI selection: checked_idx={checked_idx} (list_displays.count={self.list_displays.count()})")
+                for idx in checked_idx:
+                    try:
+                        item = self.list_displays.item(idx)
+                        logging.getLogger(__name__).info(f"[spiral.trace] UI selected display idx={idx} text={item.text()} checked={item.checkState()==Qt.CheckState.Checked}")
+                    except Exception as e:
+                        logging.getLogger(__name__).warning(f"[spiral.trace] Error logging UI display idx={idx}: {e}")
         except Exception:
             checked_idx = []
         if not checked_idx:
@@ -497,89 +511,52 @@ class Launcher(QMainWindow):
             screens = []
         try: logging.getLogger(__name__).info("_create_spiral_windows building windows for displays=%s total_screens=%d", checked_idx, len(screens))
         except Exception: pass
-        for i in checked_idx:
+        # Log all available screens and their geometries
+        logging.getLogger(__name__).info("[launcher] Available screens:")
+        for idx, screen in enumerate(screens):
+            logging.getLogger(__name__).info(f"  Screen {idx}: name={screen.name()} geometry={screen.geometry()}")
+
+        from .spiral_duplicate_window import SpiralDuplicateWindow
+        main_win = None
+        for idx, i in enumerate(checked_idx):
             sc = screens[i] if (i < len(screens) and screens) else (screens[0] if screens else None)
             if sc is None:
                 continue
-            try:
-                # Use container window hosting the compositor to improve odds of GL context creation
-                win = SpiralWindow(self.spiral_director)
+            if idx == 0:
+                # Main spiral overlay (GL)
                 try:
-                    relax = os.environ.get('MESMERGLASS_RELAX_FLAGS') == '1'
-                    flags = Qt.WindowType.FramelessWindowHint | (Qt.WindowType.WindowStaysOnTopHint if not relax else Qt.WindowType.Window)
-                    if getattr(win, '_debug_surface', False):
-                        flags = Qt.WindowType.FramelessWindowHint | Qt.WindowType.Window
-                    if os.name == 'nt' and not relax:
-                        flags |= Qt.WindowType.Tool
-                    if relax:
-                        logging.getLogger(__name__).warning("Launcher: using relaxed window flags (no always-on-top/tool) for GL diagnostic")
-                    win.setWindowFlags(flags)
-                except Exception: pass
-                try: win.setGeometry(sc.geometry())
-                except Exception: pass
-                try: win.set_active(True)
-                except Exception: pass
-                try: win.showFullScreen(); win.raise_()
+                    win = SpiralWindow(self.spiral_director, parent=None, screen_index=i)
+                    win.setGeometry(sc.geometry())
+                    win.set_active(True)
+                    win.showFullScreen(); win.raise_()
+                    self.spiral_windows.append(win)
+                    main_win = win
                 except Exception:
-                    try: win.show()
-                    except Exception: pass
-                # Diagnostic logging (container proxies inner compositor state)
+                    continue
+            else:
+                # Duplicate window for secondary screens
                 try:
-                    logging.getLogger(__name__).info(
-                        "Spiral window created hwnd=%s init=%s avail=%s flags=0x%x", 
-                        (int(win.winId()) if hasattr(win,'winId') else '?'), getattr(win,'_initialized', None), getattr(win,'available', None), int(win.windowFlags())
-                    )
-                except Exception: pass
-                # Probe loop
-                try:
-                    from PyQt6.QtCore import QTimer as _QT
-                    def _probe(status_try=[1]):
-                        try:
-                            logging.getLogger(__name__).info(
-                                "Spiral window probe #%d init=%s avail=%s program=%s", status_try[0], getattr(win,'_initialized', None), getattr(win,'available', None), getattr(win,'_program', None)
-                            )
-                        except Exception: pass
-                        status_try[0] += 1
-                        if status_try[0] <= 6 and not getattr(win,'_initialized', False):
-                            _QT.singleShot(250, _probe)
-                        # Manual kick: if still not initialized on final probe, request an update (may trigger context)
-                        if status_try[0] == 7 and not getattr(win,'_initialized', False):
-                            try:
-                                if win.comp and hasattr(win.comp, 'update'):
-                                    logging.getLogger(__name__).warning("Spiral window forcing manual update() to trigger GL init")
-                                    win.comp.update()
-                                    try:
-                                        if hasattr(win.comp, 'force_init_context'):
-                                            win.comp.force_init_context()
-                                    except Exception: pass
-                                    # One-time attempt to re-create compositor in debug surface mode
-                                    if getattr(win, '_debug_surface', False) and not getattr(win.comp, '_initialized', False):
-                                        logging.getLogger(__name__).warning("Spiral window attempting compositor re-create (debug surface mode)")
-                                        try:
-                                            from ..mesmerloom.compositor import Compositor as _LC
-                                            old = win.comp
-                                            win.comp = _LC(self.spiral_director, parent=win)
-                                            lay = win.layout(); lay.addWidget(win.comp)  # type: ignore
-                                            old.hide()
-                                            win.comp.update()
-                                        except Exception as e:
-                                            logging.getLogger(__name__).error("Re-create failed: %s", e)
-                            except Exception: pass
-                    _QT.singleShot(250, _probe)
-                except Exception: pass
-                # Windows specific extended styles for click-through (best-effort)
-                if os.name == 'nt':  # pragma: no cover - platform specific
-                    try:
-                        from ctypes import windll
-                        GWL_EXSTYLE = -20; WS_EX_LAYERED = 0x00080000; WS_EX_TRANSPARENT = 0x00000020; WS_EX_TOOLWINDOW = 0x00000080
-                        hwnd = int(win.winId()); style = windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-                        style |= WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW
-                        windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
-                    except Exception:
-                        pass
-                self.spiral_windows.append(win)
-            except Exception:
-                continue
+                    dup_win = SpiralDuplicateWindow(sc, sc.geometry())
+                    if main_win:
+                        if hasattr(main_win, 'comp'):
+                            logging.getLogger(__name__).info(f"[launcher] main_win.comp found for duplicate window on screen {sc.name()}")
+                            if hasattr(main_win.comp, 'get_framebuffer_image'):
+                                logging.getLogger(__name__).info(f"[launcher] Assigning get_framebuffer_image as image source for duplicate window on screen {sc.name()}")
+                                dup_win.set_image_source(main_win.comp.get_framebuffer_image)
+                                if hasattr(main_win.comp, 'frame_drawn'):
+                                    dup_win.connect_frame_signal(main_win.comp)
+                                    logging.getLogger(__name__).info(f"[launcher] Connected frame_drawn signal for duplicate window on screen {sc.name()}")
+                            else:
+                                logging.getLogger(__name__).warning(f"[launcher] main_win.comp missing get_framebuffer_image for duplicate window on screen {sc.name()}")
+                        else:
+                            logging.getLogger(__name__).warning(f"[launcher] main_win missing 'comp' attribute for duplicate window on screen {sc.name()}")
+                    else:
+                        logging.getLogger(__name__).warning(f"[launcher] No main_win for duplicate window on screen {sc.name()}")
+                    dup_win.showFullScreen(); dup_win.raise_()
+                    self.spiral_windows.append(dup_win)
+                except Exception as e:
+                    logging.getLogger(__name__).error(f"[launcher] Exception creating duplicate window: {e}")
+                    continue
         try:
             logging.getLogger(__name__).info("_create_spiral_windows done: created=%d", len(self.spiral_windows))
         except Exception:

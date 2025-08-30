@@ -7,7 +7,7 @@ try:  # pragma: no cover
 except Exception:  # pragma: no cover
     QApplication = None  # type: ignore
 
-from mesmerglass.mesmerloom.compositor import Compositor
+from mesmerglass.mesmerloom.compositor import LoomCompositor
 from mesmerglass.mesmerloom.spiral import SpiralDirector
 
 
@@ -16,7 +16,7 @@ def test_compositor_initializes(qtbot):
     """Smoke: compositor constructs, GL (attempts) init, phase advances."""
     app = QApplication.instance() or QApplication([])
     director = SpiralDirector(seed=123)
-    widget = Compositor(director)
+    widget = LoomCompositor(director)
     qtbot.addWidget(widget)
     widget.resize(320, 240)
     widget.show()
