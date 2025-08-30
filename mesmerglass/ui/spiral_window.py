@@ -27,6 +27,7 @@ except Exception as e:
 
 class SpiralWindow(QWidget):  # pragma: no cover - runtime/UI centric
     def __init__(self, director, parent=None, screen_index=0):
+        super().__init__(parent)
         # --- SpiralWindow diagnostics: compositor/screen assignment ---
         try:
             from PyQt6.QtWidgets import QApplication
@@ -52,7 +53,6 @@ class SpiralWindow(QWidget):  # pragma: no cover - runtime/UI centric
                 logging.getLogger(__name__).warning(f"[spiral.trace] DPI/availableGeometry error: {e}")
         except Exception as e:
             logging.getLogger(__name__).warning(f"[spiral.trace] SpiralWindow: error logging LoomCompositor/screen assignment: {e}")
-        super().__init__(parent)
         # Diagnostic: log SpiralWindow creation and window info
         logging.getLogger(__name__).info(f"[spiral.trace] SpiralWindow.__init__: screen_index={screen_index} parent={parent} winId={self.winId()} windowFlags={self.windowFlags():#x}")
         # Optional debug surface mode disables translucency & click-through (can help some drivers)
@@ -103,6 +103,7 @@ class SpiralWindow(QWidget):  # pragma: no cover - runtime/UI centric
         except Exception as e:
             logging.getLogger(__name__).warning(f"[spiral.trace] SpiralWindow.__init__: error logging screen info: {e}")
         # Restore main compositor as child widget
+        self.comp = None
         try:
             from ..mesmerloom.compositor import LoomCompositor
             self.showFullScreen()  # Make SpiralWindow itself fullscreen/top-level
@@ -124,40 +125,47 @@ class SpiralWindow(QWidget):  # pragma: no cover - runtime/UI centric
             # QTimer to force delayed update
             from PyQt6.QtCore import QTimer
             def _delayed_update():
-                self.comp.update()
-                logging.getLogger(__name__).info("SpiralWindow: QTimer forced comp.update() (delayed)")
+                if self.comp:
+                    self.comp.update()
+                    logging.getLogger(__name__).info("SpiralWindow: QTimer forced comp.update() (delayed)")
             QTimer.singleShot(100, _delayed_update)
         except Exception as e:
             logging.getLogger(__name__).error("SpiralWindow: LoomCompositor creation failed: %s", e)
-
+            self.comp = None
     # Facade methods -------------------------------------------------
     def set_active(self, active: bool):
         if self.comp and hasattr(self.comp, 'set_active'):
             try: self.comp.set_active(active)
             except Exception: pass
+        else:
+            logging.getLogger(__name__).warning("SpiralWindow.set_active: comp is None")
 
     def set_uniforms_from_director(self, uniforms: dict[str, Any]):
         if self.comp and hasattr(self.comp, 'set_uniforms_from_director'):
             try: self.comp.set_uniforms_from_director(uniforms)
             except Exception: pass
+        else:
+            logging.getLogger(__name__).warning("SpiralWindow.set_uniforms_from_director: comp is None")
 
     def request_draw(self):
         if self.comp and hasattr(self.comp, 'request_draw'):
             try: self.comp.request_draw()
             except Exception: pass
+        else:
+            logging.getLogger(__name__).warning("SpiralWindow.request_draw: comp is None")
 
     # Properties -----------------------------------------------------
     @property
     def available(self) -> bool:
-        return bool(getattr(self.comp, 'available', False))
+        return bool(getattr(self.comp, 'available', False)) if self.comp else False
 
     @property
     def _initialized(self) -> bool:  # used by probe logs
-        return bool(getattr(self.comp, '_initialized', False))
+        return bool(getattr(self.comp, '_initialized', False)) if self.comp else False
 
     @property
     def _program(self):  # used by probe logs
-        return getattr(self.comp, '_program', None)
+        return getattr(self.comp, '_program', None) if self.comp else None
 
     # ---------------- CPU fallback spiral (very simple) ----------------
     def _enable_cpu_fallback(self):
@@ -229,8 +237,10 @@ class SpiralWindow(QWidget):  # pragma: no cover - runtime/UI centric
         try:
             screen = self.screen() if hasattr(self, 'screen') else None
             screen_name = screen.name() if screen else None
+            comp_init = getattr(self.comp,'_initialized',None) if self.comp else None
+            comp_avail = getattr(self.comp,'available',None) if self.comp else None
             logging.getLogger(__name__).info(
-                f"[spiral.trace] SpiralWindow.showEvent: screen={screen_name} geometry={self.geometry()} pos={self.pos()} size={self.size()} comp_init={getattr(self.comp,'_initialized',None)} avail={getattr(self.comp,'available',None)}"
+                f"[spiral.trace] SpiralWindow.showEvent: screen={screen_name} geometry={self.geometry()} pos={self.pos()} size={self.size()} comp_init={comp_init} avail={comp_avail}"
             )
             # No manual sizing needed; layout will fit the compositor
         except Exception as e:
@@ -241,8 +251,9 @@ class SpiralWindow(QWidget):  # pragma: no cover - runtime/UI centric
         try:
             screen = self.screen() if hasattr(self, 'screen') else None
             screen_name = screen.name() if screen else None
+            comp_init = getattr(self.comp,'_initialized',None) if self.comp else None
             logging.getLogger(__name__).info(
-                f"[spiral.trace] SpiralWindow.resizeEvent: screen={screen_name} geometry={self.geometry()} pos={self.pos()} size={self.size()} comp_init={getattr(self.comp,'_initialized',None)}"
+                f"[spiral.trace] SpiralWindow.resizeEvent: screen={screen_name} geometry={self.geometry()} pos={self.pos()} size={self.size()} comp_init={comp_init}"
             )
             # No manual sizing needed; layout will fit the compositor
         except Exception as e:

@@ -349,6 +349,8 @@ class Launcher(QMainWindow):
                 self.page_spiral.spiralToggled.connect(self._on_spiral_toggled)
                 self.page_spiral.opacityChanged.connect(lambda f: setattr(self, 'spiral_opacity', f))
                 self.page_spiral.intensityChanged.connect(lambda *_: None)
+                # Wire settingsChanged to compositor redraw
+                self.page_spiral.settingsChanged.connect(self._on_spiral_settings_changed)
             except Exception: pass
 
         # Footer -------------------------------------------------------
@@ -368,6 +370,24 @@ class Launcher(QMainWindow):
         self._refresh_status()
 
     # ---------------- Spiral logic (Phase 1.1 stub) ----------------
+    def _on_spiral_settings_changed(self):
+        """Called when any spiral UI setting changes; updates uniforms and redraws compositor and overlays."""
+        try:
+            uniforms = self.spiral_director.export_uniforms() if hasattr(self.spiral_director, 'export_uniforms') else getattr(self.spiral_director, 'uniforms', lambda: {})()
+            if self.compositor and getattr(self.compositor, 'available', True):
+                self.compositor.set_uniforms_from_director(uniforms)
+                self.compositor.request_draw()
+            # Broadcast to any active runtime spiral windows
+            for win in list(getattr(self, 'spiral_windows', [])):
+                try:
+                    if getattr(win, 'available', True) and getattr(win, 'set_uniforms_from_director', None):
+                        win.set_uniforms_from_director(uniforms)
+                        if hasattr(win, 'request_draw'):
+                            win.request_draw()
+                except Exception:
+                    pass
+        except Exception:
+            pass
     def _on_spiral_toggled(self, enabled: bool):  # connected by SpiralPage
         self.spiral_enabled = bool(enabled)
         try:

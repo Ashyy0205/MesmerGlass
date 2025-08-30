@@ -77,60 +77,7 @@ def probe_available() -> bool:
 
 class LoomCompositor(QOpenGLWidget):  # type: ignore[misc]
     frame_drawn = pyqtSignal()
-    @staticmethod
-    def _as_bytes(buf) -> bytes:
-        return bytes(buf)
-    def _compile_shader(self, src: str, stype) -> int:
-        from OpenGL import GL
-        sid = GL.glCreateShader(stype)
-        if not sid:
-            raise RuntimeError("glCreateShader returned 0 / None")
-        sid = int(sid)
-        GL.glShaderSource(sid, src)
-        GL.glCompileShader(sid)
-        if not GL.glGetShaderiv(sid, GL.GL_COMPILE_STATUS):
-            log = GL.glGetShaderInfoLog(sid).decode("utf-8", "ignore")
-            raise RuntimeError(f"Shader compile failed: {log}")
-        return sid
-    def _build_program(self) -> int:
-        from OpenGL import GL
-        vs_src = self._load_text("fullscreen_quad.vert")
-        fs_src = self._load_text("spiral.frag")
-        vs = self._compile_shader(vs_src, GL.GL_VERTEX_SHADER)
-        fs = self._compile_shader(fs_src, GL.GL_FRAGMENT_SHADER)
-        prog = GL.glCreateProgram()
-        if not prog:
-            raise RuntimeError("glCreateProgram returned 0 / None")
-        prog = int(prog)
-        GL.glAttachShader(prog, vs); GL.glAttachShader(prog, fs); GL.glLinkProgram(prog)
-        if not GL.glGetProgramiv(prog, GL.GL_LINK_STATUS):
-            log = GL.glGetProgramInfoLog(prog).decode("utf-8", "ignore")
-            raise RuntimeError(f"Program link failed: {log}")
-        GL.glDeleteShader(vs); GL.glDeleteShader(fs)
-        return prog
-    def _setup_geometry(self) -> None:
-        from OpenGL import GL
-        import array, ctypes, logging
-        logging.getLogger(__name__).info("[spiral.trace] _setup_geometry called")
-        verts = array.array("f", [
-            -1.0, -1.0, 0.0, 0.0,
-             1.0, -1.0, 1.0, 0.0,
-             1.0,  1.0, 1.0, 1.0,
-            -1.0,  1.0, 0.0, 1.0,
-        ])
-        idx = array.array("I", [0, 1, 2, 2, 3, 0])
-        self._vao = GL.glGenVertexArrays(1)
-        self._vbo = GL.glGenBuffers(1)
-        self._ebo = GL.glGenBuffers(1)
-        GL.glBindVertexArray(self._vao)
-        GL.glBindBuffer(GL.GL_ARRAY_BUFFER, self._vbo)
-        GL.glBufferData(GL.GL_ARRAY_BUFFER, len(verts)*4, verts.tobytes(), GL.GL_STATIC_DRAW)
-        GL.glBindBuffer(GL.GL_ELEMENT_ARRAY_BUFFER, self._ebo)
-        GL.glBufferData(GL.GL_ELEMENT_ARRAY_BUFFER, len(idx)*4, idx.tobytes(), GL.GL_STATIC_DRAW)
-        stride = 4*4
-        GL.glEnableVertexAttribArray(0); GL.glVertexAttribPointer(0, 2, GL.GL_FLOAT, False, stride, ctypes.c_void_p(0))
-        GL.glEnableVertexAttribArray(1); GL.glVertexAttribPointer(1, 2, GL.GL_FLOAT, False, stride, ctypes.c_void_p(8))
-        GL.glBindVertexArray(0)
+    # ...existing code...
     def __init__(self, director, parent=None, trace=False, sim_flag=False, force_flag=False, test_or_ci=False):
         import logging
         # Log parent and screen assignment

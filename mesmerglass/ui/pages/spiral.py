@@ -11,6 +11,7 @@ class SpiralPage(QtWidgets.QWidget):
     intensityChanged = QtCore.pyqtSignal(float)
     opacityChanged = QtCore.pyqtSignal(float)
     armsChanged = QtCore.pyqtSignal(int)
+    settingsChanged = QtCore.pyqtSignal()
 
     def __init__(self, app_ctx, spiral_director, parent=None):
         super().__init__(parent)
@@ -46,14 +47,17 @@ class SpiralPage(QtWidgets.QWidget):
         f = v/100.0
         self.director.set_intensity(f, abrupt=True)
         self.intensityChanged.emit(f)
+        self.settingsChanged.emit()
 
     def _on_opacity(self, v: int):
         op = v/100.0
         self.director.cfg.opacity = op
         self.opacityChanged.emit(op)
+        self.settingsChanged.emit()
 
     def _on_arms(self, v: int):
         self.director.cfg.arms = int(v)
         self.armsChanged.emit(int(v))
+        self.settingsChanged.emit()
 
 __all__ = ["SpiralPage"]

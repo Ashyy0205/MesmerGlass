@@ -1,3 +1,4 @@
+# Spiral Overlay Shader & Real-Time UI Wiring
 # MesmerLoom Spiral Overlay
 ## Troubleshooting: Secondary Screen Black
 
