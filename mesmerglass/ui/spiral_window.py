@@ -113,8 +113,7 @@ class SpiralWindow(QWidget):  # pragma: no cover - runtime/UI centric
             assigned_name = assigned_screen.name() if assigned_screen else None
             logging.getLogger(__name__).info(f"[spiral.trace] After showFullScreen: screen={assigned_name} geometry={self.geometry()} pos={self.pos()} size={self.size()}")
             self.comp = LoomCompositor(director, parent=self)
-            lay.addWidget(self.comp)  # Ensure compositor is attached to layout
-            self.comp.resize(self.width(), self.height())
+            lay.addWidget(self.comp)  # Layout will always fit the compositor
             self.comp.show()
             self.comp.raise_()
             self.comp.activateWindow()
@@ -226,38 +225,26 @@ class SpiralWindow(QWidget):  # pragma: no cover - runtime/UI centric
         return super().paintEvent(ev)
 
     # Event logging -------------------------------------------------
-    def showEvent(self, ev):  # pragma: no cover
+    def showEvent(self, event):  # pragma: no cover
         try:
             screen = self.screen() if hasattr(self, 'screen') else None
             screen_name = screen.name() if screen else None
             logging.getLogger(__name__).info(
                 f"[spiral.trace] SpiralWindow.showEvent: screen={screen_name} geometry={self.geometry()} pos={self.pos()} size={self.size()} comp_init={getattr(self.comp,'_initialized',None)} avail={getattr(self.comp,'available',None)}"
             )
-            # Force child LoomCompositor to match parent geometry
-            if hasattr(self, 'comp') and self.comp:
-                self.comp.setGeometry(self.geometry())
-                self.comp.resize(self.width(), self.height())
-                logging.getLogger(__name__).info(
-                    f"[spiral.trace] SpiralWindow.showEvent: forced comp geometry to {self.comp.geometry()} size={self.comp.size()}"
-                )
+            # No manual sizing needed; layout will fit the compositor
         except Exception as e:
             logging.getLogger(__name__).warning(f"[spiral.trace] SpiralWindow.showEvent: error forcing comp geometry: {e}")
-        return super().showEvent(ev)
+        return super().showEvent(event)
 
-    def resizeEvent(self, ev):  # pragma: no cover
+    def resizeEvent(self, event):  # pragma: no cover
         try:
             screen = self.screen() if hasattr(self, 'screen') else None
             screen_name = screen.name() if screen else None
             logging.getLogger(__name__).info(
                 f"[spiral.trace] SpiralWindow.resizeEvent: screen={screen_name} geometry={self.geometry()} pos={self.pos()} size={self.size()} comp_init={getattr(self.comp,'_initialized',None)}"
             )
-            # Force child SpiralSimpleGL to match parent geometry
-            if hasattr(self, 'comp') and self.comp:
-                self.comp.setGeometry(self.geometry())
-                self.comp.resize(self.width(), self.height())
-                logging.getLogger(__name__).info(
-                    f"[spiral.trace] SpiralWindow.resizeEvent: forced comp geometry to {self.comp.geometry()} size={self.comp.size()}"
-                )
+            # No manual sizing needed; layout will fit the compositor
         except Exception as e:
             logging.getLogger(__name__).warning(f"[spiral.trace] SpiralWindow.resizeEvent: error forcing comp geometry: {e}")
-        return super().resizeEvent(ev)
+        return super().resizeEvent(event)

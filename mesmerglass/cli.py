@@ -317,27 +317,33 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 0  # not reached
     if cmd == "session":
         import json as _json
-        # Suppress internal Mesmer server for headless session operations
         import os as _os
-        _os.environ.setdefault("MESMERGLASS_NO_SERVER", "1")  # ensures Launcher skips server thread
-        try:
-            cmd = args.command or "run"
-            if cmd == "run":
-                # Import app lazily so that commands like 'session' don't trigger pygame/audio init
-                # which would emit banners on stdout and break JSON parsing in tests.
-                from .app import run as run_gui  # local import
-                run_gui()
-                return 0
-            if cmd == "spiral-test":
-                cmd_spiral_test(args)  # exits via sys.exit inside handler
-                return 0  # not reached
-            return 0
-        except Exception as e:
-            logging.getLogger(__name__).error("Failed to load session pack: %s", e)
+        _os.environ.setdefault("MESMERGLASS_NO_SERVER", "1")
+        pack_path = getattr(args, "load", None)
+        if not pack_path or not os.path.exists(pack_path):
+            msg = f"Error: session pack file not found: {pack_path}"
+            print(msg)
+            print(msg, file=sys.stderr)
             return 1
+        try:
+            from .content.loader import load_session_pack
+            pack = load_session_pack(pack_path)
+        except Exception as e:
+            msg = f"Error: failed to load session pack: {e}"
+            print(msg)
+            print(msg, file=sys.stderr)
+            return 1
+        # If no mutually exclusive flag is set, default to summary
+        if not (args.print or args.apply or args.summary):
+            args.summary = True
+        if args.print:
+            try:
+                print(_json.dumps(pack.to_canonical_dict(), ensure_ascii=False, separators=(",", ":")))
+            except Exception as e:
+                print(f"Error: failed to encode session pack as JSON: {e}")
+                return 1
+            return 0
         if args.apply:
-            # Headless apply (no event loop spin). Silence stdout during construction
-            # to avoid pygame banner or incidental prints contaminating JSON output.
             from PyQt6.QtWidgets import QApplication
             from .ui.launcher import Launcher
             import sys as _sys, io as _io
@@ -347,13 +353,12 @@ def main(argv: Optional[list[str]] = None) -> int:
             try:
                 win = Launcher("MesmerGlass", enable_device_sync_default=False)
             finally:
-                # Discard any captured banner text
                 _sys.stdout = _real_stdout
             try:
                 if hasattr(win, "apply_session_pack"):
                     win.apply_session_pack(pack)
             except Exception as e:
-                logging.getLogger(__name__).error("Error applying session pack: %s", e)
+                print(f"Error: failed to apply session pack: {e}")
                 return 1
             status = {"pack": pack.name, "text": getattr(win, "text", None), "buzz_intensity": getattr(win, "buzz_intensity", None)}
             print(_json.dumps(status, ensure_ascii=False))
@@ -362,9 +367,9 @@ def main(argv: Optional[list[str]] = None) -> int:
             except Exception:
                 pass
             return 0
-        if summary_mode:
-            ti = f"{len(pack.text.items)} text" if pack.text.items else "0 text"
-            ps = f"{len(pack.pulse.stages)} stages" if pack.pulse.stages else "0 stages"
+        if args.summary:
+            ti = f"{len(pack.text.items)} text" if hasattr(pack, 'text') and hasattr(pack.text, 'items') and pack.text.items else "0 text"
+            ps = f"{len(pack.pulse.stages)} stages" if hasattr(pack, 'pulse') and hasattr(pack.pulse, 'stages') and pack.pulse.stages else "0 stages"
             print(f"SessionPack '{pack.name}' v{pack.version} — {ti}, {ps}")
             return 0
     if cmd == "state":

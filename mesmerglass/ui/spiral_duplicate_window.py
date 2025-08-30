@@ -33,8 +33,21 @@ class SpiralDuplicateWindow(QWidget):
                     logging.getLogger(__name__).warning(f"[spiral.dup] _update_image: INVALID image (null or zero size)")
                 else:
                     logging.getLogger(__name__).info(f"[spiral.dup] _update_image: VALID image w={img.width()} h={img.height()} format={img.format()}")
+                # --- Option A: scale image to window pixel size ---
+                dpr = getattr(self, "devicePixelRatioF", lambda: 1.0)()
+                tw, th = max(1, int(self.width()*dpr)), max(1, int(self.height()*dpr))
+                # Normalize source image DPR to 1 for pixel math
+                if img.devicePixelRatio() != 1.0:
+                    img = img.copy()
+                    img.setDevicePixelRatio(1.0)
+                # Scale to fill mirror window
+                if img.width() != tw or img.height() != th:
+                    img = img.scaled(tw, th, Qt.AspectRatioMode.IgnoreAspectRatio,
+                                     Qt.TransformationMode.SmoothTransformation)
+                pm = QPixmap.fromImage(img)
+                pm.setDevicePixelRatio(dpr)
                 self._last_image = img
-                self.label.setPixmap(QPixmap.fromImage(img))
+                self.label.setPixmap(pm)
             else:
                 logging.getLogger(__name__).warning(f"[spiral.dup] _update_image: No image or not QImage (type={type(img)})")
 
