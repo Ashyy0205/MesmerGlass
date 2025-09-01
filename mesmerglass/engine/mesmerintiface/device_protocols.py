@@ -70,6 +70,10 @@ class LovenseProtocol(DeviceProtocol):
     SERVICE_UUID_V2 = "5a300001-0023-4bd4-bbd5-a6920e4c5653"
     TX_CHAR_UUID_V2 = "5a300002-0023-4bd4-bbd5-a6920e4c5653"  # Write
     RX_CHAR_UUID_V2 = "5a300003-0023-4bd4-bbd5-a6920e4c5653"  # Notify
+    # Lovense v2 alt (field: some Diamo units use 5230 prefix)
+    SERVICE_UUID_V2_ALT = "52300001-0023-4bd4-bbd5-a6920e4c5653"
+    TX_CHAR_UUID_V2_ALT = "52300002-0023-4bd4-bbd5-a6920e4c5653"
+    RX_CHAR_UUID_V2_ALT = "52300003-0023-4bd4-bbd5-a6920e4c5653"
     
     def __init__(self, device_address: str, device_name: str):
         super().__init__(device_address, device_name)
@@ -140,26 +144,42 @@ class LovenseProtocol(DeviceProtocol):
             services = client.services
             v2_service = None
             v1_service = None
+            try:
+                svc_list = [s.uuid.lower() for s in services]  # type: ignore
+                self._logger.debug(f"Lovense initialize scanning services: {svc_list}")
+            except Exception:
+                pass
             
             for service in services:
-                if service.uuid.lower() == self.SERVICE_UUID_V2.lower():
+                su = service.uuid.lower()
+                if su == self.SERVICE_UUID_V2.lower() or su == self.SERVICE_UUID_V2_ALT.lower():
                     v2_service = service
-                elif service.uuid.lower() == self.SERVICE_UUID_V1.lower():
+                elif su == self.SERVICE_UUID_V1.lower():
                     v1_service = service
                     
             # Prefer v2 if available, fall back to v1
             if v2_service:
-                self._logger.info(f"Detected Lovense v2 protocol for {self.device_name}")
-                self.is_v2_protocol = True
-                self.SERVICE_UUID = self.SERVICE_UUID_V2
-                self.TX_CHAR_UUID = self.TX_CHAR_UUID_V2
-                self.RX_CHAR_UUID = self.RX_CHAR_UUID_V2
+                # Determine which v2 mapping applies (standard 5a30 or alt 5230)
+                if v2_service.uuid.lower() == self.SERVICE_UUID_V2_ALT.lower():
+                    self._logger.info(f"Detected Lovense v2 protocol (alt 5230) for {self.device_name}")
+                    self.is_v2_protocol = True
+                    self.SERVICE_UUID = self.SERVICE_UUID_V2_ALT
+                    self.TX_CHAR_UUID = self.TX_CHAR_UUID_V2_ALT
+                    self.RX_CHAR_UUID = self.RX_CHAR_UUID_V2_ALT
+                else:
+                    self._logger.info(f"Detected Lovense v2 protocol for {self.device_name}")
+                    self.is_v2_protocol = True
+                    self.SERVICE_UUID = self.SERVICE_UUID_V2
+                    self.TX_CHAR_UUID = self.TX_CHAR_UUID_V2
+                    self.RX_CHAR_UUID = self.RX_CHAR_UUID_V2
+                self._logger.debug(f"Lovense selected service={self.SERVICE_UUID} tx={self.TX_CHAR_UUID} rx={self.RX_CHAR_UUID}")
             elif v1_service:
                 self._logger.info(f"Detected Lovense v1 protocol for {self.device_name}")
                 self.is_v2_protocol = False
                 self.SERVICE_UUID = self.SERVICE_UUID_V1
                 self.TX_CHAR_UUID = self.TX_CHAR_UUID_V1
                 self.RX_CHAR_UUID = self.RX_CHAR_UUID_V1
+                self._logger.debug(f"Lovense selected v1 service={self.SERVICE_UUID} tx={self.TX_CHAR_UUID} rx={self.RX_CHAR_UUID}")
             else:
                 self._logger.error(f"No compatible Lovense service found for {self.device_name}")
                 return False
@@ -203,11 +223,32 @@ class LovenseProtocol(DeviceProtocol):
                 command = f"Vibrate:{level};"
                 
             # Send command
-            await self._client.write_gatt_char(
-                self.TX_CHAR_UUID, 
-                command.encode('utf-8')
-            )
-            
+            try:
+                await self._client.write_gatt_char(
+                    self.TX_CHAR_UUID, 
+                    command.encode('utf-8')
+                )
+            except Exception as e_first:
+                # If using an alt mapping, optionally try the standard v2 tx char as a fallback (or vice versa)
+                fallback_tried = False
+                if self.is_v2_protocol:
+                    alt_candidates = []
+                    if self.TX_CHAR_UUID == self.TX_CHAR_UUID_V2_ALT:
+                        alt_candidates.append(self.TX_CHAR_UUID_V2)
+                    elif self.TX_CHAR_UUID == self.TX_CHAR_UUID_V2:
+                        alt_candidates.append(self.TX_CHAR_UUID_V2_ALT)
+                    for alt in alt_candidates:
+                        try:
+                            await self._client.write_gatt_char(alt, command.encode('utf-8'))
+                            self._logger.warning(
+                                f"Primary TX {self.TX_CHAR_UUID} failed ({e_first}); fallback succeeded using {alt}"
+                            )
+                            fallback_tried = True
+                            break
+                        except Exception:
+                            continue
+                if not fallback_tried:
+                    raise e_first
             self._logger.debug(f"Sent vibrate command: {command}")
             return True
             
@@ -385,6 +426,7 @@ class DeviceProtocolManager:
     PROTOCOL_MAP = {
         "lovense": LovenseProtocol,
         "lovense_uart": LovenseProtocol,
+    "lovense_v2": LovenseProtocol,  # Map v2/alt identifiers to Lovense protocol
         "we_vibe": WeVibeProtocol,
         "generic": LovenseProtocol,  # Default to Lovense for generic devices
     }
@@ -402,6 +444,9 @@ class DeviceProtocolManager:
             Protocol instance or None if unsupported
         """
         protocol_class = cls.PROTOCOL_MAP.get(protocol_name)
+        # Fallback: any unrecognised protocol beginning with 'lovense' should use LovenseProtocol
+        if protocol_class is None and protocol_name and protocol_name.startswith("lovense"):
+            protocol_class = LovenseProtocol
         if protocol_class:
             return protocol_class(device_address, device_name)
         return None

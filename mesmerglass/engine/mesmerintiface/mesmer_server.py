@@ -462,6 +462,9 @@ class MesmerIntifaceServer(ButtplugServer):
             )
             
             protocol_name = device_def.protocol if device_def else device_info.protocol or "generic"
+            # Normalise certain protocol aliases (e.g. 'lovense_v2' -> 'lovense') for manager lookup
+            if protocol_name.startswith("lovense_v2"):
+                protocol_name = "lovense_v2"  # explicit key now in map
             
             # Create protocol instance
             protocol = self._protocol_manager.create_protocol(
@@ -479,6 +482,12 @@ class MesmerIntifaceServer(ButtplugServer):
                         self._device_protocols[address] = protocol
                         self._logger.info(f"Initialized {protocol_name} protocol for {address}")
                         return True
+                    else:
+                        self._logger.error(f"Protocol initialize() returned False for {address} proto={protocol_name}")
+                else:
+                    self._logger.error(f"No connected client found for {address} when initializing protocol {protocol_name}")
+            else:
+                self._logger.error(f"Unsupported protocol '{protocol_name}' for device {address} ({device_info.name})")
                         
             return False
             

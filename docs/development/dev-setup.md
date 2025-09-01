@@ -254,3 +254,27 @@ python package.py
 - Follow code style
 - Include tests
 - Update docs
+
+## BLE UUID Inspector
+
+To aid adding new Bluetooth toys, use the inspector tool:
+
+```powershell
+python -m mesmerglass.devtools.ble_inspect --scan-seconds 6
+```
+
+Interactive mode lists discovered devices and lets you choose one to dump all services & characteristics.
+
+Flags:
+- `--address AA:BB:CC:DD:EE:FF` inspect directly (skips interactive list)
+- `--json` machine-readable output
+- `--scan-seconds N` adjust discovery window (default 5)
+- `--active` attempt an active scan (or set `MESMERGLASS_BLE_ACTIVE_SCAN=1`)
+
+Runtime logging of full services is now suppressed unless you set:
+
+```powershell
+$env:MESMERGLASS_BLE_SERVICE_DUMP = "1"
+```
+
+Add any new service UUIDs you discover to `KNOWN_SERVICE_UUIDS` in `bluetooth_scanner.py` or extend protocol classes.

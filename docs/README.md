@@ -15,6 +15,7 @@ Documentation for developers:
 - **[Development Setup](development/dev-setup.md)** - Setting up development environment
 - **[Testing](development/testing.md)** - Running tests and validation
 - **[MesmerIntiface Complete](development/mesmerintiface-complete.md)** - Technical implementation details
+- **[BLE UUID Inspector](development/ble-inspector.md)** - Discover services & characteristics for new devices
 
 ### 🔧 Technical Reference (`/technical/`)
 Technical specifications and architecture:

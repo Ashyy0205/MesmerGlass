@@ -7,9 +7,14 @@ Scans for and identifies sex toys and haptic devices that support the Buttplug p
 import asyncio
 import logging
 from typing import Dict, List, Optional, Callable, Set
+import os  # env-based debug/feature toggles
 from dataclasses import dataclass
 import time  # monotonic timing for connection maintenance without relying on event loop time
 from bleak import BleakScanner, BleakClient  # BLEDevice type imported below from backend for typing only
+try:  # Device database provides richer name matching (e.g. LVS-R001 for Diamo)
+    from .device_database import DeviceDatabase
+except Exception:  # pragma: no cover - fallback if import error
+    DeviceDatabase = None  # type: ignore
 from bleak.backends.device import BLEDevice as BLEDeviceType
 
 @dataclass
@@ -33,6 +38,8 @@ class BluetoothDeviceScanner:
         "0000fff0-0000-1000-8000-00805f9b34fb": "lovense",
         "6e400001-b5a3-f393-e0a9-e50e24dcca9e": "lovense_uart",
         "5a300001-0023-4bd4-bbd5-a6920e4c5653": "lovense_v2",  # Lovense Hush and newer devices
+    # Lovense Diamo (field observation: variant service UUID 5230.... instead of 5a30....)
+    "52300001-0023-4bd4-bbd5-a6920e4c5653": "lovense_v2",
         
         # We-Vibe devices  
         "f000aa80-0451-4000-b000-000000000000": "we_vibe",
@@ -53,28 +60,31 @@ class BluetoothDeviceScanner:
     }
     
     def __init__(self, *, log_unknown: bool = False, repeat_interval: float = 30.0, verbose: bool = False):
+        # Core state containers
         self._scanning = False
         self._scanner = None
         self._discovered_devices: Dict[str, BluetoothDeviceInfo] = {}
         self._device_callbacks: List[Callable[[List[BluetoothDeviceInfo]], None]] = []
         self._connected_clients: Dict[str, BleakClient] = {}
-        # Maintenance / logging controls
-        self._log_unknown = log_unknown
+
+        # Logging / verbosity controls (env overrides take precedence if set)
+        env_verbose = os.environ.get("MESMERGLASS_BLE_VERBOSE") == "1"
+        env_log_unknown = os.environ.get("MESMERGLASS_BLE_LOG_UNKNOWN") == "1"
+        self._log_unknown = log_unknown or env_log_unknown
         self._repeat_interval = repeat_interval  # seconds between repeat INFO logs per device
-        self._verbose = verbose
-        self._last_log_times: Dict[str, float] = {}  # address -> last INFO log monotonic time
-        self._seen_addresses: Set[str] = set()  # track addresses we've seen to avoid repeated 'first seen' logs for unknowns
-        # Counters for summary-only mode
+        self._verbose = verbose or env_verbose
+        self._last_log_times: Dict[str, float] = {}
+        self._seen_addresses: Set[str] = set()
         self._adv_total = 0
         self._adv_identified = 0
-        
-        # Setup logging with console output
+
+        # Logger (inherit handlers from global config)
         self._logger = logging.getLogger(__name__)
         self._logger.setLevel(logging.INFO)
-    # Rely on application/global logging config; avoid attaching our own stream handler
-    # to prevent writing to closed streams during test runner shutdown.
-            
+
         self._shutdown = False
+        self._db = DeviceDatabase() if DeviceDatabase is not None else None
+        self._keep_unknown = os.environ.get("MESMERGLASS_BLE_KEEP_UNKNOWN") == "1"
         
     def add_device_callback(self, callback: Callable[[List[BluetoothDeviceInfo]], None]) -> None:
         """Add callback for device discovery updates."""
@@ -104,8 +114,20 @@ class BluetoothDeviceScanner:
             self._adv_identified = 0
             self._logger.info("Starting Bluetooth LE device scan")
             
-            # Start scanning with device detection callback
-            self._scanner = BleakScanner(detection_callback=self._on_device_detected)
+            # Start scanning with device detection callback.
+            # Allow env override to request 'active' scan mode (platform/bleak dependent).
+            active_scan = os.environ.get("MESMERGLASS_BLE_ACTIVE_SCAN") == "1"
+            scanner = None
+            if active_scan:
+                try:
+                    # Bleak implementations may support scanning_mode kw only on some platforms
+                    scanner = BleakScanner(detection_callback=self._on_device_detected, scanning_mode="active")  # type: ignore[arg-type]
+                    self._logger.info("Bluetooth scanner using ACTIVE mode")
+                except Exception:
+                    scanner = None
+            if scanner is None:
+                scanner = BleakScanner(detection_callback=self._on_device_detected)
+            self._scanner = scanner
             await self._scanner.start()
             
             if duration:
@@ -311,7 +333,7 @@ class BluetoothDeviceScanner:
                         else:
                             raise
             else:
-                # Unknown device path: suppress per-device INFO in summary-only mode unless verbose/log_unknown
+                # Unknown device path: suppress per-device INFO unless verbose/log_unknown enabled.
                 if self._verbose or self._log_unknown:
                     now = time.monotonic(); last = self._last_log_times.get(addr, 0.0)
                     if self._verbose or (now - last >= self._repeat_interval) or first_seen:
@@ -323,7 +345,22 @@ class BluetoothDeviceScanner:
                         self._logger.debug(
                             f"BLE adv: {device.name or 'Unknown'} ({addr}) RSSI {advertisement_data.rssi}"
                         )
-                # Not storing unknown devices to keep discovered list focused, unless future need arises.
+                # If feature flag set, retain unknown devices so user can observe them in UI.
+                if self._keep_unknown:
+                    self._discovered_devices[addr] = device_info
+                    try:
+                        self._notify_device_callbacks()
+                    except Exception:
+                        pass
+                # Optional raw dump of unknown adverts for debugging (name + UUIDs + manufacturer data lengths)
+                if os.environ.get("MESMERGLASS_BLE_DUMP_UNKNOWN") == "1":
+                    try:
+                        mdata = {k: len(v) for k, v in (advertisement_data.manufacturer_data or {}).items()}
+                        self._logger.info(
+                            f"RAW UNKNOWN ADV name={device.name!r} addr={addr} uuids={[str(u) for u in advertisement_data.service_uuids]} mfg={mdata} RSSI={advertisement_data.rssi}"
+                        )
+                    except Exception:
+                        pass
         except Exception as e:
             if not self._shutdown:
                 self._logger.error(f"Error processing detected device: {e}")
@@ -337,29 +374,43 @@ class BluetoothDeviceScanner:
         Returns:
             Tuple of (device_type, protocol) or (None, None) if not recognized.
         """
-        # Check service UUIDs
+    # 1. Service UUID heuristic
         for service_uuid in device_info.service_uuids:
             service_uuid_lower = service_uuid.lower()
             if service_uuid_lower in self.KNOWN_SERVICE_UUIDS:
                 protocol = self.KNOWN_SERVICE_UUIDS[service_uuid_lower]
                 return ("sex_toy", protocol)
                 
-        # Check manufacturer data
+        # 2. Manufacturer data
         for company_id in device_info.manufacturer_data:
             if company_id in self.KNOWN_MANUFACTURERS:
                 protocol = self.KNOWN_MANUFACTURERS[company_id]
                 return ("sex_toy", protocol)
                 
-        # Check device name patterns (more comprehensive)
+        # 3. Device database lookup (covers variants like LVS-R001 for Diamo)
+        if self._db and device_info.name:
+            try:
+                # Attempt identification using database name + any captured services
+                db_match = self._db.identify_device(device_info.name, device_info.service_uuids)
+                if db_match:
+                    return ("sex_toy", db_match.protocol or "generic")
+            except Exception:  # pragma: no cover (defensive)
+                pass
+
+        # 4. Device name pattern fallback
         if device_info.name:
             name_lower = device_info.name.lower()
             
             # Known brands
             brand_patterns = [
+                # Core brands / product lines
                 "lovense", "we-vibe", "kiiroo", "satisfyer", "lelo", "wevibe",
                 "fleshlight", "ohmibod", "mysteryvibe", "magic motion", "svakom",
+                # Common Lovense product codenames
                 "calor", "edge", "hush", "lush", "nora", "max", "osci", "sync",
-                "pivot", "nova", "domi", "ferri", "diamo", "mission", "ambi"
+                "pivot", "nova", "domi", "ferri", "diamo", "mission", "ambi",
+                # Additional variant prefixes observed in field (e.g. LVS-R001 for Diamo revisions)
+                "lvs-r",  # NEW: capture Diamo style variant codes
             ]
             
             for pattern in brand_patterns:
@@ -390,12 +441,19 @@ class BluetoothDeviceScanner:
         """Discover and log device services and characteristics."""
         try:
             services = client.services
-            self._logger.info(f"Device {device_info.address} services:")
-            
-            for service in services:
-                self._logger.info(f"  Service: {service.uuid}")
-                for char in service.characteristics:
-                    self._logger.info(f"    Characteristic: {char.uuid} (properties: {char.properties})")
+            dump = os.environ.get("MESMERGLASS_BLE_SERVICE_DUMP") == "1"
+            if dump:
+                self._logger.info(f"Device {device_info.address} services:")
+                for service in services:
+                    self._logger.info(f"  Service: {service.uuid}")
+                    for char in service.characteristics:
+                        self._logger.info(f"    Characteristic: {char.uuid} (properties: {char.properties})")
+            else:
+                try:
+                    svc_count = len(list(services))
+                    self._logger.debug(f"Discovered {svc_count} services for {device_info.name or device_info.address}")
+                except Exception:
+                    pass
                     
         except Exception as e:
             self._logger.error(f"Error discovering services for {device_info.address}: {e}")
