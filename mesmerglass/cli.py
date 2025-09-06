@@ -157,8 +157,26 @@ def build_parser() -> argparse.ArgumentParser:
     p_spiral.add_argument("--blend", choices=["multiply","screen","softlight"], default="multiply", help="Blend mode (default: multiply)")
     p_spiral.add_argument("--duration", type=float, default=5.0, help="Seconds to run (default: 5)")
     p_spiral.add_argument("--render-scale", choices=["1.0","0.85","0.75"], default="1.0", help="Render scale (default: 1.0)")
+    p_spiral.add_argument("--supersampling", type=int, choices=[1,4,9,16], default=4, help="Anti-aliasing samples: 1=none, 4=2x2, 9=3x3, 16=4x4 (default: 4)")
+    p_spiral.add_argument("--precision", choices=["low","medium","high"], default="high", help="Floating-point precision level (default: high)")
+    p_spiral.add_argument("--debug-gl-state", action="store_true", help="Print OpenGL state information for debugging")
+    p_spiral.add_argument("--test-opaque", action="store_true", help="Render fully opaque with blending off to test compositor artifacts")
+    p_spiral.add_argument("--test-offscreen", action="store_true", help="Render to RGBA16F FBO and save to PNG for artifact isolation")
+    p_spiral.add_argument("--test-legacy-blend", action="store_true", help="Use legacy alpha blending instead of premultiplied (for comparison)")
+    p_spiral.add_argument("--disable-srgb", action="store_true", help="Disable sRGB framebuffer for gamma-incorrect blending test")
+    p_spiral.add_argument("--internal-opacity", action="store_true", help="Use internal opacity blending with opaque window (bypasses DWM dithering)")
+    p_spiral.add_argument("--proof-window-opacity", type=float, metavar="0.0-1.0", help="Proof test: Set window opacity (will show DWM dithering)")
+    p_spiral.add_argument("--check-window-flags", action="store_true", help="Check Windows API flags (WS_EX_LAYERED) for DWM dithering diagnosis")
     p_spiral.add_argument("--force", action="store_true", help="Bypass GL availability probe and attempt to run anyway")
     p_spiral.add_argument("--screen", type=int, default=0, help="Screen index to target for spiral overlay (default: 0)")
+    p_spiral.add_argument("--raw-window", action="store_true", help="Use QOpenGLWindow instead of QOpenGLWidget (bypasses Qt FBO blit)")
+    p_spiral.add_argument("--desktop-gl", action="store_true", help="Force desktop OpenGL (no ANGLE/D3D)")
+    p_spiral.add_argument("--no-msaa", action="store_true", help="Disable all MSAA/multisampling")
+    p_spiral.add_argument("--debug-gl-info", action="store_true", help="Print detailed OpenGL implementation info")
+    p_spiral.add_argument("--test-offscreen-png", action="store_true", help="Render to RGBA16F FBO and save PNG (isolation test)")
+    p_spiral.add_argument("--no-overlays", action="store_true", help="Disable all overlays/widgets (pure GL window)")
+    p_spiral.add_argument("--window-test", action="store_true", help="Use raw QWindow + OpenGL context (bypasses all Qt widgets)")
+    p_spiral.add_argument("--move-scale-test", action="store_true", help="Test if artifacts are screen-fixed or content-fixed (drag/scale window)")
 
     # Test runner integration (wraps previous run_tests.py functionality)
     p_tr = sub.add_parser("test-run", help="Run pytest with selection shortcuts (replaces run_tests.py)")
@@ -186,7 +204,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 def cmd_spiral_test(args) -> None:
-    """Run bounded MesmerLoom spiral render with strict exit codes.
+    """Run bounded MesmerLoom spiral render with systematic artifact isolation.
 
     Exit codes:
       0 success
@@ -194,10 +212,38 @@ def cmd_spiral_test(args) -> None:
       1 unexpected error
     """
     import sys, time as _time
+    
+    # Test 2: Force desktop OpenGL (no ANGLE) - set BEFORE any Qt imports
+    if getattr(args, 'desktop_gl', False):
+        import os
+        os.environ['QT_OPENGL'] = 'desktop'
+        # Also try the attribute method
+        try:
+            from PyQt6.QtCore import QCoreApplication, Qt
+            QCoreApplication.setAttribute(Qt.ApplicationAttribute.AA_UseDesktopOpenGL, True)
+            print("TEST MODE 2: Desktop OpenGL forced (no ANGLE/D3D)")
+            print("If clean on desktop GL but not default → ANGLE/D3D dithering")
+            print("----------------------------------------------------------------------")
+        except ImportError:
+            pass
+    
+    # Test 3: Disable MSAA/multisampling - set BEFORE QApplication
+    if getattr(args, 'no_msaa', False):
+        try:
+            from PyQt6.QtGui import QSurfaceFormat
+            fmt = QSurfaceFormat()
+            fmt.setSamples(0)
+            QSurfaceFormat.setDefaultFormat(fmt)
+            print("TEST MODE 3: MSAA/multisampling disabled")  
+            print("If artifacts persist → not MSAA/coverage related")
+            print("----------------------------------------------------------------------")
+        except ImportError:
+            pass
+    
     # Imports
     try:
         from .mesmerloom.spiral import SpiralDirector as LoomDirector
-        from .mesmerloom.compositor import Compositor, probe_available
+        from .mesmerloom.compositor import LoomCompositor, probe_available
     except Exception as e:
         print("MesmerLoom spiral-test: GL unavailable: import failure", e)
         sys.exit(77)
@@ -213,15 +259,240 @@ def cmd_spiral_test(args) -> None:
             if not probe_ok:
                 print("MesmerLoom spiral-test: probe inconclusive; attempting context anyway...")
         from PyQt6.QtWidgets import QApplication
+        from PyQt6.QtCore import Qt
+        import logging
+        
+        # B) Force opaque default framebuffer (no alpha buffer)
+        try:
+            from PyQt6.QtOpenGL import QSurfaceFormat
+            fmt = QSurfaceFormat()
+            fmt.setAlphaBufferSize(0)  # Force no alpha - prevents Qt compositing artifacts
+            fmt.setRenderableType(QSurfaceFormat.RenderableType.OpenGL)
+            QSurfaceFormat.setDefaultFormat(fmt)
+            logging.getLogger(__name__).info("[spiral.trace] QSurfaceFormat configured: alphaBufferSize=0")
+        except ImportError:
+            try:
+                from PyQt6.QtGui import QSurfaceFormat
+                fmt = QSurfaceFormat()
+                fmt.setAlphaBufferSize(0)
+                fmt.setRenderableType(QSurfaceFormat.RenderableType.OpenGL)
+                QSurfaceFormat.setDefaultFormat(fmt)
+                logging.getLogger(__name__).info("[spiral.trace] QSurfaceFormat configured: alphaBufferSize=0 (via QtGui)")
+            except ImportError as e:
+                logging.getLogger(__name__).warning(f"[spiral.trace] Could not configure QSurfaceFormat: {e}")
+        
         app = QApplication.instance() or QApplication([])
         director = LoomDirector(seed=7)
         try:
             director.set_intensity(max(0.0, min(1.0, float(getattr(args, "intensity", 0.75)))))
+            # Set supersampling level for anti-aliasing
+            director.set_supersampling(getattr(args, "supersampling", 4))
+            # Set precision level
+            director.set_precision(getattr(args, "precision", "high"))
         except Exception:
             pass
-        comp = LoomCompositor(director)
-        comp.resize(640, 360)
+        
+        # Test 1: Choose compositor implementation based on test mode
+        if getattr(args, 'window_test', False):
+            # Use raw QWindow to bypass ALL Qt widget compositing
+            try:
+                from .mesmerloom.raw_qwindow import RawOpenGLWindow
+                comp = RawOpenGLWindow(director)
+                comp.resize(1920, 1080)
+                print("ISOLATION TEST: Raw QWindow + OpenGL context")
+                print("Bypasses ALL Qt widget/FBO compositing completely")
+                print("If artifacts disappear → Qt widget pipeline was the culprit")
+                print("----------------------------------------------------------------------")
+            except ImportError as e:
+                print(f"Raw QWindow test unavailable: {e}")
+                print("Falling back to regular QOpenGLWidget...")
+                comp = LoomCompositor(director)
+                comp.resize(640, 360)
+        else:
+            # Use QOpenGLWindow by default (artifact-free)
+            try:
+                from .mesmerloom.window_compositor import LoomWindowCompositor
+                comp = LoomWindowCompositor(director)
+                comp.resize(1920, 1080)
+                print("DEFAULT: QOpenGLWindow compositor (artifact-free)")
+                print("Direct window rendering - no Qt widget FBO blit artifacts")
+                print("----------------------------------------------------------------------")
+            except ImportError as e:
+                print(f"QOpenGLWindow compositor unavailable: {e}")
+                print("Falling back to QOpenGLWidget (has FBO blit artifacts)...")
+                # Fallback to regular QOpenGLWidget implementation
+                comp = LoomCompositor(director)
+                comp.resize(640, 360)
+        
+        # Configure window transparency based on mode
+        internal_opacity = getattr(sys.modules.get(__name__), '_internal_opacity_mode', False)
+        proof_window_opacity = getattr(args, 'proof_window_opacity', None)
+        check_flags = getattr(args, 'check_window_flags', False)
+        
+        # Check if this is a QOpenGLWindow or QOpenGLWidget
+        is_window_compositor = hasattr(comp, 'setFlags')  # QOpenGLWindow has setFlags, QWidget has setAttribute
+        
+        if proof_window_opacity is not None:
+            # Proof test: Use window-level opacity (will show DWM dithering)
+            proof_opacity = max(0.0, min(1.0, proof_window_opacity))
+            if not is_window_compositor:
+                comp.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+            comp.setWindowOpacity(proof_opacity)
+            logging.getLogger(__name__).info(f"[spiral.trace] PROOF TEST: Window opacity set to {proof_opacity} (expect DWM dithering)")
+        elif internal_opacity:
+            # Internal opacity mode: Force truly opaque window to bypass DWM dithering
+            comp.setWindowOpacity(1.0)
+            if not is_window_compositor:
+                comp.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
+                comp.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+                comp.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
+            logging.getLogger(__name__).info("[spiral.trace] Window set to TRULY opaque for internal opacity mode")
+        else:
+            # Standard mode: Use translucent window (subject to DWM dithering)
+            if not is_window_compositor:
+                comp.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+            comp.setWindowOpacity(1.0)  # Let shader handle alpha blending
         comp.set_active(True)
+        # Store debug flag for compositor to use
+        if getattr(args, 'debug_gl_state', False):
+            print("OpenGL State Debugging Mode")
+            print("-" * 30)
+            # Set module-level flag for compositor to detect
+            import sys
+            sys.modules[__name__]._debug_gl_state = True
+        
+        if getattr(args, 'test_opaque', False):
+            print("TEST MODE: Fully opaque rendering with blending disabled")
+            print("If artifacts disappear → compositor/layered-window issue")
+            print("-" * 50)
+            # Set module-level flag for compositor to detect
+            import sys
+            sys.modules[__name__]._test_opaque_mode = True
+            
+        if getattr(args, 'test_offscreen', False):
+            print("TEST MODE: Offscreen RGBA16F rendering to isolate shader artifacts")
+            print("Will save to spiral_test_output.png for inspection")
+            print("-" * 50)
+            # Set module-level flag for compositor to detect
+            import sys
+            sys.modules[__name__]._test_offscreen_mode = True
+            
+        if getattr(args, 'test_legacy_blend', False):
+            print("TEST MODE: Using legacy alpha blending (for comparison)")
+            print("This may show compositor artifacts that premultiplied alpha fixes")
+            print("-" * 50)
+            # Set module-level flag for compositor to detect
+            import sys
+            sys.modules[__name__]._test_legacy_blend = True
+            
+        if getattr(args, 'disable_srgb', False):
+            print("TEST MODE: sRGB framebuffer disabled (gamma-incorrect blending)")
+            print("Testing if artifacts are related to gamma correction")
+            print("-" * 50)
+            # Set module-level flag for compositor to detect
+            import sys
+            sys.modules[__name__]._disable_srgb_framebuffer = True
+            
+        if getattr(args, 'test_offscreen_png', False):
+            print("ISOLATION TEST: Offscreen RGBA16F PNG render")
+            print("Clean PNG = presentation issue, Dirty PNG = shader/math issue")
+            print("Will save to spiral_offscreen_test.png")
+            print("-" * 50)
+            # Set module-level flag for compositor to detect
+            import sys
+            sys.modules[__name__]._test_offscreen_png = True
+            
+        if getattr(args, 'no_overlays', False):
+            print("ISOLATION TEST: No overlays/widgets (pure GL window)")
+            print("Tests if Qt widgets/overlays trigger compositor artifacts")
+            print("-" * 50)
+            # Set module-level flag for compositor to detect
+            import sys
+            sys.modules[__name__]._no_overlays_mode = True
+            
+        if getattr(args, 'move_scale_test', False):
+            print("ISOLATION TEST: Move/Scale Pattern Check")
+            print("Drag and scale the window during the test:")
+            print("• Pattern fixed to screen → post-render (compositor/driver/monitor)")
+            print("• Pattern scales with content → your rendering path")
+            print("-" * 50)
+            
+        if getattr(args, 'internal_opacity', False):
+            print("SOLUTION MODE: Internal opacity blending with opaque window")
+            print("This bypasses Windows DWM dithering by keeping window opaque")
+            print("Opacity blending happens inside the shader: mix(bgColor, spiralColor, opacity)")
+            print("-" * 70)
+            # Set module-level flag for compositor to detect
+            import sys
+            sys.modules[__name__]._internal_opacity_mode = True
+            
+        # Debug OpenGL implementation info
+        if getattr(args, 'debug_gl_info', False):
+            def print_gl_info():
+                try:
+                    from OpenGL import GL
+                    version = GL.glGetString(GL.GL_VERSION)
+                    renderer = GL.glGetString(GL.GL_RENDERER) 
+                    vendor = GL.glGetString(GL.GL_VENDOR)
+                    print(f"OpenGL Version: {version.decode() if version else 'Unknown'}")
+                    print(f"OpenGL Renderer: {renderer.decode() if renderer else 'Unknown'}")
+                    print(f"OpenGL Vendor: {vendor.decode() if vendor else 'Unknown'}")
+                    
+                    # Check for ANGLE
+                    if renderer and b"ANGLE" in renderer:
+                        print("⚠️  ANGLE detected - using D3D backend (may cause dithering)")
+                    else:
+                        print("✅ Desktop OpenGL detected")
+                    
+                    # Test 3: Check multisampling status
+                    try:
+                        multisample_enabled = GL.glIsEnabled(GL.GL_MULTISAMPLE)
+                        sample_buffers = GL.glGetIntegerv(GL.GL_SAMPLE_BUFFERS)
+                        samples = GL.glGetIntegerv(GL.GL_SAMPLES)
+                        print(f"GL_MULTISAMPLE enabled: {multisample_enabled}")
+                        print(f"Sample buffers: {sample_buffers}")
+                        print(f"Samples: {samples}")
+                        
+                        # Disable multisampling for test
+                        if getattr(args, 'no_msaa', False):
+                            GL.glDisable(GL.GL_MULTISAMPLE)
+                            try:
+                                GL.glDisable(0x8C36)  # GL_SAMPLE_SHADING
+                            except Exception:
+                                pass
+                            print("✅ Multisampling disabled for test")
+                            
+                    except Exception as e:
+                        print(f"Could not query/disable multisampling: {e}")
+                        
+                except Exception as e:
+                    print(f"Could not query OpenGL info: {e}")
+            
+            # Schedule GL info print after context is ready
+            from PyQt6.QtCore import QTimer
+            QTimer.singleShot(100, print_gl_info)
+            
+        def check_window_layered_status(widget):
+            """Check if window has WS_EX_LAYERED flag (indicates DWM will dither)"""
+            try:
+                hwnd = int(widget.winId())
+                from ctypes import windll, wintypes
+                GetWindowLongPtr = windll.user32.GetWindowLongPtrW
+                GWL_EXSTYLE = -20
+                WS_EX_LAYERED = 0x00080000
+                ex = GetWindowLongPtr(hwnd, GWL_EXSTYLE)
+                is_layered = bool(ex & WS_EX_LAYERED)
+                print(f"Windows API Check: WS_EX_LAYERED = {is_layered}")
+                print(f"Extended Style = 0x{ex:08X}")
+                if is_layered:
+                    print("⚠️  WARNING: Window is layered - DWM will apply dithering!")
+                    print("   Fix: Ensure WA_TranslucentBackground=False and windowOpacity=1.0")
+                else:
+                    print("✅ GOOD: Window is opaque - no DWM dithering expected")
+                return is_layered
+            except Exception as e:
+                print(f"Could not check window flags: {e}")
+                return None
         # Assign to requested screen if available
         try:
             screens = app.screens()
@@ -232,14 +503,45 @@ def cmd_spiral_test(args) -> None:
             print(f"spiral-test: could not assign to screen {getattr(args, 'screen', 0)}: {e}")
         comp.showFullScreen()
         # Process events to allow initializeGL to run regardless of force.
-        cycles = 10 if not getattr(args, 'force', False) else 4
-        for _ in range(cycles):
+        cycles = 20 if not getattr(args, 'force', False) else 8  # Increased wait cycles
+        for i in range(cycles):
             app.processEvents()
             if getattr(comp, 'available', False):
                 break
+            if i % 5 == 0:  # Debug every 5th cycle
+                logging.getLogger(__name__).info(f"[spiral.trace] Waiting for GL context... cycle {i+1}/{cycles}, available={getattr(comp, 'available', False)}")
         if not getattr(comp, 'available', False):
+            logging.getLogger(__name__).error(f"[spiral.trace] GL context check failed: available={getattr(comp, 'available', None)}, initialized={getattr(comp, '_initialized', None)}")
             print("MesmerLoom spiral-test: GL unavailable: context failure")
+            print("Try running with --force to bypass this check")
             sys.exit(77)
+            
+        # Check Windows API flags for DWM dithering diagnosis
+        if check_flags or internal_opacity:
+            print("\n" + "="*50)
+            print("WINDOWS API DIAGNOSTIC CHECK")
+            print("="*50)
+            try:
+                check_window_layered_status(comp)
+            except Exception as e:
+                print(f"Could not check window layered status: {e}")
+            
+            # B) Verify framebuffer has no alpha (for QOpenGLWidget)
+            try:
+                if hasattr(comp, 'format'):
+                    alpha_size = comp.format().alphaBufferSize()
+                    print(f"OpenGL alphaBufferSize = {alpha_size}")
+                    if alpha_size > 0:
+                        print("⚠️  WARNING: Framebuffer has alpha channel - may cause Qt compositing artifacts!")
+                        print("   Fix: Ensure QSurfaceFormat.setAlphaBufferSize(0) before QApplication")
+                    else:
+                        print("✅ GOOD: Framebuffer is opaque (no alpha channel)")
+                else:
+                    print("✅ QOpenGLWindow: No widget framebuffer (direct rendering)")
+            except Exception as e:
+                print(f"Could not check framebuffer format: {e}")
+                
+            print("="*50 + "\n")
         # Configure and run loop
         blend_map = {"multiply": 0, "screen": 1, "softlight": 2}
         try:
@@ -258,9 +560,7 @@ def cmd_spiral_test(args) -> None:
             if elapsed >= dur:
                 break
             dt = now - last; last = now
-            director.update(dt)
-            comp.set_uniforms_from_director(director.export_uniforms())
-            comp.request_draw()
+            # The compositor automatically handles director updates and uniform setting in paintGL
             app.processEvents()
             frames += 1
             # Frame pacing (~60fps) to avoid runaway CPU loop on headless

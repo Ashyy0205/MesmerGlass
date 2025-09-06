@@ -121,8 +121,18 @@ class Launcher(QMainWindow):
         # MesmerLoom compositor (may be None / unavailable headless)
         self.compositor = None
         try:
-            if LoomCompositor is not None:
-                self.compositor = LoomCompositor(self.spiral_director, parent=self)
+            # Try QOpenGLWindow compositor first (artifact-free)
+            try:
+                from ..mesmerloom.window_compositor import LoomWindowCompositor
+                self.compositor = LoomWindowCompositor(self.spiral_director)
+                logging.getLogger(__name__).info("[spiral.trace] LoomWindowCompositor created successfully (artifact-free)")
+            except ImportError:
+                # Fallback to QOpenGLWidget compositor (has FBO artifacts)
+                if LoomCompositor is not None:
+                    self.compositor = LoomCompositor(self.spiral_director, parent=self)
+                    logging.getLogger(__name__).info("[spiral.trace] LoomCompositor fallback created (has FBO artifacts)")
+                    
+            if self.compositor:
                 self.compositor.set_active(False)
         except Exception:
             self.compositor = None

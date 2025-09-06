@@ -128,10 +128,13 @@ Run a short GPU spiral render for benchmarking / CI availability checks.
 
 Arguments:
 - `--video <path>` optional background video (default: solid fallback)
-- `--intensity 0..1` starting intensity (default: 0.5)
+- `--intensity 0..1` starting intensity (default: 0.75)
 - `--blend {multiply,screen,softlight}` blend mode (default: multiply)
 - `--duration <seconds>` run time (default: 5.0)
 - `--render-scale {1.0,0.85,0.75}` offscreen scale (default: 1.0)
+- `--supersampling {1,4,9,16}` anti-aliasing level: 1=none, 4=2x2, 9=3x3, 16=4x4 (default: 4)
+- `--precision {low,medium,high}` floating-point precision level (default: high)
+- `--debug-gl-state` print OpenGL state information for debugging visual artifacts
 - `--screen <N>` select display index (0=primary, 1=secondary, ...)
 
 Exit Codes:
@@ -144,4 +147,7 @@ Examples:
 python -m mesmerglass spiral-test --screen 1 --duration 2
 python -m mesmerglass spiral-test --intensity 0.8 --blend screen --render-scale 0.85
 python -m mesmerglass spiral-test --video sample.mp4 --duration 4 --blend softlight
+python -m mesmerglass spiral-test --supersampling 16 --intensity 0.3 --duration 3
+python -m mesmerglass spiral-test --precision high --supersampling 4 --intensity 0.2
+python -m mesmerglass spiral-test --debug-gl-state --intensity 0.2 --duration 3
 ```

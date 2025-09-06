@@ -95,14 +95,14 @@ class PanelMesmerLoom(QWidget):
         except Exception: pass
     def _on_blend_mode(self, idx: int):
         self.blendModeChanged.emit(idx)
-        try: self.compositor.set_blend_mode(idx)
+        try: self.director.set_blend_mode(idx)
         except Exception: pass
     def _on_opacity(self, v: int):
         f = self._opacity(v); self.opacityChanged.emit(f)
-        try: self.compositor.set_opacity(f)
+        try: self.director.set_opacity(f)
         except Exception: pass
     def _on_arm_count(self, v: int):
-        try: self.compositor.set_arm_count(v)
+        try: self.director.set_arm_count(v)
         except Exception: pass
     def _pick_color(self, arm: bool):
         from PyQt6.QtWidgets import QColorDialog
@@ -113,8 +113,13 @@ class PanelMesmerLoom(QWidget):
         rgba = (col.redF(), col.greenF(), col.blueF(), col.alphaF())
         if arm:
             self._arm_rgba = rgba; self.armColorChanged.emit(rgba)
+            try: self.director.set_arm_color(col.redF(), col.greenF(), col.blueF())
+            except Exception: pass
         else:
             self._gap_rgba = rgba; self.gapColorChanged.emit(rgba)
+            try: self.director.set_gap_color(col.redF(), col.greenF(), col.blueF())
+            except Exception: pass
+        # Keep compositor call for any additional color processing
         try: self.compositor.set_color_params(self._arm_rgba, self._gap_rgba, self.cmb_color_mode.currentIndex(), {"amount": self._slider01(self.sld_mode_amount.value())})
         except Exception: pass
     def _on_color_mode(self, *_):

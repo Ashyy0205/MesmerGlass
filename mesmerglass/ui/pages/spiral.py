@@ -49,11 +49,11 @@ class SpiralPage(QtWidgets.QWidget):
 
     def _on_opacity(self, v: int):
         op = v/100.0
-        self.director.cfg.opacity = op
+        self.director.set_opacity(op)
         self.opacityChanged.emit(op)
 
     def _on_arms(self, v: int):
-        self.director.cfg.arms = int(v)
+        self.director.set_arm_count(int(v))
         self.armsChanged.emit(int(v))
 
 __all__ = ["SpiralPage"]

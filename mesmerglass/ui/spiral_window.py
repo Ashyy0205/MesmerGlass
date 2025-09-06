@@ -11,18 +11,27 @@ similar to the compositor: .set_uniforms_from_director(), .request_draw(),
 and .set_active(). Availability is proxied from the inner compositor.
 """
 from __future__ import annotations
-from PyQt6.QtWidgets import QWidget, QVBoxLayout
+from PyQt6.QtWidgets import QWidget, QVBoxLayout, QApplication
 from PyQt6.QtCore import Qt
 import os
 from typing import Any
 import logging
 
 try:
-    from ..mesmerloom.compositor import LoomCompositor
-    logging.getLogger(__name__).info("[spiral.trace] LoomCompositor import succeeded in spiral_window.py")
-except Exception as e:
-    logging.getLogger(__name__).error(f"[spiral.trace] LoomCompositor import failed in spiral_window.py: {e}")
-    LoomCompositor = None  # type: ignore
+    # Try QOpenGLWindow compositor first (artifact-free)
+    from ..mesmerloom.window_compositor import LoomWindowCompositor
+    logging.getLogger(__name__).info("[spiral.trace] LoomWindowCompositor import succeeded in spiral_window.py")
+    _USE_WINDOW_COMPOSITOR = True
+except ImportError:
+    # Fallback to QOpenGLWidget compositor (has FBO artifacts)
+    try:
+        from ..mesmerloom.compositor import LoomCompositor
+        logging.getLogger(__name__).info("[spiral.trace] LoomCompositor fallback import succeeded in spiral_window.py")
+        _USE_WINDOW_COMPOSITOR = False
+    except Exception as e:
+        logging.getLogger(__name__).error(f"[spiral.trace] All compositor imports failed in spiral_window.py: {e}")
+        LoomCompositor = None  # type: ignore
+        _USE_WINDOW_COMPOSITOR = False
 
 
 class SpiralWindow(QWidget):  # pragma: no cover - runtime/UI centric
@@ -102,9 +111,8 @@ class SpiralWindow(QWidget):  # pragma: no cover - runtime/UI centric
             )
         except Exception as e:
             logging.getLogger(__name__).warning(f"[spiral.trace] SpiralWindow.__init__: error logging screen info: {e}")
-        # Restore main compositor as child widget
+        # Restore main compositor as child widget or window
         try:
-            from ..mesmerloom.compositor import LoomCompositor
             self.showFullScreen()  # Make SpiralWindow itself fullscreen/top-level
             self.raise_()
             self.activateWindow()
@@ -112,15 +120,62 @@ class SpiralWindow(QWidget):  # pragma: no cover - runtime/UI centric
             assigned_screen = self.screen() if hasattr(self, 'screen') else None
             assigned_name = assigned_screen.name() if assigned_screen else None
             logging.getLogger(__name__).info(f"[spiral.trace] After showFullScreen: screen={assigned_name} geometry={self.geometry()} pos={self.pos()} size={self.size()}")
-            self.comp = LoomCompositor(director, parent=self)
-            lay.addWidget(self.comp)  # Layout will always fit the compositor
-            self.comp.show()
-            self.comp.raise_()
-            self.comp.activateWindow()
+            
+            if _USE_WINDOW_COMPOSITOR:
+                # Use QOpenGLWindow compositor (artifact-free)
+                self.comp = LoomWindowCompositor(director)
+                
+                # Set window properties for overlay behavior FIRST
+                self.comp.setFlags(Qt.WindowType.FramelessWindowHint | 
+                                  Qt.WindowType.WindowStaysOnTopHint |
+                                  Qt.WindowType.Tool)
+                
+                # Show fullscreen FIRST (this might move to wrong screen)
+                self.comp.showFullScreen()
+                
+                # CRITICAL: Set target screen AFTER showFullScreen() to override any auto-placement
+                screens = QApplication.screens()
+                if 0 <= screen_index < len(screens):
+                    target_screen = screens[screen_index]
+                    self.comp.setScreen(target_screen)
+                    logging.getLogger(__name__).info(f"[spiral.debug] QOpenGLWindow assigned to target screen: {target_screen.name()} (index {screen_index}) AFTER showFullScreen")
+                    
+                    # Force geometry to target screen to ensure proper placement
+                    target_geometry = target_screen.geometry()
+                    self.comp.setGeometry(target_geometry)
+                    logging.getLogger(__name__).info(f"[spiral.debug] QOpenGLWindow geometry forced to: {target_geometry}")
+                else:
+                    logging.getLogger(__name__).warning(f"[spiral.debug] Invalid screen_index {screen_index}, QOpenGLWindow using default screen")
+                
+                self.comp.raise_()
+                
+                logging.getLogger(__name__).info("SpiralWindow: LoomWindowCompositor created as separate window (artifact-free)")
+                logging.getLogger(__name__).info(f"[spiral.debug] QOpenGLWindow geometry after setup: {self.comp.geometry()}")
+                comp_screen = self.comp.screen()
+                comp_screen_name = comp_screen.name() if comp_screen else 'None'
+                logging.getLogger(__name__).info(f"[spiral.debug] QOpenGLWindow screen: {comp_screen_name}")
+                logging.getLogger(__name__).info(f"[spiral.debug] Parent SpiralWindow geometry: {self.geometry()}")
+                parent_screen = self.screen()
+                parent_screen_name = parent_screen.name() if parent_screen else 'None'
+                logging.getLogger(__name__).info(f"[spiral.debug] Parent SpiralWindow screen: {parent_screen_name}")
+            else:
+                # Fallback to QOpenGLWidget compositor (has FBO artifacts)
+                from ..mesmerloom.compositor import LoomCompositor
+                self.comp = LoomCompositor(director, parent=self)
+                lay.addWidget(self.comp)  # Layout will always fit the compositor
+                self.comp.show()
+                self.comp.raise_()
+                self.comp.activateWindow()
+                logging.getLogger(__name__).info("SpiralWindow: LoomCompositor attached to layout (fallback - has FBO artifacts)")
+            
             self.comp.update()  # Force GL context creation
-            logging.getLogger(__name__).info("SpiralWindow: LoomCompositor attached to layout and shown")
+            
             # Diagnostic: log widget visibility and GL context
-            logging.getLogger(__name__).info(f"[spiral.trace] SpiralWindow visible={self.isVisible()} comp visible={self.comp.isVisible()} comp geometry={self.comp.geometry()} size={self.comp.size()}")
+            if hasattr(self.comp, 'geometry'):
+                logging.getLogger(__name__).info(f"[spiral.trace] SpiralWindow visible={self.isVisible()} comp visible={self.comp.isVisible()} comp geometry={self.comp.geometry()} size={self.comp.size()}")
+            else:
+                logging.getLogger(__name__).info(f"[spiral.trace] SpiralWindow visible={self.isVisible()} comp visible=True (QOpenGLWindow)")
+                
             # QTimer to force delayed update
             from PyQt6.QtCore import QTimer
             def _delayed_update():
@@ -128,7 +183,7 @@ class SpiralWindow(QWidget):  # pragma: no cover - runtime/UI centric
                 logging.getLogger(__name__).info("SpiralWindow: QTimer forced comp.update() (delayed)")
             QTimer.singleShot(100, _delayed_update)
         except Exception as e:
-            logging.getLogger(__name__).error("SpiralWindow: LoomCompositor creation failed: %s", e)
+            logging.getLogger(__name__).error("SpiralWindow: Compositor creation failed: %s", e)
 
     # Facade methods -------------------------------------------------
     def set_active(self, active: bool):

@@ -61,6 +61,16 @@ class SpiralDirector:
         self._flip_elapsed = 0.0
         self._next_flip_in = self._schedule_next_flip(0.0)
         self._intensity_slew_cooldown = 0.0  # while >0 use half slew caps
+        
+        # Additional spiral parameters for shader
+        self.arm_count = 8
+        self.arm_color = (1.0, 1.0, 1.0)
+        self.gap_color = (0.0, 0.0, 0.0)
+        self.blend_mode = 0  # 0=multiply, 1=screen, 2=softlight
+        self.color = (1.0, 1.0, 1.0)
+        self.resolution = (1920, 1080)
+        self.super_samples = 4  # Anti-aliasing samples: 1=none, 4=2x2, 9=3x3, 16=4x4
+        self.precision_level = "high"  # low, medium, high
 
     # ---------------- Intensity & scaling ----------------
     def set_intensity(self, v: float):
@@ -90,6 +100,41 @@ class SpiralDirector:
     def set_vignette(self, v: float):
         self.VIGNETTE_MIN = max(0.0, min(v * 0.5, 2.0))
         self.VIGNETTE_MAX = max(self.VIGNETTE_MIN + 0.001, min(v * 1.5, 2.0))
+
+    def set_arm_count(self, count: int):
+        """Set number of spiral arms (2-16)."""
+        self.arm_count = max(2, min(16, int(count)))
+    
+    def set_arm_color(self, r: float, g: float, b: float):
+        """Set spiral arm color (RGB 0-1)."""
+        self.arm_color = (max(0.0, min(1.0, r)), max(0.0, min(1.0, g)), max(0.0, min(1.0, b)))
+    
+    def set_gap_color(self, r: float, g: float, b: float):
+        """Set spiral gap color (RGB 0-1)."""
+        self.gap_color = (max(0.0, min(1.0, r)), max(0.0, min(1.0, g)), max(0.0, min(1.0, b)))
+    
+    def set_blend_mode(self, mode: int):
+        """Set blend mode (0=multiply, 1=screen, 2=softlight)."""
+        self.blend_mode = max(0, min(2, int(mode)))
+    
+    def set_opacity(self, opacity: float):
+        """Set spiral opacity (0.0-1.0)."""
+        # Clamp to safe range and update state
+        self.state.opacity = max(self.OPACITY_MIN, min(self.OPACITY_MAX, opacity))
+    
+    def set_resolution(self, width: int, height: int):
+        """Set screen resolution for aspect ratio correction."""
+        self.resolution = (max(1, int(width)), max(1, int(height)))
+    
+    def set_supersampling(self, samples: int):
+        """Set anti-aliasing samples (1=none, 4=2x2, 9=3x3, 16=4x4)."""
+        valid_samples = [1, 4, 9, 16]
+        self.super_samples = samples if samples in valid_samples else 4
+    
+    def set_precision(self, level: str):
+        """Set floating-point precision level (low, medium, high)."""
+        valid_levels = ["low", "medium", "high"]
+        self.precision_level = level if level in valid_levels else "high"
 
     # ---------------- Flip scheduling ----------------
     def _schedule_next_flip(self, intensity: float) -> float:
@@ -193,12 +238,9 @@ class SpiralDirector:
     # ---------------- Export ----------------
     def export_uniforms(self) -> dict:
         s = self.state
-        # Add time, color, and resolution for shader compatibility
         now = time.time()
-        # Color and resolution can be set via setters if needed; fallback to defaults
-        color = getattr(self, 'color', (1.0, 1.0, 1.0))
-        resolution = getattr(self, 'resolution', (1920, 1080))
         return {
+            # Core SpiralDirector uniforms
             "uPhase": s.phase,
             "uBaseSpeed": s.base_speed,
             "uEffectiveSpeed": s.effective_speed,
@@ -212,7 +254,21 @@ class SpiralDirector:
             "uFlipState": s.flip_state,
             "uIntensity": s.intensity,
             "uSafetyClamped": 1 if s.safety_clamped else 0,
+            
+            # Time and resolution
+            "uTime": now,
+            "uResolution": self.resolution,
+            
+            # Visual parameters
+            "uArms": self.arm_count,
+            "uBlendMode": self.blend_mode,
+            "uArmColor": self.arm_color,
+            "uGapColor": self.gap_color,
+            "uSuperSamples": self.super_samples,
+            "uPrecisionLevel": {"low": 0, "medium": 1, "high": 2}.get(self.precision_level, 2),
+            
+            # Legacy compatibility
             "u_time": now,
-            "u_color": color,
-            "u_resolution": resolution,
+            "u_color": self.color,
+            "u_resolution": self.resolution,
         }

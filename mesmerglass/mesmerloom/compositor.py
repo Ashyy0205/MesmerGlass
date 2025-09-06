@@ -131,6 +131,106 @@ class LoomCompositor(QOpenGLWidget):  # type: ignore[misc]
         GL.glEnableVertexAttribArray(0); GL.glVertexAttribPointer(0, 2, GL.GL_FLOAT, False, stride, ctypes.c_void_p(0))
         GL.glEnableVertexAttribArray(1); GL.glVertexAttribPointer(1, 2, GL.GL_FLOAT, False, stride, ctypes.c_void_p(8))
         GL.glBindVertexArray(0)
+        
+    def _setup_offscreen_fbo(self):
+        """Setup offscreen RGBA16F FBO for isolation testing"""
+        from OpenGL import GL
+        
+        # Create texture
+        self.offscreen_texture = GL.glGenTextures(1)
+        GL.glBindTexture(GL.GL_TEXTURE_2D, self.offscreen_texture)
+        GL.glTexImage2D(GL.GL_TEXTURE_2D, 0, GL.GL_RGBA16F, 
+                       self.offscreen_width, self.offscreen_height, 0,
+                       GL.GL_RGBA, GL.GL_FLOAT, None)
+        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MIN_FILTER, GL.GL_LINEAR)
+        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MAG_FILTER, GL.GL_LINEAR)
+        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_S, GL.GL_CLAMP_TO_EDGE)
+        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_T, GL.GL_CLAMP_TO_EDGE)
+        
+        # Create FBO
+        self.offscreen_fbo = GL.glGenFramebuffers(1)
+        GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, self.offscreen_fbo)
+        GL.glFramebufferTexture2D(GL.GL_FRAMEBUFFER, GL.GL_COLOR_ATTACHMENT0, 
+                                 GL.GL_TEXTURE_2D, self.offscreen_texture, 0)
+        
+        # Check FBO completeness
+        status = GL.glCheckFramebufferStatus(GL.GL_FRAMEBUFFER)
+        if status != GL.GL_FRAMEBUFFER_COMPLETE:
+            logging.getLogger(__name__).error(f"[spiral.trace] Offscreen FBO incomplete: {status}")
+        else:
+            logging.getLogger(__name__).info("[spiral.trace] Offscreen RGBA16F FBO created successfully")
+        
+        # Restore default framebuffer
+        GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, 0)
+        GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
+        
+    def _render_offscreen_png(self):
+        """Render to offscreen FBO and save PNG for isolation testing"""
+        from OpenGL import GL
+        import numpy as np
+        from PIL import Image
+        
+        if not self.offscreen_fbo:
+            return
+            
+        # Render to offscreen FBO
+        GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, self.offscreen_fbo)
+        GL.glViewport(0, 0, self.offscreen_width, self.offscreen_height)
+        
+        # Clear
+        GL.glClearColor(0.2, 0.2, 0.2, 1.0)
+        GL.glClear(GL.GL_COLOR_BUFFER_BIT)
+        
+        # Disable blending for pure shader output
+        GL.glDisable(GL.GL_BLEND)
+        
+        # Set uniforms for test
+        if self._program:
+            GL.glUseProgram(self._program)
+            # Use current director parameters
+            uniforms = self.director.export_uniforms()
+            time_val = (time.time() - self._t0) * 0.5
+            
+            # Set standard uniforms
+            GL.glUniform1f(GL.glGetUniformLocation(self._program, "u_time"), time_val)
+            GL.glUniform1f(GL.glGetUniformLocation(self._program, "u_intensity"), uniforms.get('intensity', 0.25))
+            GL.glUniform2f(GL.glGetUniformLocation(self._program, "u_resolution"), 
+                          self.offscreen_width, self.offscreen_height)
+            GL.glUniform3f(GL.glGetUniformLocation(self._program, "u_bg_color"), 0.2, 0.2, 0.2)
+            GL.glUniform1i(GL.glGetUniformLocation(self._program, "u_internal_opacity"), 1)  # Force internal opacity
+            
+            # Render fullscreen quad
+            if self._vao:
+                GL.glBindVertexArray(self._vao)
+                GL.glDrawElements(GL.GL_TRIANGLES, 6, GL.GL_UNSIGNED_INT, None)
+                GL.glBindVertexArray(0)
+            
+            GL.glUseProgram(0)
+        
+        # Read pixels
+        GL.glFinish()  # Ensure rendering is complete
+        pixel_data = GL.glReadPixels(0, 0, self.offscreen_width, self.offscreen_height, 
+                                    GL.GL_RGBA, GL.GL_UNSIGNED_BYTE)
+        
+        # Convert to numpy array and flip Y (OpenGL vs image coordinate system)
+        img_array = np.frombuffer(pixel_data, dtype=np.uint8)
+        img_array = img_array.reshape((self.offscreen_height, self.offscreen_width, 4))
+        img_array = np.flipud(img_array)  # Flip Y axis
+        
+        # Convert to PIL Image and save
+        img = Image.fromarray(img_array, 'RGBA')
+        filename = "spiral_offscreen_test.png"
+        img.save(filename)
+        
+        # Restore default framebuffer
+        GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, 0)
+        GL.glViewport(0, 0, self.width(), self.height())
+        
+        logging.getLogger(__name__).info(f"[spiral.trace] Offscreen PNG saved: {filename}")
+        print(f"✅ OFFSCREEN PNG SAVED: {filename}")
+        print("View this file on another device to check for artifacts!")
+        
+        self.offscreen_rendered = True
     def __init__(self, director, parent=None, trace=False, sim_flag=False, force_flag=False, test_or_ci=False):
         import logging
         # Log parent and screen assignment
@@ -165,6 +265,13 @@ class LoomCompositor(QOpenGLWidget):  # type: ignore[misc]
         self._active = False
         self.available = False
         self._announced_available = False
+        
+        # Offscreen rendering support for isolation tests
+        self.offscreen_fbo = None
+        self.offscreen_texture = None
+        self.offscreen_rendered = False
+        self.offscreen_width = 1920
+        self.offscreen_height = 1080
         # Counters / tracing
         self._trace = bool(os.environ.get("MESMERGLASS_SPIRAL_TRACE"))
         self._log_interval = 60
@@ -591,6 +698,13 @@ class LoomCompositor(QOpenGLWidget):  # type: ignore[misc]
             # Defensive: only set uniforms if program is valid and uniform location is found
             self._start_timer()
             logging.getLogger(__name__).info(f"[spiral.trace] LoomCompositor.initializeGL timer started")
+            
+            # Setup offscreen FBO for isolation testing if requested
+            import sys
+            test_offscreen_png = getattr(sys.modules.get('mesmerglass.cli'), '_test_offscreen_png', False)
+            if test_offscreen_png:
+                self._setup_offscreen_fbo()
+            
             self._initialized = True
             self.available = True
             logging.getLogger(__name__).info(f"[spiral.trace] LoomCompositor.initializeGL success program={self._program}")
@@ -677,7 +791,104 @@ class LoomCompositor(QOpenGLWidget):  # type: ignore[misc]
         w_px = int(self.width()  * dpr)
         h_px = int(self.height() * dpr)
         GL.glViewport(0, 0, w_px, h_px)
+        
+        # Configure OpenGL state to eliminate visual artifacts
+        GL.glDisable(GL.GL_DITHER)              # Prevents ordered dithering patterns
+        GL.glDisable(GL.GL_SAMPLE_ALPHA_TO_COVERAGE)  # Prevents alpha-to-coverage artifacts with MSAA
+        GL.glDisable(GL.GL_POLYGON_SMOOTH)      # Disables legacy polygon smoothing
         GL.glDisable(GL.GL_DEPTH_TEST)
+        
+        # Check for offscreen PNG test after first few frames to ensure stable rendering
+        import sys
+        test_offscreen_png = getattr(sys.modules.get('mesmerglass.cli'), '_test_offscreen_png', False)
+        if test_offscreen_png and not self.offscreen_rendered and self._draw_count >= 60:
+            # Render offscreen PNG after 60 frames for stable results
+            self._render_offscreen_png()
+        
+        
+        # 5th suggestion: Enable sRGB framebuffer for gamma-correct blending (once only)
+        if not hasattr(self, '_srgb_setup_done'):
+            disable_srgb = False
+            try:
+                import mesmerglass.cli as cli_module
+                disable_srgb = getattr(cli_module, '_disable_srgb_framebuffer', False)
+            except (ImportError, AttributeError):
+                pass
+                
+            if not disable_srgb:
+                try:
+                    GL.glEnable(GL.GL_FRAMEBUFFER_SRGB)  # Enable automatic linear→sRGB conversion
+                    self._srgb_enabled = True
+                    logging.getLogger(__name__).info("[spiral.trace] sRGB framebuffer enabled for gamma-correct blending")
+                except GL.GLError as e:
+                    self._srgb_enabled = False
+                    logging.getLogger(__name__).warning(f"[spiral.trace] sRGB framebuffer not supported: {e}")
+            else:
+                self._srgb_enabled = False
+                logging.getLogger(__name__).info("[spiral.trace] sRGB framebuffer disabled for testing (--disable-srgb)")
+            self._srgb_setup_done = True
+        
+        # TEST: Disable blending to test compositor/layered-window artifacts
+        # If dots vanish with blending off → it's the overlay/compositor path
+        test_opaque = False
+        use_legacy_blend = False
+        try:
+            import mesmerglass.cli as cli_module
+            test_opaque = getattr(cli_module, '_test_opaque_mode', False)
+            use_legacy_blend = getattr(cli_module, '_test_legacy_blend', False)
+        except (ImportError, AttributeError):
+            pass
+            
+        if test_opaque:
+            print("TEST MODE: Rendering fully opaque with blending disabled")
+            GL.glDisable(GL.GL_BLEND)
+        else:
+            # Configure proper blending for overlay transparency
+            GL.glEnable(GL.GL_BLEND)
+                
+            if use_legacy_blend:
+                # Legacy alpha blending (may show artifacts)
+                GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA)
+            else:
+                # Use premultiplied alpha to fix compositor artifacts
+                # This eliminates the screen-door/grid artifacts in layered windows
+                GL.glBlendFuncSeparate(GL.GL_ONE, GL.GL_ONE_MINUS_SRC_ALPHA, 
+                                       GL.GL_ONE, GL.GL_ONE_MINUS_SRC_ALPHA)
+        
+        # Ensure consistent multisampling behavior
+        GL.glEnable(GL.GL_MULTISAMPLE)
+        
+        # Debug GL state if requested via CLI (only on first frame)
+        debug_gl_requested = False
+        try:
+            import mesmerglass.cli as cli_module
+            debug_gl_requested = getattr(cli_module, '_debug_gl_state', False)
+        except (ImportError, AttributeError):
+            pass
+            
+        if debug_gl_requested and self._draw_count == 1:  # Only debug first frame
+            print(f"GL_DITHER: {GL.glIsEnabled(GL.GL_DITHER)}")
+            print(f"GL_SAMPLE_ALPHA_TO_COVERAGE: {GL.glIsEnabled(GL.GL_SAMPLE_ALPHA_TO_COVERAGE)}")
+            print(f"GL_POLYGON_SMOOTH: {GL.glIsEnabled(GL.GL_POLYGON_SMOOTH)}")
+            print(f"GL_BLEND: {GL.glIsEnabled(GL.GL_BLEND)}")
+            print(f"GL_MULTISAMPLE: {GL.glIsEnabled(GL.GL_MULTISAMPLE)}")
+            print(f"GL_DEPTH_TEST: {GL.glIsEnabled(GL.GL_DEPTH_TEST)}")
+            # Check sRGB framebuffer state
+            try:
+                srgb_enabled = GL.glIsEnabled(GL.GL_FRAMEBUFFER_SRGB)
+                print(f"GL_FRAMEBUFFER_SRGB: {srgb_enabled}")
+            except GL.GLError:
+                print("GL_FRAMEBUFFER_SRGB: Not supported")
+            try:
+                blend_src = GL.glGetIntegerv(GL.GL_BLEND_SRC_ALPHA)
+                blend_dst = GL.glGetIntegerv(GL.GL_BLEND_DST_ALPHA)
+                print(f"Blend func: SRC={blend_src}, DST={blend_dst}")
+            except Exception:
+                print("Blend func: (could not query)")
+            viewport = GL.glGetIntegerv(GL.GL_VIEWPORT)
+            print(f"Viewport: {viewport}")
+            print("-" * 30)
+        
         GL.glUseProgram(self._program)
         # Uniforms (core + director exported set)
         t = time.time() - self._t0
@@ -687,13 +898,53 @@ class LoomCompositor(QOpenGLWidget):  # type: ignore[misc]
         def _seti(name, val: int):
             loc = GL.glGetUniformLocation(self._program, name)
             if loc >= 0: GL.glUniform1i(loc, int(val))
+        def _set2(name, val: tuple):
+            loc = GL.glGetUniformLocation(self._program, name)
+            if loc >= 0: GL.glUniform2f(loc, float(val[0]), float(val[1]))
+        def _set3(name, val: tuple):
+            loc = GL.glGetUniformLocation(self._program, name)
+            if loc >= 0: GL.glUniform3f(loc, float(val[0]), float(val[1]), float(val[2]))
+        
+        # Set test mode uniforms  
+        _seti('uTestOpaqueMode', 1 if test_opaque else 0)
+        _seti('uTestLegacyBlend', 1 if use_legacy_blend else 0)
+        # When GL_FRAMEBUFFER_SRGB is enabled, we should NOT do manual sRGB conversion
+        # OpenGL handles the linear→sRGB conversion automatically
+        _seti('uSRGBOutput', 0)  # Always let OpenGL handle sRGB conversion
+        
+        # Internal opacity mode to bypass DWM dithering
+        internal_opacity = False
+        try:
+            import mesmerglass.cli as cli_module
+            internal_opacity = getattr(cli_module, '_internal_opacity_mode', False)
+        except (ImportError, AttributeError):
+            pass
+        _seti('uInternalOpacity', 1 if internal_opacity else 0)
+        # Set background color for internal blending (black for now, could be configurable)
+        _set3('uBackgroundColor', (0.0, 0.0, 0.0))
+        
+        # D) Present opaque even if you internally mix alpha - disable GL blending for internal opacity
+        if internal_opacity:
+            GL.glDisable(GL.GL_BLEND)  # Critical: no GL blending when presenting opaque
+        else:
+            GL.glEnable(GL.GL_BLEND)  # Standard blending for other modes
+        
         loc = GL.glGetUniformLocation(self._program,'uResolution')
         if loc >=0: GL.glUniform2f(loc, float(w_px), float(h_px))
         _set1('uTime', t)
         # Director uniforms
         for k,v in uniforms.items():
-            if isinstance(v, int): _seti(k, v)
-            else: _set1(k, v)
+            if isinstance(v, int): 
+                _seti(k, v)
+            elif isinstance(v, (tuple, list)):
+                if len(v) == 2:
+                    _set2(k, v)
+                elif len(v) == 3:
+                    _set3(k, v)
+                else:
+                    _set1(k, float(v[0]) if v else 0.0)  # fallback to first element
+            else: 
+                _set1(k, v)
         _seti('uBlendMode', getattr(self, '_blend_mode', 0))
         # Draw
         self._draw_fullscreen_quad()
