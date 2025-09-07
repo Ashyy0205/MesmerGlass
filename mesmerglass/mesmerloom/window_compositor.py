@@ -6,12 +6,25 @@ Eliminates Qt widget FBO blit artifacts by using direct window rendering.
 import logging
 import time
 import os
+import sys
 from typing import Optional, Dict, Union
 from PyQt6.QtCore import QTimer, Qt
 from PyQt6.QtOpenGL import QOpenGLWindow, QOpenGLBuffer, QOpenGLShaderProgram, QOpenGLVertexArrayObject
 from PyQt6.QtGui import QSurfaceFormat
 from OpenGL import GL
 import numpy as np
+
+# Windows-specific imports for forcing window to top
+if sys.platform == "win32":
+    try:
+        import ctypes
+        from ctypes import wintypes
+        HWND_TOPMOST = -1
+        SWP_NOMOVE = 0x0002
+        SWP_NOSIZE = 0x0001
+        SWP_SHOWWINDOW = 0x0040
+    except ImportError:
+        ctypes = None
 
 logger = logging.getLogger(__name__)
 
@@ -47,20 +60,39 @@ class LoomWindowCompositor(QOpenGLWindow):
         # Set window properties for overlay behavior
         self.setFlags(Qt.WindowType.FramelessWindowHint | 
                      Qt.WindowType.WindowStaysOnTopHint |
-                     Qt.WindowType.Tool)
+                     Qt.WindowType.Tool |
+                     Qt.WindowType.BypassWindowManagerHint)  # Bypass window manager for stronger control
         
-        # Configure surface format for maximum compatibility
+        # Configure surface format for transparency support
         format = QSurfaceFormat()
         format.setVersion(3, 3)
         format.setProfile(QSurfaceFormat.OpenGLContextProfile.CoreProfile)
         format.setDepthBufferSize(24)
         format.setStencilBufferSize(8)
         format.setSamples(0)  # No MSAA to avoid artifacts
-        format.setAlphaBufferSize(0)  # No alpha buffer for opaque presentation
+        format.setAlphaBufferSize(8)  # Enable alpha buffer for transparency
         format.setSwapBehavior(QSurfaceFormat.SwapBehavior.DoubleBuffer)
         self.setFormat(format)
         
         logger.info(f"[spiral.trace] LoomWindowCompositor.__init__ called: director={director}")
+    
+    def _force_topmost_windows(self):
+        """Force window to topmost using Windows API"""
+        if sys.platform == "win32" and ctypes:
+            try:
+                # Get the window handle
+                hwnd = int(self.winId())
+                if hwnd:
+                    # Set window to topmost using Windows API
+                    ctypes.windll.user32.SetWindowPos(
+                        hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW
+                    )
+                    logger.info(f"[spiral.trace] Window forced to topmost using Win32 API: hwnd={hwnd}")
+                    return True
+            except Exception as e:
+                logger.warning(f"[spiral.trace] Failed to force topmost using Win32 API: {e}")
+        return False
     
     def initializeGL(self):
         """Initialize OpenGL resources"""
@@ -81,8 +113,9 @@ class LoomWindowCompositor(QOpenGLWindow):
             # Setup geometry
             self._setup_geometry()
             
-            # Configure optimal OpenGL state
-            GL.glDisable(GL.GL_BLEND)        # No blending - we do opacity in shader
+            # Configure OpenGL state for transparency
+            GL.glEnable(GL.GL_BLEND)         # Enable blending for transparency
+            GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA)  # Standard alpha blending
             GL.glDisable(GL.GL_DEPTH_TEST)   # No depth testing needed
             GL.glDisable(GL.GL_DITHER)       # Disable dithering completely
             GL.glDisable(GL.GL_MULTISAMPLE)  # Disable multisampling
@@ -216,8 +249,9 @@ class LoomWindowCompositor(QOpenGLWindow):
         # Setup viewport
         GL.glViewport(0, 0, self.width(), self.height())
         
-        # Clear with background color
-        GL.glClearColor(0.0, 0.0, 0.0, 1.0)  # Pure black background
+        # CRITICAL FIX: Clear with transparent background for proper window transparency
+        # Using alpha=0.0 makes the background completely transparent to the desktop
+        GL.glClearColor(0.0, 0.0, 0.0, 0.0)  # Transparent background - key fix!
         GL.glClear(GL.GL_COLOR_BUFFER_BIT)
         
         # Use shader program
@@ -305,16 +339,22 @@ class LoomWindowCompositor(QOpenGLWindow):
             else: 
                 _set1(k, v)
         
-        # Set QOpenGLWindow-specific defaults (same as original compositor)
-        _seti('uInternalOpacity', 1)  # Use internal opacity blending for QOpenGLWindow
+        # Set QOpenGLWindow-specific defaults for transparency
+        _seti('uInternalOpacity', 0)  # Use window transparency mode (not internal blending)
         _set3('uBackgroundColor', (0.0, 0.0, 0.0))  # Pure black background for better contrast
         _seti('uBlendMode', getattr(self, '_blend_mode', 0))  # Default blend mode
         _seti('uTestOpaqueMode', 0)  # Normal rendering mode
         _seti('uTestLegacyBlend', 0)  # Use modern blending
         _seti('uSRGBOutput', 0)  # Let OpenGL handle sRGB
         
-        # Disable GL blending for opaque internal blending (same as original)
-        GL.glDisable(GL.GL_BLEND)
+        # Add window-level opacity control (separate from spiral opacity)
+        _set1('uWindowOpacity', getattr(self, '_window_opacity', 1.0))  # Default fully opaque
+        if getattr(self, '_frame_count', 0) % 60 == 1:  # Log every 60 frames
+            logger.info(f"[spiral.debug] Frame {getattr(self, '_frame_count', 0)}: uWindowOpacity={getattr(self, '_window_opacity', 1.0)}")
+        
+        # Enable GL blending for transparency
+        GL.glEnable(GL.GL_BLEND)
+        GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA)
         
         # Render fullscreen quad
         self.vao.bind()
@@ -350,10 +390,11 @@ class LoomWindowCompositor(QOpenGLWindow):
             logger.warning(f"[spiral.trace] Failed to set intensity: {e}")
     
     def setWindowOpacity(self, opacity: float):
-        """Set window opacity (for compatibility with QWidget interface)"""
-        # QOpenGLWindow doesn't support window opacity the same way as QWidget
-        # For now, just log and ignore - we use internal opacity in shader
-        logger.info(f"[spiral.trace] setWindowOpacity({opacity}) called on QOpenGLWindow - using internal opacity")
+        """Set window-level opacity (0.0-1.0) for the entire overlay"""
+        opacity = max(0.0, min(1.0, opacity))  # Clamp to valid range
+        self._window_opacity = opacity
+        logger.info(f"[spiral.trace] setWindowOpacity({opacity}) - window transparency enabled, stored as {self._window_opacity}")
+        self.update()  # Trigger repaint with new opacity
     
     def set_blend_mode(self, mode: int):
         """Set blend mode (for compatibility)"""
@@ -400,6 +441,18 @@ class LoomWindowCompositor(QOpenGLWindow):
         """Handle window close"""
         self.cleanup()
         super().closeEvent(event)
+    
+    def showEvent(self, event):
+        """Handle window show - ensure it appears on top immediately"""
+        super().showEvent(event)
+        # Force window to top immediately when shown
+        self.raise_()
+        self.requestActivate()
+        
+        # Use Windows API for stronger topmost behavior
+        self._force_topmost_windows()
+        
+        logger.info("[spiral.trace] LoomWindowCompositor.showEvent: Window activated and raised to top")
 
 
 def probe_window_available() -> bool:

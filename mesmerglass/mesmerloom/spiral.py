@@ -1,4 +1,9 @@
-"""SpiralDirector implementation (Phase 2 core logic).
+"""SpiralDirector implementation (    BASE_SPEED_MIN = 0.09; BASE_SPEED_MAX = 0.14
+    WOBBLE_MIN = 0.006; WOBBLE_MAX = 0.020
+    TWIST_MIN = 0.06; TWIST_MAX = 0.14
+    CONTRAST_BOOST_MAX = 0.18
+    VIGNETTE_MIN = 0.0; VIGNETTE_MAX = 0.0  # Disabled to prevent background darkening
+    CHROMA_MAX = 0.32 core logic).
 
 Responsibilities:
  - Intensity scaling for dynamic parameters (speeds, ranges, contrast, vignette, chromatic shift)
@@ -36,7 +41,7 @@ class SpiralDirector:
     WOBBLE_MIN = 0.006; WOBBLE_MAX = 0.020
     TWIST_MIN = 0.06; TWIST_MAX = 0.14
     CONTRAST_BOOST_MAX = 0.18
-    VIGNETTE_MIN = 0.22; VIGNETTE_MAX = 0.38
+    VIGNETTE_MIN = 0.0; VIGNETTE_MAX = 0.0  # Disabled to prevent background darkening
     CHROMA_MAX = 0.3
     # Flip ranges
     FLIP_PERIOD_MIN = 120.0; FLIP_PERIOD_MAX = 240.0  # intensity 0→1 maps 240→120 (invert later)
@@ -65,8 +70,8 @@ class SpiralDirector:
         # Additional spiral parameters for shader
         self.arm_count = 8
         self.arm_color = (1.0, 1.0, 1.0)
-        self.gap_color = (0.0, 0.0, 0.0)
-        self.blend_mode = 0  # 0=multiply, 1=screen, 2=softlight
+        self.gap_color = (0.0, 0.0, 0.0)  # Black (transparent gaps)
+        self.blend_mode = 1  # 0=multiply, 1=screen, 2=softlight - screen mode to avoid darkening
         self.color = (1.0, 1.0, 1.0)
         self.resolution = (1920, 1080)
         self.super_samples = 4  # Anti-aliasing samples: 1=none, 4=2x2, 9=3x3, 16=4x4

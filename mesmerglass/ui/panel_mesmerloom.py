@@ -26,7 +26,7 @@ class PanelMesmerLoom(QWidget):
     def __init__(self, director, compositor, parent=None):
         super().__init__(parent)
         self.director = director; self.compositor = compositor
-        self._arm_rgba = (1.0,1.0,1.0,1.0); self._gap_rgba = (0.0,0.0,0.0,1.0)
+        self._arm_rgba = (1.0,1.0,1.0,1.0); self._gap_rgba = (0.0,0.0,0.0,1.0)  # Black gap (transparent)
         self._build()
 
     def _build(self):

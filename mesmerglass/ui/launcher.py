@@ -32,7 +32,7 @@ from .pages.device import DevicePage
 from .pages.audio import AudioPage
 from .pages.devtools import DevToolsPage  # DevTools content (now hosted in separate window)
 from .pages.performance import PerformancePage  # Performance metrics page
-from .pages.spiral import SpiralPage  # Spiral settings page (minimal)
+# Note: SpiralPage removed - opacity controls moved to MesmerLoom tab
 from .panel_mesmerloom import PanelMesmerLoom
 try:
     import logging
@@ -275,13 +275,7 @@ class Launcher(QMainWindow):
         scr_disp = QScrollArea(); scr_disp.setWidgetResizable(True); scr_disp.setFrameShape(QFrame.Shape.NoFrame)
         scr_disp.setWidget(self._page_displays()); self.tabs.addTab(scr_disp, "Displays")
 
-        # Spiral tab (logic-only phase)
-        try:
-            self.page_spiral = SpiralPage(self, self.spiral_director)
-            scr_spiral = QScrollArea(); scr_spiral.setWidgetResizable(True); scr_spiral.setFrameShape(QFrame.Shape.NoFrame)
-            scr_spiral.setWidget(self.page_spiral); self.tabs.addTab(scr_spiral, "Spiral")
-        except Exception:
-            self.page_spiral = None  # type: ignore
+        # Note: SpiralPage removed - opacity controls moved to MesmerLoom tab
 
         # MesmerLoom panel (Step 3)
         try:
@@ -353,13 +347,18 @@ class Launcher(QMainWindow):
             self.page_device.burstPeakChanged.connect(lambda v: setattr(self,'burst_peak', v/100.0))
             self.page_device.burstMaxMsChanged.connect(lambda v: setattr(self,'burst_max_ms', v))
         except Exception: pass
-        # Spiral
-        if getattr(self, 'page_spiral', None):
+        # MesmerLoom opacity controls (moved from SpiralPage)
+        if getattr(self, 'page_mesmerloom', None):
             try:
-                self.page_spiral.spiralToggled.connect(self._on_spiral_toggled)
-                self.page_spiral.opacityChanged.connect(lambda f: setattr(self, 'spiral_opacity', f))
-                self.page_spiral.intensityChanged.connect(lambda *_: None)
-            except Exception: pass
+                logging.getLogger(__name__).info(f"[spiral.trace] Connecting mesmerloom opacity signals...")
+                self.page_mesmerloom.opacityChanged.connect(lambda f: setattr(self, 'spiral_opacity', f))
+                self.page_mesmerloom.opacityChanged.connect(self._on_window_opacity_changed)  # Also control window transparency
+                self.page_mesmerloom.opacityChanged.connect(lambda f: logging.getLogger(__name__).info(f"[spiral.trace] UI opacity slider moved to {f}"))  # Debug
+                logging.getLogger(__name__).info(f"[spiral.trace] MesmerLoom opacity signals connected successfully")
+            except Exception as e:
+                logging.getLogger(__name__).error(f"[spiral.trace] Failed to connect mesmerloom opacity signals: {e}")
+        else:
+            logging.getLogger(__name__).warning(f"[spiral.trace] page_mesmerloom is None - opacity signals not connected")
 
         # Footer -------------------------------------------------------
         footer = QWidget(); footer.setObjectName('footerBar')
@@ -461,6 +460,23 @@ class Launcher(QMainWindow):
         except Exception:
             pass
 
+    def _on_window_opacity_changed(self, opacity: float):
+        """Update window-level opacity for all spiral windows"""
+        try:
+            logging.getLogger(__name__).info(f"[spiral.trace] _on_window_opacity_changed called with opacity={opacity}")
+            logging.getLogger(__name__).info(f"[spiral.trace] Setting window opacity to {opacity} on {len(getattr(self, 'spiral_windows', []))} windows")
+            for win in list(getattr(self, 'spiral_windows', [])):
+                try:
+                    if hasattr(win, 'comp') and hasattr(win.comp, 'setWindowOpacity'):
+                        logging.getLogger(__name__).info(f"[spiral.trace] Calling setWindowOpacity({opacity}) on window {win}")
+                        win.comp.setWindowOpacity(opacity)
+                    else:
+                        logging.getLogger(__name__).warning(f"[spiral.trace] Window {win} missing comp or setWindowOpacity method")
+                except Exception as e:
+                    logging.getLogger(__name__).warning(f"[spiral.trace] Failed to set window opacity on {win}: {e}")
+        except Exception as e:
+            logging.getLogger(__name__).warning(f"[spiral.trace] Failed to update window opacity: {e}")
+
     # ---------------- Spiral compositor window management ----------------
     def _create_spiral_windows(self):
         """Create per-display spiral compositor windows if spiral enabled.
@@ -538,6 +554,16 @@ class Launcher(QMainWindow):
                     win = SpiralWindow(self.spiral_director, parent=None, screen_index=i)
                     win.setGeometry(sc.geometry())
                     win.set_active(True)
+                    
+                    # Apply current opacity to new window
+                    try:
+                        current_opacity = getattr(self, 'spiral_opacity', 0.85)
+                        if hasattr(win, 'comp') and hasattr(win.comp, 'setWindowOpacity'):
+                            win.comp.setWindowOpacity(current_opacity)
+                            logging.getLogger(__name__).info(f"[spiral.trace] Applied opacity {current_opacity} to new spiral window")
+                    except Exception as e:
+                        logging.getLogger(__name__).warning(f"[spiral.trace] Failed to set initial opacity: {e}")
+                    
                     win.showFullScreen(); win.raise_()
                     self.spiral_windows.append(win)
                     main_win = win

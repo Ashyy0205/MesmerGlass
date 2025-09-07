@@ -37,6 +37,7 @@ uniform int uTestLegacyBlend = 0; // Test mode: 1=legacy blend, 0=premultiplied 
 uniform int uSRGBOutput = 0; // Test mode: 1=manual sRGB conversion, 0=let framebuffer handle it
 uniform int uInternalOpacity = 0; // Test mode: 1=internal blending with opaque window, 0=window transparency
 uniform vec3 uBackgroundColor = vec3(0.0, 0.0, 0.0); // Background color for internal blending
+uniform float uWindowOpacity = 1.0; // Window-level opacity control (0.0-1.0)
 
 // High-precision mathematical constants
 const float PI = 3.1415926535897932384626433832795;
@@ -228,8 +229,17 @@ void main() {
         bar = mix(bar, 1.0 - bar, flipEffect);
     }
     
-    // Interpolate between arm and gap colors
-    vec3 baseColor = mix(uGapColor, uArmColor, bar);
+    // Calculate spiral arm visibility (1.0 = arm, 0.0 = gap)
+    // This determines which parts are arms vs gaps
+    float armVisibility = bar;
+    
+    // Blend between gap color and arm color based on spiral pattern
+    // This allows both arm and gap colors to be visible and changeable
+    vec3 baseColor = mix(uGapColor, uArmColor, armVisibility);
+    
+    // Apply window opacity to the entire spiral (both arms and gaps)
+    // The opacity slider controls the visibility of the entire overlay
+    float finalAlpha = uWindowOpacity;
     
     // CRITICAL FIX: Apply intensity scaling to ensure uIntensity uniform is used
     // This prevents OpenGL from optimizing out the uIntensity uniform
@@ -241,9 +251,11 @@ void main() {
     baseColor = (baseColor - 0.5) * uContrast + 0.5;
     baseColor = clamp(baseColor, 0.0, 1.0);
     
-    // Apply vignette effect (smoother)
+    // Apply vignette effect only to spiral arms (not background areas)
+    // This prevents background darkening in transparent gaps
     float vignette = 1.0 - uVignette * smoothstep(0.0, 1.0, r * r);
-    baseColor *= vignette;
+    // Only apply vignette to visible spiral areas, not to transparent gaps
+    baseColor = mix(baseColor, baseColor * vignette, armVisibility);
     
     // Apply chromatic shift for hypnotic effect (precision-enhanced)
     if (uChromaticShift > 0.0) {
@@ -262,9 +274,6 @@ void main() {
         baseColor = clamp(baseColor, 0.0, 1.0);
     }
     
-    // Apply final opacity
-    float finalOpacity = uSpiralOpacity;
-    
     // Safety clamp indicator (subtle red tint if clamped)
     if (uSafetyClamped == 1) {
         baseColor.r += 0.05;
@@ -280,16 +289,26 @@ void main() {
         // Do your "opacity" inside your GL: mix(bgColor, spiralColor, globalOpacity)
         // CRITICAL: Always output alpha=1.0 to prevent any Qt/Windows alpha compositing
         vec3 outputColor = (uSRGBOutput == 1) ? linearToSRGB(baseColor) : baseColor;
-        vec3 blendedColor = mix(uBackgroundColor, outputColor, finalOpacity);
+        vec3 blendedColor = mix(uBackgroundColor, outputColor, finalAlpha);
         FragColor = vec4(blendedColor, 1.0); // Force alpha=1 - no exceptions
-    } else if (uTestLegacyBlend == 1) {
-        // TEST MODE: Legacy alpha blending (may show DWM dithering artifacts)
-        vec3 outputColor = (uSRGBOutput == 1) ? linearToSRGB(baseColor) : baseColor;
-        FragColor = vec4(outputColor, finalOpacity);
     } else {
-        // Use premultiplied alpha (still subject to DWM dithering with layered windows)
+        // TRANSPARENCY MODE: Only spiral arms are visible with opacity control
         vec3 outputColor = (uSRGBOutput == 1) ? linearToSRGB(baseColor) : baseColor;
-        vec3 premultipliedColor = outputColor * finalOpacity;
-        FragColor = vec4(premultipliedColor, finalOpacity);
+        
+        // Use finalAlpha - gaps are fully transparent, arms have opacity control
+        if (uTestLegacyBlend == 1) {
+            // TEST MODE: Legacy alpha blending
+            FragColor = vec4(outputColor, finalAlpha);
+        } else {
+            // CRITICAL FIX: Ensure completely transparent pixels don't contribute any color
+            // When finalAlpha is very small, force the pixel to be completely transparent
+            if (finalAlpha < 0.001) {
+                FragColor = vec4(0.0, 0.0, 0.0, 0.0);  // Fully transparent
+            } else {
+                // Use premultiplied alpha for proper transparency compositing
+                vec3 premultipliedColor = outputColor * finalAlpha;
+                FragColor = vec4(premultipliedColor, finalAlpha);
+            }
+        }
     }
 }

@@ -69,6 +69,8 @@ class SpiralWindow(QWidget):  # pragma: no cover - runtime/UI centric
         if not self._debug_surface:
             self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
             self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+            # CRITICAL: Also enable transparency for the window itself
+            self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
         else:
             logging.getLogger(__name__).warning("SpiralWindow: MESMERGLASS_SPIRAL_DEBUG_SURFACE enabled (no translucency/click-through)")
         self.setObjectName("SpiralWindow")
@@ -125,13 +127,22 @@ class SpiralWindow(QWidget):  # pragma: no cover - runtime/UI centric
                 # Use QOpenGLWindow compositor (artifact-free)
                 self.comp = LoomWindowCompositor(director)
                 
-                # Set window properties for overlay behavior FIRST
+                # Set window properties for transparent overlay behavior FIRST
                 self.comp.setFlags(Qt.WindowType.FramelessWindowHint | 
                                   Qt.WindowType.WindowStaysOnTopHint |
-                                  Qt.WindowType.Tool)
+                                  Qt.WindowType.Tool |
+                                  Qt.WindowType.WindowTransparentForInput)  # Enable click-through
                 
                 # Show fullscreen FIRST (this might move to wrong screen)
                 self.comp.showFullScreen()
+                
+                # CRITICAL: Force window to top immediately after showing
+                self.comp.raise_()
+                self.comp.requestActivate()  # QWindow method for activation
+                
+                # Use Windows API for stronger topmost behavior
+                if hasattr(self.comp, '_force_topmost_windows'):
+                    self.comp._force_topmost_windows()
                 
                 # CRITICAL: Set target screen AFTER showFullScreen() to override any auto-placement
                 screens = QApplication.screens()
@@ -144,12 +155,36 @@ class SpiralWindow(QWidget):  # pragma: no cover - runtime/UI centric
                     target_geometry = target_screen.geometry()
                     self.comp.setGeometry(target_geometry)
                     logging.getLogger(__name__).info(f"[spiral.debug] QOpenGLWindow geometry forced to: {target_geometry}")
+                    
+                    # CRITICAL: Force window to top again after geometry changes
+                    self.comp.raise_()
+                    self.comp.requestActivate()
+                    if hasattr(self.comp, '_force_topmost_windows'):
+                        self.comp._force_topmost_windows()
                 else:
                     logging.getLogger(__name__).warning(f"[spiral.debug] Invalid screen_index {screen_index}, QOpenGLWindow using default screen")
                 
                 self.comp.raise_()
                 
                 logging.getLogger(__name__).info("SpiralWindow: LoomWindowCompositor created as separate window (artifact-free)")
+                
+                # CRITICAL: Add delayed activation to ensure window appears on top
+                from PyQt6.QtCore import QTimer
+                def _ensure_top_window():
+                    """Ensure window stays on top after a short delay"""
+                    try:
+                        self.comp.raise_()
+                        self.comp.requestActivate()
+                        # Use Windows API for stronger control
+                        if hasattr(self.comp, '_force_topmost_windows'):
+                            self.comp._force_topmost_windows()
+                        logging.getLogger(__name__).info("[spiral.trace] Delayed window activation completed")
+                    except Exception as e:
+                        logging.getLogger(__name__).warning(f"[spiral.trace] Delayed window activation failed: {e}")
+                
+                QTimer.singleShot(50, _ensure_top_window)  # Activate after 50ms
+                QTimer.singleShot(200, _ensure_top_window)  # Activate again after 200ms for stubborn cases
+                
                 logging.getLogger(__name__).info(f"[spiral.debug] QOpenGLWindow geometry after setup: {self.comp.geometry()}")
                 comp_screen = self.comp.screen()
                 comp_screen_name = comp_screen.name() if comp_screen else 'None'
