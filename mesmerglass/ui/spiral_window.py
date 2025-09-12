@@ -67,15 +67,18 @@ class SpiralWindow(QWidget):  # pragma: no cover - runtime/UI centric
         # Optional debug surface mode disables translucency & click-through (can help some drivers)
         self._debug_surface = bool(os.environ.get("MESMERGLASS_SPIRAL_DEBUG_SURFACE"))
         if not self._debug_surface:
+            # Keep wrapper non-interactive and transparent if it ever becomes visible
             self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
             self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-            # CRITICAL: Also enable transparency for the window itself
             self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+            self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
+            self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
         else:
             logging.getLogger(__name__).warning("SpiralWindow: MESMERGLASS_SPIRAL_DEBUG_SURFACE enabled (no translucency/click-through)")
         self.setObjectName("SpiralWindow")
         lay = QVBoxLayout(self); lay.setContentsMargins(0,0,0,0)
         self._glwindow_attempted = False
+        self._using_qglwindow = bool(_USE_WINDOW_COMPOSITOR)
         # Forced QScreen assignment
         try:
             from PyQt6.QtWidgets import QApplication
@@ -115,56 +118,92 @@ class SpiralWindow(QWidget):  # pragma: no cover - runtime/UI centric
             logging.getLogger(__name__).warning(f"[spiral.trace] SpiralWindow.__init__: error logging screen info: {e}")
         # Restore main compositor as child widget or window
         try:
-            self.showFullScreen()  # Make SpiralWindow itself fullscreen/top-level
-            self.raise_()
-            self.activateWindow()
+            # For QOpenGLWindow path we DO NOT show this QWidget wrapper; keep it off-screen/hidden
+            _wrapper_visible = False
+            if not _USE_WINDOW_COMPOSITOR:
+                _wrapper_visible = True
+            if _wrapper_visible:
+                self.showFullScreen()  # Make SpiralWindow itself fullscreen/top-level (fallback path only)
+                self.raise_()
+                self.activateWindow()
             # Log after showFullScreen
             assigned_screen = self.screen() if hasattr(self, 'screen') else None
             assigned_name = assigned_screen.name() if assigned_screen else None
             logging.getLogger(__name__).info(f"[spiral.trace] After showFullScreen: screen={assigned_name} geometry={self.geometry()} pos={self.pos()} size={self.size()}")
             
             if _USE_WINDOW_COMPOSITOR:
+                # Ensure this wrapper never shows as a black/opaque window
+                try:
+                    self.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
+                    self.hide()
+                except Exception:
+                    pass
                 # Use QOpenGLWindow compositor (artifact-free)
                 self.comp = LoomWindowCompositor(director)
-                
-                # Set window properties for transparent overlay behavior FIRST
-                self.comp.setFlags(Qt.WindowType.FramelessWindowHint | 
-                                  Qt.WindowType.WindowStaysOnTopHint |
-                                  Qt.WindowType.Tool |
-                                  Qt.WindowType.WindowTransparentForInput)  # Enable click-through
-                
-                # Show fullscreen FIRST (this might move to wrong screen)
-                self.comp.showFullScreen()
-                
-                # CRITICAL: Force window to top immediately after showing
-                self.comp.raise_()
-                self.comp.requestActivate()  # QWindow method for activation
-                
-                # Use Windows API for stronger topmost behavior
-                if hasattr(self.comp, '_force_topmost_windows'):
-                    self.comp._force_topmost_windows()
-                
-                # CRITICAL: Set target screen AFTER showFullScreen() to override any auto-placement
-                screens = QApplication.screens()
-                if 0 <= screen_index < len(screens):
-                    target_screen = screens[screen_index]
-                    self.comp.setScreen(target_screen)
-                    logging.getLogger(__name__).info(f"[spiral.debug] QOpenGLWindow assigned to target screen: {target_screen.name()} (index {screen_index}) AFTER showFullScreen")
-                    
-                    # Force geometry to target screen to ensure proper placement
-                    target_geometry = target_screen.geometry()
-                    self.comp.setGeometry(target_geometry)
-                    logging.getLogger(__name__).info(f"[spiral.debug] QOpenGLWindow geometry forced to: {target_geometry}")
-                    
-                    # CRITICAL: Force window to top again after geometry changes
-                    self.comp.raise_()
-                    self.comp.requestActivate()
-                    if hasattr(self.comp, '_force_topmost_windows'):
-                        self.comp._force_topmost_windows()
-                else:
-                    logging.getLogger(__name__).warning(f"[spiral.debug] Invalid screen_index {screen_index}, QOpenGLWindow using default screen")
-                
-                self.comp.raise_()
+
+                # IMPORTANT: Do NOT reset flags here; LoomWindowCompositor has already set
+                # the correct flags and applying setFlags again may recreate the native
+                # window, dropping layered styles before first show and causing a black flash.
+                # If needed in future, re-apply styles immediately after any flag changes.
+
+                # Re-assert layered styles and keep alpha at 0 before first show to avoid black
+                try:
+                    if hasattr(self.comp, '_apply_win32_layered_styles'):
+                        self.comp._apply_win32_layered_styles()
+                    if hasattr(self.comp, '_set_layered_alpha'):
+                        self.comp._set_layered_alpha(0)
+                except Exception:
+                    pass
+
+                # Delay first show slightly so layered styles/alpha settle, then show and position
+                from PyQt6.QtCore import QTimer
+                def _show_and_position():
+                    try:
+                        # Show fullscreen (styles already applied keep it transparent)
+                        self.comp.showFullScreen()
+
+                        # Force window to top immediately after showing
+                        self.comp.raise_()
+                        self.comp.requestActivate()  # QWindow method for activation
+
+                        # Use Windows API for stronger topmost behavior
+                        if hasattr(self.comp, '_force_topmost_windows'):
+                            self.comp._force_topmost_windows()
+
+                        # Set target screen AFTER showFullScreen() to override auto-placement
+                        screens = QApplication.screens()
+                        if 0 <= screen_index < len(screens):
+                            target_screen = screens[screen_index]
+                            self.comp.setScreen(target_screen)
+                            logging.getLogger(__name__).info(f"[spiral.debug] QOpenGLWindow assigned to target screen: {target_screen.name()} (index {screen_index}) AFTER showFullScreen")
+
+                            # Force geometry to target screen to ensure proper placement
+                            target_geometry = target_screen.geometry()
+                            self.comp.setGeometry(target_geometry)
+                            logging.getLogger(__name__).info(f"[spiral.debug] QOpenGLWindow geometry forced to: {target_geometry}")
+
+                            # Force window to top again after geometry changes
+                            self.comp.raise_()
+                            self.comp.requestActivate()
+                            if hasattr(self.comp, '_force_topmost_windows'):
+                                self.comp._force_topmost_windows()
+                        else:
+                            logging.getLogger(__name__).warning(f"[spiral.debug] Invalid screen_index {screen_index}, QOpenGLWindow using default screen")
+
+                        self.comp.raise_()
+
+                        # Present an all-transparent frame immediately after positioning
+                        if hasattr(self.comp, '_initial_transparent_swap'):
+                            self.comp._initial_transparent_swap()
+                    except Exception as e:
+                        logging.getLogger(__name__).warning(f"[spiral.trace] _show_and_position failed: {e}")
+
+                # Configurable initial show delay to avoid first black compose
+                try:
+                    delay_ms = int(os.environ.get("MESMERGLASS_FIRST_SHOW_DELAY_MS", "25"))
+                except Exception:
+                    delay_ms = 25
+                QTimer.singleShot(delay_ms, _show_and_position)
                 
                 logging.getLogger(__name__).info("SpiralWindow: LoomWindowCompositor created as separate window (artifact-free)")
                 
@@ -219,6 +258,42 @@ class SpiralWindow(QWidget):  # pragma: no cover - runtime/UI centric
             QTimer.singleShot(100, _delayed_update)
         except Exception as e:
             logging.getLogger(__name__).error("SpiralWindow: Compositor creation failed: %s", e)
+
+    # Ensure launcher calls to show/raise/activate do not surface the wrapper when using QOpenGLWindow
+    def showFullScreen(self):  # type: ignore[override]
+        if getattr(self, '_using_qglwindow', False):
+            try:
+                if hasattr(self, 'comp'):
+                    self.comp.showFullScreen()
+                    self.comp.raise_()
+                    if hasattr(self.comp, 'requestActivate'):
+                        self.comp.requestActivate()
+            except Exception:
+                pass
+            return
+        return super().showFullScreen()
+
+    def raise_(self):  # type: ignore[override]
+        if getattr(self, '_using_qglwindow', False):
+            try:
+                if hasattr(self, 'comp'):
+                    self.comp.raise_()
+                    if hasattr(self.comp, 'requestActivate'):
+                        self.comp.requestActivate()
+            except Exception:
+                pass
+            return
+        return super().raise_()
+
+    def activateWindow(self):  # type: ignore[override]
+        if getattr(self, '_using_qglwindow', False):
+            try:
+                if hasattr(self, 'comp') and hasattr(self.comp, 'requestActivate'):
+                    self.comp.requestActivate()
+            except Exception:
+                pass
+            return
+        return super().activateWindow()
 
     # Facade methods -------------------------------------------------
     def set_active(self, active: bool):

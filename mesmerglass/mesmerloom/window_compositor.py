@@ -10,7 +10,7 @@ import sys
 from typing import Optional, Dict, Union
 from PyQt6.QtCore import QTimer, Qt
 from PyQt6.QtOpenGL import QOpenGLWindow, QOpenGLBuffer, QOpenGLShaderProgram, QOpenGLVertexArrayObject
-from PyQt6.QtGui import QSurfaceFormat
+from PyQt6.QtGui import QSurfaceFormat, QColor, QGuiApplication
 from OpenGL import GL
 import numpy as np
 
@@ -23,6 +23,9 @@ if sys.platform == "win32":
         SWP_NOMOVE = 0x0002
         SWP_NOSIZE = 0x0001
         SWP_SHOWWINDOW = 0x0040
+        SWP_NOZORDER = 0x0004
+        SWP_NOACTIVATE = 0x0010
+        SWP_FRAMECHANGED = 0x0020
     except ImportError:
         ctypes = None
 
@@ -37,7 +40,7 @@ class LoomWindowCompositor(QOpenGLWindow):
     def __init__(self, director, parent=None):
         super().__init__(parent)
         self.director = director
-        
+
         # Core rendering state
         self.program_id = None
         self.vao = None
@@ -46,23 +49,52 @@ class LoomWindowCompositor(QOpenGLWindow):
         self.initialized = False
         self.frame_count = 0
         self.t0 = time.time()
-        
+
         # Tracing and performance
         self._trace = bool(os.environ.get("MESMERGLASS_SPIRAL_TRACE"))
         self._log_interval = 60
         self._active = True
         self.available = False
-        
+
         # Animation timer
         self.timer = QTimer()
         self.timer.timeout.connect(self.update)
-        
+        # Track first exposure to trigger an immediate styled repaint
+        self._first_expose_handled = False
+        # One-time guard for an initial transparent swap to avoid first black frame
+        self._first_transparent_swap_done = False
+        # Start fully transparent; restore after first transparent swap
+        self._window_opacity = 1.0
+        try:
+            super().setOpacity(0.0)
+        except Exception:
+            pass
+
         # Set window properties for overlay behavior
-        self.setFlags(Qt.WindowType.FramelessWindowHint | 
+        try:
+            # WindowTransparentForInput may not exist on older Qt; guard it
+            flags = (Qt.WindowType.FramelessWindowHint |
                      Qt.WindowType.WindowStaysOnTopHint |
                      Qt.WindowType.Tool |
-                     Qt.WindowType.BypassWindowManagerHint)  # Bypass window manager for stronger control
-        
+                     Qt.WindowType.BypassWindowManagerHint)
+            if hasattr(Qt.WindowType, "WindowTransparentForInput"):
+                flags |= Qt.WindowType.WindowTransparentForInput  # default to click-through
+            self.setFlags(flags)
+        except Exception:
+            # Fallback to basic flags
+            try:
+                self.setFlags(Qt.WindowType.FramelessWindowHint |
+                              Qt.WindowType.WindowStaysOnTopHint |
+                              Qt.WindowType.Tool)
+            except Exception:
+                pass
+
+        # Establish a transparent base color for the QWindow backbuffer (enables per-pixel alpha)
+        try:
+            self.setColor(QColor(0, 0, 0, 0))  # Transparent window background
+        except Exception:
+            pass
+
         # Configure surface format for transparency support
         format = QSurfaceFormat()
         format.setVersion(3, 3)
@@ -73,8 +105,68 @@ class LoomWindowCompositor(QOpenGLWindow):
         format.setAlphaBufferSize(8)  # Enable alpha buffer for transparency
         format.setSwapBehavior(QSurfaceFormat.SwapBehavior.DoubleBuffer)
         self.setFormat(format)
-        
+
+        # Ensure the native window is created so we can apply styles BEFORE first show/paint
+        try:
+            self.create()  # force platform window creation (no show)
+        except Exception:
+            pass
+        # Apply styles immediately if possible (reduces initial black frame risk)
+        try:
+            self._apply_win32_layered_styles()
+            self._refresh_win32_styles()
+            # Start per-window alpha at 0 so the window is fully transparent until first swap
+            self._set_layered_alpha(0)
+        except Exception:
+            pass
+
         logger.info(f"[spiral.trace] LoomWindowCompositor.__init__ called: director={director}")
+        # Apply layered/click-through styles ASAP after native handle exists
+        try:
+            QTimer.singleShot(0, self._apply_win32_layered_styles)
+        except Exception:
+            pass
+
+    def _initial_transparent_swap(self):
+        """Do a one-time transparent clear/swap as soon as the surface is exposed.
+        This prevents the OS from compositing an uninitialized (black) backbuffer
+        before our first regular paintGL.
+        """
+        if self._first_transparent_swap_done:
+            return
+        if not self.isExposed():
+            return
+        # Only proceed if a context exists and can be made current early
+        ctx = self.context()
+        if ctx is None:
+            return
+        try:
+            self.makeCurrent()
+        except Exception:
+            # Some drivers may not allow this prior to initializeGL; bail out gracefully
+            return
+        try:
+            GL.glViewport(0, 0, max(1, self.width()), max(1, self.height()))
+            GL.glClearColor(0.0, 0.0, 0.0, 0.0)
+            GL.glClear(GL.GL_COLOR_BUFFER_BIT)
+            try:
+                # Swap immediately so DWM sees an all-transparent first frame
+                ctx.swapBuffers(self)
+            except Exception:
+                pass
+            self._first_transparent_swap_done = True
+            # Restore desired opacity now that we have presented a transparent frame
+            try:
+                super().setOpacity(self._window_opacity)
+            except Exception:
+                pass
+            # Ensure layered alpha is restored to fully visible
+            self._set_layered_alpha(255)
+        finally:
+            try:
+                self.doneCurrent()
+            except Exception:
+                pass
     
     def _force_topmost_windows(self):
         """Force window to topmost using Windows API"""
@@ -97,7 +189,8 @@ class LoomWindowCompositor(QOpenGLWindow):
     def initializeGL(self):
         """Initialize OpenGL resources"""
         logger.info("[spiral.trace] LoomWindowCompositor.initializeGL called")
-        
+        # Re-assert layered styles after GL init (some drivers recreate surfaces)
+        self._apply_win32_layered_styles()
         try:
             # Print OpenGL info
             version = GL.glGetString(GL.GL_VERSION).decode()
@@ -106,6 +199,10 @@ class LoomWindowCompositor(QOpenGLWindow):
             logger.info(f"[spiral.trace] OpenGL version: {version}")
             logger.info(f"[spiral.trace] OpenGL renderer: {renderer}")
             logger.info(f"[spiral.trace] OpenGL vendor: {vendor}")
+            try:
+                logger.info(f"[spiral.trace] Window format alphaBufferSize={self.format().alphaBufferSize()}")
+            except Exception:
+                pass
             
             # Build shader program
             self._build_shader_program()
@@ -129,6 +226,24 @@ class LoomWindowCompositor(QOpenGLWindow):
             except Exception:
                 pass
             
+            # One-time transparent clear/swap before any regular paint to avoid initial black
+            try:
+                GL.glViewport(0, 0, max(1, self.width()), max(1, self.height()))
+                GL.glClearColor(0.0, 0.0, 0.0, 0.0)
+                GL.glClear(GL.GL_COLOR_BUFFER_BIT)
+                ctx = self.context()
+                if ctx is not None:
+                    ctx.swapBuffers(self)
+                    self._first_transparent_swap_done = True
+                    self._set_layered_alpha(255)
+                    try:
+                        super().setOpacity(self._window_opacity)
+                    except Exception:
+                        pass
+            except Exception:
+                # Non-fatal; continue
+                pass
+
             # Start animation timer
             self.timer.start(16)  # ~60 FPS
             
@@ -393,6 +508,12 @@ class LoomWindowCompositor(QOpenGLWindow):
         """Set window-level opacity (0.0-1.0) for the entire overlay"""
         opacity = max(0.0, min(1.0, opacity))  # Clamp to valid range
         self._window_opacity = opacity
+        try:
+            # Apply to native window only after first transparent swap has occurred
+            if getattr(self, '_first_transparent_swap_done', False):
+                super().setOpacity(opacity)
+        except Exception:
+            pass
         logger.info(f"[spiral.trace] setWindowOpacity({opacity}) - window transparency enabled, stored as {self._window_opacity}")
         self.update()  # Trigger repaint with new opacity
     
@@ -449,10 +570,166 @@ class LoomWindowCompositor(QOpenGLWindow):
         self.raise_()
         self.requestActivate()
         
-        # Use Windows API for stronger topmost behavior
+        # Use Windows API for stronger topmost behavior and layered/click-through styles
         self._force_topmost_windows()
+        self._apply_win32_layered_styles()
+        # Keep layered alpha at 0 until transparent swap done
+        try:
+            self._set_layered_alpha(0)
+            self._refresh_win32_styles()
+        except Exception:
+            pass
+        # Schedule the initial transparent swap ASAP
+        try:
+            QTimer.singleShot(0, self._initial_transparent_swap)
+        except Exception:
+            pass
+        # Optionally schedule a one-time sneaky click to force OS composite refresh
+        try:
+            # Enabled by default; set MESMERGLASS_SNEAKY_CLICK=0/false/off to disable.
+            if os.environ.get("MESMERGLASS_SNEAKY_CLICK", "1") not in ("0", "false", "False", "off"):
+                # Default delay 250ms after show (1/4 second);
+                # configurable via MESMERGLASS_SNEAKY_CLICK_DELAY_MS
+                try:
+                    delay_ms = int(os.environ.get("MESMERGLASS_SNEAKY_CLICK_DELAY_MS", "250"))
+                except Exception:
+                    delay_ms = 250
+                delay_ms = max(0, min(5000, delay_ms))
+                QTimer.singleShot(delay_ms, self._sneaky_click_bottom)
+        except Exception:
+            pass
         
         logger.info("[spiral.trace] LoomWindowCompositor.showEvent: Window activated and raised to top")
+
+    def exposeEvent(self, event):
+        """On first exposure, re-apply styles and schedule a repaint to avoid black frame."""
+        super().exposeEvent(event)
+        if not self.isExposed():
+            return
+        # Refresh styles each time we get exposed (robust against OS transitions)
+        self._apply_win32_layered_styles()
+        self._force_topmost_windows()
+        self._refresh_win32_styles()
+        # Perform a one-time transparent clear/swap before any normal paint to avoid initial black
+        self._initial_transparent_swap()
+        if not self._first_expose_handled:
+            self._first_expose_handled = True
+            try:
+                QTimer.singleShot(0, self.update)
+            except Exception:
+                pass
+
+    def _refresh_win32_styles(self):
+        """Force Windows to re-evaluate styles without moving/resizing/showing."""
+        if sys.platform != "win32" or not ctypes:
+            return
+        try:
+            hwnd = int(self.winId())
+            if not hwnd:
+                return
+            ctypes.windll.user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0,
+                                              SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED)
+            try:
+                ctypes.windll.user32.UpdateWindow(hwnd)
+            except Exception:
+                pass
+        except Exception as e:
+            logger.warning(f"[spiral.trace] _refresh_win32_styles failed: {e}")
+
+    def _set_layered_alpha(self, alpha: int):
+        """Set per-window layered alpha (0..255) if WS_EX_LAYERED is active."""
+        if sys.platform != "win32" or not ctypes:
+            return
+        try:
+            hwnd = int(self.winId())
+            if not hwnd:
+                return
+            LWA_ALPHA = 0x02
+            ctypes.windll.user32.SetLayeredWindowAttributes(hwnd, 0, int(max(0, min(255, alpha))), LWA_ALPHA)
+        except Exception as e:
+            logger.warning(f"[spiral.trace] _set_layered_alpha({alpha}) failed: {e}")
+
+    def _apply_win32_layered_styles(self):
+        """Ensure WS_EX_LAYERED and WS_EX_TRANSPARENT are set, and set LWA_ALPHA=255 for uniform alpha.
+        Called multiple times safely (idempotent)."""
+        if sys.platform != "win32" or not ctypes:
+            return
+        try:
+            GWL_EXSTYLE = -20
+            WS_EX_LAYERED = 0x00080000
+            WS_EX_TRANSPARENT = 0x00000020
+            WS_EX_TOOLWINDOW = 0x00000080
+            LWA_ALPHA = 0x02
+            hwnd = int(self.winId())
+            if not hwnd:
+                return
+            # Get/Set extended styles
+            style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            new_style = style | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW
+            if new_style != style:
+                ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, new_style)
+            # Ensure alpha=255 (fully opaque) at the window level so per-pixel alpha shows through
+            try:
+                ctypes.windll.user32.SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA)
+            except Exception:
+                pass
+        except Exception as e:
+            logger.warning(f"[spiral.trace] _apply_win32_layered_styles failed: {e}")
+
+    # --- Optional: sneaky click to trigger OS composition refresh ---
+    def _sneaky_click_bottom(self):  # pragma: no cover - platform interaction
+        if sys.platform != "win32" or not ctypes:
+            return
+        if getattr(self, "_sneaky_clicked", False):
+            return
+        try:
+            # Resolve target: PRIMARY screen, bottom-left origin. Click at (100, 0) by default
+            # relative to availableGeometry (avoids taskbar). Users can override via:
+            # MESMERGLASS_SNEAKY_CLICK_OFFSET_X and _Y (bottom-left origin).
+            primary = QGuiApplication.primaryScreen()
+            screen = primary or self.screen()
+            if screen is None:
+                return
+            # Work area to avoid taskbar/start
+            try:
+                geom = screen.availableGeometry()
+            except Exception:
+                geom = screen.geometry()
+            # Read offsets (bottom-left origin: y=0 is bottom edge)
+            try:
+                off_x = int(os.environ.get("MESMERGLASS_SNEAKY_CLICK_OFFSET_X", "100"))
+            except Exception:
+                off_x = 100
+            try:
+                off_y = int(os.environ.get("MESMERGLASS_SNEAKY_CLICK_OFFSET_Y", "0"))
+            except Exception:
+                off_y = 0
+            # Clamp within the work area, keep a 2px inset
+            left = geom.x() + 2
+            right = geom.x() + geom.width() - 2
+            bottom = geom.y() + geom.height() - 2
+            top = geom.y() + 2
+            target_x = max(left, min(right, geom.x() + off_x))
+            # Convert bottom-left y (0 at bottom) to screen coords (top-left origin)
+            target_y = max(top, min(bottom, bottom - off_y))
+
+            # Save current cursor pos
+            pt = wintypes.POINT()
+            ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+
+            # Move to target and click
+            ctypes.windll.user32.SetCursorPos(int(target_x), int(target_y))
+            MOUSEEVENTF_LEFTDOWN = 0x0002
+            MOUSEEVENTF_LEFTUP = 0x0004
+            ctypes.windll.user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+            ctypes.windll.user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+
+            # Restore cursor
+            ctypes.windll.user32.SetCursorPos(pt.x, pt.y)
+            self._sneaky_clicked = True
+            logger.info("[spiral.trace] Performed sneaky click at bottom of screen to refresh composition")
+        except Exception as e:
+            logger.warning(f"[spiral.trace] _sneaky_click_bottom failed: {e}")
 
 
 def probe_window_available() -> bool:
