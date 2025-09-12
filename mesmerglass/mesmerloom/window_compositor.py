@@ -8,7 +8,7 @@ import time
 import os
 import sys
 from typing import Optional, Dict, Union
-from PyQt6.QtCore import QTimer, Qt
+from PyQt6.QtCore import QTimer, Qt, pyqtSignal
 from PyQt6.QtOpenGL import QOpenGLWindow, QOpenGLBuffer, QOpenGLShaderProgram, QOpenGLVertexArrayObject
 from PyQt6.QtGui import QSurfaceFormat, QColor, QGuiApplication
 from OpenGL import GL
@@ -36,6 +36,8 @@ class LoomWindowCompositor(QOpenGLWindow):
     QOpenGLWindow-based spiral compositor.
     Eliminates Qt widget FBO blit artifacts completely.
     """
+    # Emit after a frame is drawn so duplicate/mirror windows can update
+    frame_drawn = pyqtSignal()
     
     def __init__(self, director, parent=None):
         super().__init__(parent)
@@ -484,6 +486,12 @@ class LoomWindowCompositor(QOpenGLWindow):
             if self.frame_count % (self._log_interval * 4) == 0:  # Extra debug every 240 frames
                 logger.info(f"[spiral.trace] Director uniforms: {list(uniforms.keys())}")
                 logger.info(f"[spiral.trace] Key values: uIntensity={uniforms.get('uIntensity', 'MISSING')}, uPhase={uniforms.get('uPhase', 'MISSING')}, uBarWidth={uniforms.get('uBarWidth', 'MISSING')}")
+        
+        # Notify listeners (duplicate/mirror windows) that a new frame is available
+        try:
+            self.frame_drawn.emit()
+        except Exception:
+            pass
     
     def resizeGL(self, width, height):
         """Handle window resize"""
@@ -557,6 +565,34 @@ class LoomWindowCompositor(QOpenGLWindow):
             
         self.available = False
         logger.info("[spiral.trace] LoomWindowCompositor cleaned up")
+
+    # --- Duplicate/mirror support: read the current framebuffer as QImage ---
+    def get_framebuffer_image(self):  # parity with widget compositor API
+        """Return a QImage of the current window framebuffer for duplication.
+
+        Uses QOpenGLWindow.grabFramebuffer() which handles the correct buffer
+        selection internally on this platform window type.
+        """
+        try:
+            # Ensure window is exposed and initialized; otherwise grabbing may fail
+            if not self.isExposed() or not self.initialized or not self.available:
+                return None
+            img = self.grabFramebuffer()  # QImage
+            try:
+                # Normalize DPR similar to widget compositor logic
+                dpr = getattr(self, 'devicePixelRatioF', lambda: 1.0)()
+                if hasattr(img, 'setDevicePixelRatio'):
+                    img.setDevicePixelRatio(float(dpr))
+            except Exception:
+                pass
+            if img and not img.isNull():
+                logger.info(f"[spiral.trace] window get_framebuffer_image: VALID {img.width()}x{img.height()} dpr={getattr(img,'devicePixelRatio',lambda:1.0)():.2f}")
+                return img
+            logger.warning("[spiral.trace] window get_framebuffer_image: null image")
+            return None
+        except Exception as e:
+            logger.error(f"[spiral.trace] window get_framebuffer_image error: {e}")
+            return None
     
     def closeEvent(self, event):
         """Handle window close"""

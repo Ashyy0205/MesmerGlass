@@ -467,9 +467,13 @@ class Launcher(QMainWindow):
             logging.getLogger(__name__).info(f"[spiral.trace] Setting window opacity to {opacity} on {len(getattr(self, 'spiral_windows', []))} windows")
             for win in list(getattr(self, 'spiral_windows', [])):
                 try:
+                    # Main GL overlay (QOpenGLWindow compositor):
                     if hasattr(win, 'comp') and hasattr(win.comp, 'setWindowOpacity'):
                         logging.getLogger(__name__).info(f"[spiral.trace] Calling setWindowOpacity({opacity}) on window {win}")
                         win.comp.setWindowOpacity(opacity)
+                    # Duplicate QWidget mirror window:
+                    elif hasattr(win, 'set_overlay_opacity'):
+                        win.set_overlay_opacity(opacity)
                     else:
                         logging.getLogger(__name__).warning(f"[spiral.trace] Window {win} missing comp or setWindowOpacity method")
                 except Exception as e:
@@ -588,6 +592,13 @@ class Launcher(QMainWindow):
                             logging.getLogger(__name__).warning(f"[launcher] main_win missing 'comp' attribute for duplicate window on screen {sc.name()}")
                     else:
                         logging.getLogger(__name__).warning(f"[launcher] No main_win for duplicate window on screen {sc.name()}")
+                    # Apply current opacity to duplicate mirror window so overlay effect matches main.
+                    try:
+                        current_opacity = getattr(self, 'spiral_opacity', 0.85)
+                        if hasattr(dup_win, 'set_overlay_opacity'):
+                            dup_win.set_overlay_opacity(current_opacity)
+                    except Exception:
+                        pass
                     dup_win.showFullScreen(); dup_win.raise_()
                     self.spiral_windows.append(dup_win)
                 except Exception as e:
