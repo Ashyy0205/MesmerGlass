@@ -6,8 +6,9 @@ enhancements (menu bar, pack path tracking) will be re-applied as small
 incremental diffs on top of this stable baseline.
 """
 
-import os, time, random, threading, time as _time_mod, asyncio  # asyncio added for persistent BLE loop
-from typing import List, Any
+import os, time, random, threading, time as _time_mod, asyncio, json  # asyncio added for persistent BLE loop
+from typing import List, Dict, Any, Optional
+from pathlib import Path  # For theme bank initialization
 
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject
 from PyQt6.QtGui import QColor, QFont, QGuiApplication, QShortcut, QKeySequence
@@ -22,18 +23,34 @@ from ..engine.audio import Audio2
 from ..engine.pulse import PulseEngine, clamp
 from mesmerglass.mesmerloom.spiral import SpiralDirector  # spiral parameter director (GL overlay)
 try:
+    # Visual Programs integration
+    from ..mesmerloom.visual_director import VisualDirector
+    from ..engine.text_director import TextDirector
+    from ..content.text_renderer import TextRenderer
+    from ..content.simple_video_streamer import SimpleVideoStreamer
+    from ..content.themebank import ThemeBank
+except Exception as e:
+    logging.getLogger(__name__).warning(f"Visual Programs imports failed: {e}")
+    VisualDirector = None  # type: ignore
+    TextDirector = None  # type: ignore
+    TextRenderer = None  # type: ignore
+    SimpleVideoStreamer = None  # type: ignore
+    ThemeBank = None  # type: ignore
+try:
     # MesmerIntiface optional if bleak is not installed in current environment.
     from ..engine.mesmerintiface import MesmerIntifaceServer  # type: ignore
 except Exception:  # pragma: no cover - fallback when bleak missing or import error
     MesmerIntifaceServer = None  # type: ignore
 from .overlay import OverlayWindow
-from .pages.textfx import TextFxPage
 from .pages.device import DevicePage
 from .pages.audio import AudioPage
 from .pages.devtools import DevToolsPage  # DevTools content (now hosted in separate window)
 from .pages.performance import PerformancePage  # Performance metrics page
+# Visual Programs tab removed - replaced with simple media mode selector in MesmerLoom tab
+from .text_tab import TextTab  # Simplified text tab (messages only)
 # Note: SpiralPage removed - opacity controls moved to MesmerLoom tab
 from .panel_mesmerloom import PanelMesmerLoom
+from ..vr.vr_bridge import VrBridge  # VR bridge (OpenXR or mock)
 try:
     import logging
     try:
@@ -99,9 +116,22 @@ class Launcher(QMainWindow):
         self.flash_interval_ms = 1200; self.flash_width_ms = 250
         self.audio1_path = ""; self.audio2_path = ""; self.vol1 = 0.5; self.vol2 = 0.5
         self.enable_device_sync = bool(enable_device_sync_default)
+        # Env override to fully disable the PulseEngine/device sync for stability (e.g. VR-only sessions)
+        try:
+            import os as _os
+            if _os.environ.get("MESMERGLASS_NO_PULSE", "0") in ("1", "true", "True", "yes"):
+                self.enable_device_sync = False
+                logging.getLogger(__name__).info("[device] MESMERGLASS_NO_PULSE=1 -> device sync disabled")
+        except Exception:
+            pass
         self.enable_buzz_on_flash = True; self.buzz_intensity = 0.6
         self.enable_bursts = False; self.burst_min_s = 30; self.burst_max_s = 120; self.burst_peak = 0.9; self.burst_max_ms = 1200
         self.overlays = []  # list of OverlayWindow instances
+
+        # Media cycling (simple random cycler replacing Visual Programs)
+        self.media_mode = 1  # 0=images&videos, 1=images only, 2=video focus (default: Images Only)
+        self.image_duration_sec = 5  # Default 5 seconds per image
+        self.video_duration_sec = 30  # Default 30 seconds per video
 
         # Spiral (phase 1 logic only + MesmerLoom compositor wiring)
         self.spiral_enabled = False
@@ -118,6 +148,30 @@ class Launcher(QMainWindow):
         except Exception:
             pass
         self.running = False
+        
+        # VR streaming integration (using MesmerVisor streaming server)
+        from ..mesmervisor.streaming_server import VRStreamingServer, DiscoveryService
+        from ..mesmervisor.gpu_utils import EncoderType
+        self.vr_streaming_server = None  # Will be created on-demand when VR client selected
+        self.vr_clients = []  # List of discovered VR clients (from discovery service)
+        self._vr_streaming_active = False
+        
+        # Start discovery service immediately to find VR devices
+        # (streaming server created later on-demand)
+        self.vr_discovery_service = DiscoveryService(
+            discovery_port=5556, 
+            streaming_port=5555
+        )
+        self.vr_discovery_service.start()
+        
+        # Auto-refresh VR clients list every 2 seconds
+        self._vr_refresh_timer = QTimer(self)
+        self._vr_refresh_timer.setInterval(2000)
+        self._vr_refresh_timer.timeout.connect(self._refresh_vr_displays)
+        self._vr_refresh_timer.start()
+        
+        # Also do an initial refresh after 1 second to catch early discoveries
+        QTimer.singleShot(1000, self._refresh_vr_displays)
         # MesmerLoom compositor (may be None / unavailable headless)
         self.compositor = None
         try:
@@ -136,8 +190,151 @@ class Launcher(QMainWindow):
                 self.compositor.set_active(False)
         except Exception:
             self.compositor = None
+        
+        # Visual Programs integration (theme bank, text renderer, video streamer, director)
+        self.theme_bank = None
+        self.text_renderer = None
+        self.video_streamer = None
+        self.visual_director = None
+        self.text_director = None  # Independent text control system
+        
+        # Media Bank: Global list of all available media directories
+        # Each mode selects which bank entries to use (stored as indices in mode JSON)
+        # Starts empty - user must add directories via MesmerLoom tab
+        self._media_bank: List[Dict[str, Any]] = []
+        
+        # Load saved Media Bank from config file if it exists
+        self._load_media_bank_config()
+        # Allow disabling all media/text/video subsystems for VR-minimal stability
+        self._no_media = False
+        try:
+            _env = os.environ
+            self._no_media = (
+                _env.get("MESMERGLASS_NO_MEDIA", "0") in ("1", "true", "True", "yes")
+                or _env.get("MESMERGLASS_VR_MINIMAL", "0") in ("1", "true", "True", "yes")
+            )
+            if self._no_media:
+                logging.getLogger(__name__).info("[media] NO_MEDIA=1/VR_MINIMAL=1 -> skipping ThemeBank/Text/Video initialization")
+        except Exception:
+            self._no_media = False
+        try:
+            if not self._no_media and ThemeBank is not None:
+                # Initialize theme bank with test media for demonstration
+                from ..content.theme import ThemeConfig
+                
+                # Get test media directory
+                media_dir = Path(__file__).parent.parent.parent / "MEDIA"
+                
+                # Check if MediaBank has enabled entries - if so, use those instead of test theme
+                enabled_bank_entries = [i for i, entry in enumerate(self._media_bank) 
+                                       if entry.get('enabled', True)]
+                
+                if enabled_bank_entries:
+                    # Use MediaBank entries to build theme
+                    logging.getLogger(__name__).info(
+                        f"[visual] Found {len(enabled_bank_entries)} enabled MediaBank entries - "
+                        f"rebuilding theme from bank"
+                    )
+                    self._rebuild_media_library_from_selections(enabled_bank_entries, silent=True)
+                else:
+                    # No MediaBank entries - create test theme with sample content
+                    logging.getLogger(__name__).info("[visual] No MediaBank entries - using default MEDIA folder")
+                    
+                    test_images = []
+                    test_videos = []
+                    test_text = [
+                        "Welcome to MesmerGlass",
+                        "Trance Visual Programs",
+                        "Relax and Focus",
+                        "Let Go",
+                        "Deep and Deeper",
+                        "Spiral Down",
+                        "Good Subject",
+                        "Obey and Enjoy"
+                    ]
+                    
+                    # Scan for test images if MEDIA directory exists
+                    if media_dir.exists():
+                        images_dir = media_dir / "Images"
+                        videos_dir = media_dir / "Videos"
+                        
+                        if images_dir.exists():
+                            # Collect image paths (relative to media_dir)
+                            for ext in ['*.jpg', '*.jpeg', '*.png', '*.gif', '*.webp']:
+                                for img_path in images_dir.glob(ext):
+                                    test_images.append(str(img_path.relative_to(media_dir)))
+                        
+                        if videos_dir.exists():
+                            # Collect video paths (relative to media_dir)
+                            for ext in ['*.mp4', '*.webm', '*.mkv', '*.avi']:
+                                for vid_path in videos_dir.glob(ext):
+                                    test_videos.append(str(vid_path.relative_to(media_dir)))
+                    
+                    # Create theme config
+                    default_theme = ThemeConfig(
+                        name="Test Theme",
+                        enabled=True,
+                        image_path=test_images,  # Correct field name
+                        animation_path=test_videos,  # Correct field name
+                        font_path=[],
+                        text_line=test_text  # Correct field name
+                    )
+                    
+                    self.theme_bank = ThemeBank(
+                        themes=[default_theme],
+                        root_path=media_dir if media_dir.exists() else Path.cwd(),
+                        image_cache_size=64
+                    )
+                    
+                    # Activate the theme (set as primary)
+                    if len(self.theme_bank._themes) > 0:
+                        self.theme_bank.set_active_themes(primary_index=1)  # 1-indexed
+                    
+                    img_count = len(test_images)
+                    vid_count = len(test_videos)
+                    txt_count = len(test_text)
+                    logging.getLogger(__name__).info(
+                        f"[visual] ThemeBank initialized with test theme: "
+                        f"{img_count} images, {vid_count} videos, {txt_count} text lines"
+                    )
+            if not self._no_media and TextRenderer is not None:
+                # Initialize text renderer
+                self.text_renderer = TextRenderer()
+                logging.getLogger(__name__).info("[visual] TextRenderer initialized")
+            
+            if not self._no_media and SimpleVideoStreamer is not None:
+                # Initialize video streamer (forward-only mode, no ping-pong)
+                self.video_streamer = SimpleVideoStreamer(buffer_size=120)
+                logging.getLogger(__name__).info("[visual] SimpleVideoStreamer initialized (forward-only)")
+            
+            if not self._no_media and TextDirector is not None and self.text_renderer and self.compositor:
+                # Initialize text director FIRST (text library manager)
+                self.text_director = TextDirector(
+                    text_renderer=self.text_renderer,
+                    compositor=self.compositor
+                )
+                logging.getLogger(__name__).info("[text] TextDirector initialized (text library manager)")
+            
+            if not self._no_media and VisualDirector is not None and self.theme_bank and self.compositor:
+                # Initialize visual director (with text_director for text selection)
+                self.visual_director = VisualDirector(
+                    theme_bank=self.theme_bank,
+                    compositor=self.compositor,
+                    text_renderer=self.text_renderer,
+                    video_streamer=self.video_streamer,
+                    text_director=self.text_director  # Visual Programs request texts from here
+                )
+                logging.getLogger(__name__).info("[visual] VisualDirector initialized (with text_director integration)")
+        except Exception as e:
+            logging.getLogger(__name__).error(f"[visual] Visual Programs initialization failed: {e}")
+            import traceback
+            traceback.print_exc()
+        
         # Runtime spiral windows (one per selected display)
         self.spiral_windows = []
+        # VR bridge plumbing
+        self.vr_bridge = None
+        self._vr_comp = None  # currently connected compositor for VR frames
 
         # Auto diagnostic spiral enable/launch (no UI click) if env set
         try:
@@ -169,21 +366,33 @@ class Launcher(QMainWindow):
         self._shutting_down = False
 
         # Persistent BLE loop ---------------------------------------
-        self._ble_loop = asyncio.new_event_loop()
-        self._ble_loop_alive = True
-        def _ble_loop_runner():
-            asyncio.set_event_loop(self._ble_loop)
-            try:
-                self._ble_loop.run_forever()
-            except Exception as e:  # pragma: no cover
-                logging.getLogger(__name__).error("BLE loop crash: %s", e)
-            finally:
+        # Allow disabling the dedicated BLE asyncio loop via env to avoid
+        # interactions with Windows WinRT/BLE in VR-only scenarios.
+        self._ble_loop = None
+        self._ble_loop_alive = False
+        try:
+            import os as _os
+            _disable_ble_loop = _os.environ.get("MESMERGLASS_NO_BLE_LOOP", "0") in ("1", "true", "True", "yes") or bool(_os.environ.get("MESMERGLASS_NO_SERVER"))
+        except Exception:
+            _disable_ble_loop = False
+        if not _disable_ble_loop:
+            self._ble_loop = asyncio.new_event_loop()
+            self._ble_loop_alive = True
+            def _ble_loop_runner():
+                asyncio.set_event_loop(self._ble_loop)
                 try:
-                    self._ble_loop.close()
-                except Exception:
-                    pass
-        self._ble_loop_thread = threading.Thread(target=_ble_loop_runner, name="BLELoop", daemon=True)
-        self._ble_loop_thread.start()
+                    self._ble_loop.run_forever()
+                except Exception as e:  # pragma: no cover
+                    logging.getLogger(__name__).error("BLE loop crash: %s", e)
+                finally:
+                    try:
+                        self._ble_loop.close()
+                    except Exception:
+                        pass
+            self._ble_loop_thread = threading.Thread(target=_ble_loop_runner, name="BLELoop", daemon=True)
+            self._ble_loop_thread.start()
+        else:
+            logging.getLogger(__name__).info("[device] BLE loop disabled via env (MESMERGLASS_NO_BLE_LOOP or MESMERGLASS_NO_SERVER)")
 
         # Environment flags -----------------------------------------
         self._suppress_server = bool(os.environ.get("MESMERGLASS_NO_SERVER"))
@@ -197,6 +406,21 @@ class Launcher(QMainWindow):
             )
         except Exception:
             pass
+        # VR flags
+        try:
+            self._vr_enabled = (os.environ.get("MESMERGLASS_VR") == '1')
+            self._vr_force_mock = (os.environ.get("MESMERGLASS_VR_MOCK") == '1')
+            if self._vr_enabled:
+                self._init_vr_bridge()
+        except Exception:
+            self._vr_enabled = False
+            self._vr_force_mock = False
+        # Strict mode enforcement (force EXACT adherence to mode timing)
+        try:
+            self._strict_mode = (os.environ.get("MESMERGLASS_STRICT_MODE") == '1')
+            logging.getLogger(__name__).info("[mode] Strict mode: %s", self._strict_mode)
+        except Exception:
+            self._strict_mode = False
 
         # UI / services ----------------------------------------------
         self._build_ui()
@@ -225,27 +449,33 @@ class Launcher(QMainWindow):
 
         self.tabs = QTabWidget()
 
-        # Media tab
-        scr_media = QScrollArea(); scr_media.setWidgetResizable(True); scr_media.setFrameShape(QFrame.Shape.NoFrame)
-        scr_media.setWidget(self._page_media()); self.tabs.addTab(scr_media, "Media")
+        # === CONTROL TABS ===
 
-        # Text & FX tab
-        self.page_textfx = TextFxPage(
-            text=self.text,
-            text_scale_pct=self.text_scale_pct,
-            fx_mode=self.fx_mode,
-            fx_intensity=self.fx_intensity,
-            flash_interval_ms=self.flash_interval_ms,
-            flash_width_ms=self.flash_width_ms,
-        )
-        try: self.page_textfx.loadPackRequested.connect(self._on_load_session_pack)
-        except Exception: pass
-        try: self.page_textfx.createPackRequested.connect(self._on_create_message_pack)
-        except Exception: pass
-        try: self.page_textfx.loadFontRequested.connect(self._on_load_font)
-        except Exception: pass
-        scr_txt = QScrollArea(); scr_txt.setWidgetResizable(True); scr_txt.setFrameShape(QFrame.Shape.NoFrame)
-        scr_txt.setWidget(self.page_textfx); self.tabs.addTab(scr_txt, "Text & FX")
+        # Media tab removed (redundant; media is controlled by mode JSON via VisualDirector)
+        # Intentionally no-op: keep legacy fields/state for session state compatibility.
+
+        # Text tab (simplified - messages only)
+        try:
+            self.page_text = TextTab(text_director=getattr(self, 'text_director', None))
+            scr_txt = QScrollArea(); scr_txt.setWidgetResizable(True); scr_txt.setFrameShape(QFrame.Shape.NoFrame)
+            scr_txt.setWidget(self.page_text)
+            idx_text = self.tabs.addTab(scr_txt, "📝 Text")
+            try: self.tabs.setTabToolTip(idx_text, "Text message library (add/edit/remove messages)")
+            except Exception: pass
+        except Exception as e:
+            logging.getLogger(__name__).error(f"Text tab creation failed: {e}", exc_info=True)
+            self.page_text = None  # type: ignore
+
+        # MesmerLoom tab (Spiral controls)
+        try:
+            self.page_mesmerloom = PanelMesmerLoom(self.spiral_director, self.compositor, self)
+            scr_ml = QScrollArea(); scr_ml.setWidgetResizable(True); scr_ml.setFrameShape(QFrame.Shape.NoFrame)
+            scr_ml.setWidget(self.page_mesmerloom)
+            idx_ml = self.tabs.addTab(scr_ml, "🌀 MesmerLoom")
+            try: self.tabs.setTabToolTip(idx_ml, "Spiral overlay controls - intensity, colors, type, width")
+            except Exception: pass
+        except Exception:
+            self.page_mesmerloom = None  # type: ignore
 
         # Audio tab
         self.page_audio = AudioPage(
@@ -255,7 +485,10 @@ class Launcher(QMainWindow):
             vol2_pct=int(self.vol2 * 100),
         )
         scr_audio = QScrollArea(); scr_audio.setWidgetResizable(True); scr_audio.setFrameShape(QFrame.Shape.NoFrame)
-        scr_audio.setWidget(self.page_audio); self.tabs.addTab(scr_audio, "Audio")
+        scr_audio.setWidget(self.page_audio)
+        idx_audio = self.tabs.addTab(scr_audio, "🎵 Audio")
+        try: self.tabs.setTabToolTip(idx_audio, "Background music and audio tracks")
+        except Exception: pass
 
         # Device tab
         self.page_device = DevicePage(
@@ -269,26 +502,17 @@ class Launcher(QMainWindow):
             max_ms=self.burst_max_ms,
         )
         scr_dev = QScrollArea(); scr_dev.setWidgetResizable(True); scr_dev.setFrameShape(QFrame.Shape.NoFrame)
-        scr_dev.setWidget(self.page_device); self.tabs.addTab(scr_dev, "Device Sync")
+        scr_dev.setWidget(self.page_device)
+        idx_dev = self.tabs.addTab(scr_dev, "🔗 Device Sync")
+        try: self.tabs.setTabToolTip(idx_dev, "Haptic device synchronization (Buttplug.io)")
+        except Exception: pass
 
         # Displays tab
         scr_disp = QScrollArea(); scr_disp.setWidgetResizable(True); scr_disp.setFrameShape(QFrame.Shape.NoFrame)
-        scr_disp.setWidget(self._page_displays()); self.tabs.addTab(scr_disp, "Displays")
-
-        # Note: SpiralPage removed - opacity controls moved to MesmerLoom tab
-
-        # MesmerLoom panel (Step 3)
-        try:
-            self.page_mesmerloom = PanelMesmerLoom(self.spiral_director, self.compositor, self)
-            scr_ml = QScrollArea(); scr_ml.setWidgetResizable(True); scr_ml.setFrameShape(QFrame.Shape.NoFrame)
-            scr_ml.setWidget(self.page_mesmerloom); self.tabs.addTab(scr_ml, "MesmerLoom")
-            # Sync enable checkbox with existing spiral toggle state
-            self.page_mesmerloom.spiralEnabledChanged.connect(self._on_spiral_toggled)
-            # Initialize checkbox state to reflect current spiral flag
-            try: self.page_mesmerloom.chk_enable.setChecked(self.spiral_enabled)
-            except Exception: pass
-        except Exception:
-            self.page_mesmerloom = None  # type: ignore
+        scr_disp.setWidget(self._page_displays())
+        idx_disp = self.tabs.addTab(scr_disp, "🖥️ Displays")
+        try: self.tabs.setTabToolTip(idx_disp, "Select which monitors show the overlay")
+        except Exception: pass
 
         if self.layout_mode == 'sidebar':
             # Simple sidebar nav replicating prior behavior
@@ -302,8 +526,10 @@ class Launcher(QMainWindow):
             main.addWidget(top,0)
             center = QWidget(); ch = QHBoxLayout(center); ch.setContentsMargins(0,0,0,0); ch.setSpacing(10)
             self.nav = QListWidget(); self.nav.setObjectName('sideNav')
-            for name in ("Media","Text & FX","Audio","Device Sync","Displays","Spiral"): self.nav.addItem(name)
-            self.nav.setCurrentRow(0)
+            # Simplified tab list (Visual Programs tab removed in Phase 2)
+            for name in (" MesmerLoom", "🎵 Audio", "🔗 Device Sync", "🖥️ Displays"):
+                self.nav.addItem(name)
+            self.nav.setCurrentRow(0)  # Start on MesmerLoom
             try: self.tabs.tabBar().setVisible(False)
             except Exception: pass
             ch.addWidget(self.nav,0); ch.addWidget(self.tabs,1); main.addWidget(center,1)
@@ -315,16 +541,11 @@ class Launcher(QMainWindow):
             main.addWidget(self.tabs,1)
 
         # Signal wiring ------------------------------------------------
-        # Text / FX
+        # Text tab (simplified - no signals needed for message library)
         try:
-            self.page_textfx.textChanged.connect(lambda s: setattr(self, 'text', s))
-            self.page_textfx.textScaleChanged.connect(lambda v: setattr(self, 'text_scale_pct', v))
-            self.page_textfx.fxModeChanged.connect(lambda s: setattr(self, 'fx_mode', s))
-            self.page_textfx.fxIntensityChanged.connect(lambda v: setattr(self, 'fx_intensity', v))
-            self.page_textfx.flashIntervalChanged.connect(lambda v: setattr(self, 'flash_interval_ms', v))
-            self.page_textfx.flashWidthChanged.connect(lambda v: setattr(self, 'flash_width_ms', v))
-            if hasattr(self.page_textfx, 'colorChanged'):
-                self.page_textfx.colorChanged.connect(self._on_text_color_changed)
+            if hasattr(self, 'page_text') and self.page_text:
+                # TextTab manages its own text_director, no external signals needed
+                pass
         except Exception: pass
         # Audio
         try:
@@ -347,18 +568,6 @@ class Launcher(QMainWindow):
             self.page_device.burstPeakChanged.connect(lambda v: setattr(self,'burst_peak', v/100.0))
             self.page_device.burstMaxMsChanged.connect(lambda v: setattr(self,'burst_max_ms', v))
         except Exception: pass
-        # MesmerLoom opacity controls (moved from SpiralPage)
-        if getattr(self, 'page_mesmerloom', None):
-            try:
-                logging.getLogger(__name__).info(f"[spiral.trace] Connecting mesmerloom opacity signals...")
-                self.page_mesmerloom.opacityChanged.connect(lambda f: setattr(self, 'spiral_opacity', f))
-                self.page_mesmerloom.opacityChanged.connect(self._on_window_opacity_changed)  # Also control window transparency
-                self.page_mesmerloom.opacityChanged.connect(lambda f: logging.getLogger(__name__).info(f"[spiral.trace] UI opacity slider moved to {f}"))  # Debug
-                logging.getLogger(__name__).info(f"[spiral.trace] MesmerLoom opacity signals connected successfully")
-            except Exception as e:
-                logging.getLogger(__name__).error(f"[spiral.trace] Failed to connect mesmerloom opacity signals: {e}")
-        else:
-            logging.getLogger(__name__).warning(f"[spiral.trace] page_mesmerloom is None - opacity signals not connected")
 
         # Footer -------------------------------------------------------
         footer = QWidget(); footer.setObjectName('footerBar')
@@ -375,6 +584,101 @@ class Launcher(QMainWindow):
         self.btn_launch.clicked.connect(self.launch)
         self.btn_stop.clicked.connect(self.stop_all)
         self._refresh_status()
+        
+        # Setup keyboard shortcuts
+        self._setup_shortcuts()
+        # Start a lightweight frame tick so spiral rotation and visuals advance
+        # consistently at ~60 FPS even without the legacy SpiralPage toggle.
+        try:
+            self._mode_tick = QTimer(self)
+            self._mode_tick.setInterval(16)
+            # Avoid duplicate connections in case of re-init
+            try:
+                self._mode_tick.timeout.disconnect()  # type: ignore[arg-type]
+            except Exception:
+                pass
+            self._mode_tick.timeout.connect(self._tick_visuals)
+            if not self._mode_tick.isActive():
+                self._mode_tick.start()
+        except Exception as e:
+            logging.getLogger(__name__).warning(f"[visual] Could not start mode tick: {e}")
+
+    def _setup_shortcuts(self):
+        """Setup keyboard shortcuts for launcher actions."""
+        from PyQt6.QtGui import QShortcut, QKeySequence
+        from PyQt6.QtCore import Qt
+        
+        # Ctrl+R: Reload custom mode
+        reload_shortcut = QShortcut(QKeySequence("Ctrl+R"), self)
+        reload_shortcut.activated.connect(self._on_reload_custom_mode)
+        logging.getLogger(__name__).info("[launcher] Keyboard shortcut registered: Ctrl+R = Reload Custom Mode")
+
+    # ==========================
+    # Mode / visuals integration
+    # ==========================
+    def _tick_visuals(self):
+        """Advance spiral rotation and current visual once per frame.
+
+        Keeps Launcher visuals in lockstep with VMC by using the MesmerLoom
+        SpiralDirector RPM-based rotation and a fixed 60 FPS dt.
+        """
+        try:
+            if hasattr(self, 'spiral_director') and self.spiral_director:
+                # Amount parameter is ignored in RPM mode; retained for compatibility
+                self.spiral_director.rotate_spiral(0.0)
+                self.spiral_director.update(1/60.0)
+        except Exception as e:
+            logging.getLogger(__name__).debug(f"[visual] spiral tick error: {e}")
+
+        try:
+            if hasattr(self, 'visual_director') and self.visual_director:
+                self.visual_director.update(dt=1/60.0)
+        except Exception as e:
+            logging.getLogger(__name__).debug(f"[visual] director update error: {e}")
+
+        try:
+            if self.compositor:
+                if hasattr(self.compositor, 'update_zoom_animation'):
+                    self.compositor.update_zoom_animation()
+                self.compositor.update()
+        except Exception:
+            pass
+
+    def _on_custom_mode_requested(self, mode_path: str) -> None:
+        """Load a custom visual mode JSON and apply its settings.
+
+        Called by PanelMesmerLoom when the user selects a mode; this wires through
+        VisualDirector → CustomVisual so spiral/media/text/zoom are applied.
+        """
+        try:
+            from pathlib import Path as _Path
+            p = _Path(mode_path)
+            if not p.exists():
+                logging.getLogger(__name__).error(f"[visual] Mode not found: {p}")
+                return
+            if not self.visual_director:
+                logging.getLogger(__name__).error("[visual] VisualDirector not initialized")
+                return
+            ok = self.visual_director.select_custom_visual(p)
+            if not ok:
+                logging.getLogger(__name__).error(f"[visual] Failed to load mode: {p}")
+                return
+            cv = getattr(self.visual_director, 'current_visual', None)
+            # If strict mode is enabled, instruct the visual to disable its internal cycler.
+            try:
+                if self._strict_mode and cv and hasattr(cv, 'set_strict_mode'):
+                    cv.set_strict_mode(True)
+                    logging.getLogger(__name__).info("[mode] Enabled strict mode on CustomVisual")
+            except Exception:
+                pass
+            if cv and hasattr(cv, 'reapply_all_settings'):
+                try:
+                    cv.reapply_all_settings()
+                except Exception:
+                    pass
+            logging.getLogger(__name__).info(f"[visual] Custom mode loaded: {p.name}")
+        except Exception as e:
+            logging.getLogger(__name__).error(f"[visual] Mode load error: {e}")
 
     # ---------------- Spiral logic (Phase 1.1 stub) ----------------
     def _on_spiral_toggled(self, enabled: bool):  # connected by SpiralPage
@@ -388,7 +692,7 @@ class Launcher(QMainWindow):
         if self.spiral_enabled:
             if self.spiral_timer is None:
                 self.spiral_timer = QTimer(self)
-                self.spiral_timer.setInterval(33)  # ~30 FPS logic tick (no rendering yet)
+                self.spiral_timer.setInterval(16)  # ~60 FPS logic tick (matches VMC)
                 # Guard against duplicate connection
                 try:
                     self.spiral_timer.timeout.disconnect()  # type: ignore[arg-type]
@@ -436,16 +740,118 @@ class Launcher(QMainWindow):
             pass
 
     def _on_spiral_tick(self):  # placeholder: evolve parameters only
+        # Debug: Log first 3 calls to verify this method is being invoked
+        if not hasattr(self, '_tick_count'):
+            self._tick_count = 0
+        self._tick_count += 1
+        if self._tick_count <= 3:
+            logging.getLogger(__name__).info(f"[spiral_tick] Tick #{self._tick_count}: spiral_enabled={self.spiral_enabled}")
+        
         if not self.spiral_enabled:
+            if self._tick_count <= 3:
+                logging.getLogger(__name__).info(f"[spiral_tick] EARLY RETURN: spiral_enabled=False")
             return
         try:
-            # Deterministic dt for tests
-            self.spiral_director.update(1/30.0)
+            # Debug: Log first 3 ticks to verify this method is being called
+            if self._tick_count <= 3:
+                logging.getLogger(__name__).info(f"[spiral_tick] Tick #{self._tick_count}: using standard rotation method")
+            
+            # Use standard spiral rotation - the method now handles RPM calculation internally  
+            self.spiral_director.rotate_spiral(4.0)  # amount is ignored in new RPM mode
+            
+            # Deterministic dt for tests (60 FPS matches VMC)
+            self.spiral_director.update(1/60.0)
+            
+            # Debug: Log rotation speed to verify it's using correct RPM
+            if self._tick_count <= 3:
+                current_rpm = self.spiral_director.rotation_speed
+                phase_acc = getattr(self.spiral_director, '_phase_accumulator', 'NO_ATTR')
+                state_phase = getattr(self.spiral_director.state, 'phase', 'NO_ATTR')
+                logging.getLogger(__name__).info(f"[spiral_tick] RPM={current_rpm}, _phase_accumulator={phase_acc}, state.phase={state_phase}")
+            
             uniforms = self.spiral_director.export_uniforms() if hasattr(self.spiral_director, 'export_uniforms') else getattr(self.spiral_director, 'uniforms', lambda: {})()
-            if self.compositor and getattr(self.compositor, 'available', True):
+            
+            # Add rotation debug output for speed measurement (every 4th tick to match VMC frequency)
+            if self._tick_count % 4 == 0:
+                print(f"[Launcher rotation_debug] phase={uniforms.get('uPhase', 0):.6f}")
+                print(f"[Launcher rotation_debug] time={uniforms.get('time', 0):.6f}")
+                print(f"[Launcher rotation_debug] rotation_speed={uniforms.get('rotation_speed', 0)}")
+                print(f"[Launcher rotation_debug] uEffectiveSpeed={uniforms.get('uEffectiveSpeed', 0)}")
+                print(f"[Launcher rotation_debug] uBaseSpeed={uniforms.get('uBaseSpeed', 0)}")
+                print(f"[Launcher rotation_debug] uIntensity={uniforms.get('uIntensity', 0)}")
+                
+                # Add zoom debug output
+                current_zoom = uniforms.get('zoom_level', 1.0)
+                expected_zoom_rate = 0.05 * uniforms.get('rotation_speed', 0)
+                print(f"[Launcher zoom_debug] zoom_level={current_zoom:.6f}")
+                print(f"[Launcher zoom_debug] expected_zoom_rate={expected_zoom_rate:.6f}")
+                print(f"[Launcher zoom_debug] zoom_rate={uniforms.get('zoom_rate', 0):.6f}")
+            
+            # CRITICAL: Cache uniforms to prevent compositor from calling director.update() again
+            # This ensures spiral rotation happens exactly once per tick at the correct rate
+            if hasattr(self, 'spiral_windows') and self.spiral_windows:
+                for win in self.spiral_windows:
+                    if hasattr(win, 'comp') and hasattr(win.comp, '_uniforms_cache'):
+                        win.comp._uniforms_cache = uniforms.copy()
+                        if self._tick_count <= 3:
+                            logging.getLogger(__name__).info(f"[spiral_tick] Cached uniforms to compositor (time={uniforms.get('time', 'N/A')})")
+            
+            # Update visual director if running (this advances the visual's cycler)
+            if self.visual_director and self.visual_director.current_visual:
                 try:
-                    self.compositor.set_uniforms_from_director(uniforms)
-                    self.compositor.request_draw()
+                    self.visual_director.update(dt=1/60.0)
+                    
+                    # NOTE: Built-in visual restart removed in Phase 3
+                    # Custom modes handle their own looping/completion internally
+                    # Check if visual completed and restart for continuous playback (once per completion)
+                    # is_complete = self.visual_director.is_complete()
+                    # if is_complete:
+                    #     # Custom modes loop internally, no restart needed
+                    pass
+                    if False:  # Disabled - built-in visuals removed
+                        # Use a flag to prevent restarting multiple times per completion
+                        restarting = getattr(self, '_visual_restarting', False)
+                        if not restarting:
+                            self._visual_restarting = True
+                            # current_index = self.visual_director.current_visual_index  # Removed in Phase 3
+                            # logging.getLogger(__name__).info(f"[visual] Visual program completed (index={current_index}), restarting for continuous playback")
+                            # if current_index is not None:
+                            #     success = self.visual_director.select_visual(current_index)  # Method removed
+                            #     logging.getLogger(__name__).info(f"[visual] Restart result: {success}")
+                            self._visual_restarting = False
+                        else:
+                            # Debugging: log that we're skipping restart due to flag
+                            if self.visual_director.get_frame_count() % 60 == 0:
+                                logging.getLogger(__name__).debug(f"[visual] Complete but skipping restart (flag={restarting})")
+                    else:
+                        # Clear restart flag when visual is running normally
+                        self._visual_restarting = False
+                except Exception as e:
+                    logging.getLogger(__name__).error(f"[visual] Update error: {e}", exc_info=True)
+            elif getattr(self, '_visual_debug_logged', 0) < 3:
+                # Debug: Log why visual director isn't updating (max 3 times)
+                self._visual_debug_logged = getattr(self, '_visual_debug_logged', 0) + 1
+                logging.getLogger(__name__).warning(
+                    f"[visual] Not updating: visual_director={self.visual_director is not None} "
+                    f"current_visual={getattr(self.visual_director, 'current_visual', None) is not None if self.visual_director else 'N/A'}"
+                )
+            
+            if self.compositor and getattr(self.compositor, 'available', True):
+                # Send uniforms if compositor supports it
+                try:
+                    if hasattr(self.compositor, 'set_uniforms_from_director'):
+                        self.compositor.set_uniforms_from_director(uniforms)
+                except Exception:
+                    pass
+                # Request draw/update independently so tests see an update() call even if uniform method is absent
+                try:
+                    if hasattr(self.compositor, 'request_draw'):
+                        self.compositor.request_draw()
+                except Exception:
+                    pass
+                try:
+                    if hasattr(self.compositor, 'update'):
+                        self.compositor.update()
                 except Exception:
                     pass
             # Broadcast to any active runtime spiral windows
@@ -463,6 +869,11 @@ class Launcher(QMainWindow):
     def _on_window_opacity_changed(self, opacity: float):
         """Update window-level opacity for all spiral windows"""
         try:
+            # Prevent UI slider from overriding custom mode's opacity control
+            if self.visual_director and self.visual_director.is_custom_mode_active():
+                logging.getLogger(__name__).info(f"[CustomVisual] Ignoring window opacity change (custom mode has direct JSON control)")
+                return
+            
             logging.getLogger(__name__).info(f"[spiral.trace] _on_window_opacity_changed called with opacity={opacity}")
             logging.getLogger(__name__).info(f"[spiral.trace] Setting window opacity to {opacity} on {len(getattr(self, 'spiral_windows', []))} windows")
             for win in list(getattr(self, 'spiral_windows', [])):
@@ -521,6 +932,16 @@ class Launcher(QMainWindow):
                         logging.getLogger(__name__).warning(f"[spiral.trace] Error logging UI display idx={idx}: {e}")
         except Exception:
             checked_idx = []
+        
+        # Auto-select first display if none selected (same logic as launch())
+        if not checked_idx and self.list_displays.count() > 0:
+            try:
+                self.list_displays.item(0).setCheckState(Qt.CheckState.Checked)
+                checked_idx = [0]
+                logging.getLogger(__name__).info("_create_spiral_windows: auto-selected display 0 (none were checked)")
+            except Exception as e:
+                logging.getLogger(__name__).warning(f"_create_spiral_windows: auto-select failed: {e}")
+        
         if not checked_idx:
             try: logging.getLogger(__name__).info("_create_spiral_windows early-exit: no displays selected (list_displays.count=%s)", getattr(self, 'list_displays', None).count() if hasattr(self,'list_displays') else '?')
             except Exception: pass
@@ -529,6 +950,34 @@ class Launcher(QMainWindow):
         if self.spiral_windows and len(self.spiral_windows) == len(checked_idx):
             try: logging.getLogger(__name__).info("_create_spiral_windows early-exit: existing windows count matches selection (%d)", len(self.spiral_windows))
             except Exception: pass
+            
+            # Before early-exit, check if custom mode needs settings applied
+            logging.getLogger(__name__).info(f"[CustomVisual] Early-exit check: visual_director={self.visual_director is not None}")
+            if self.visual_director:
+                is_custom = self.visual_director.is_custom_mode_active()
+                logging.getLogger(__name__).info(f"[CustomVisual] Early-exit check: is_custom_mode_active={is_custom}")
+                if is_custom:
+                    try:
+                        from mesmerglass.mesmerloom.custom_visual import CustomVisual
+                        current = self.visual_director.current_visual
+                        logging.getLogger(__name__).info(f"[CustomVisual] Early-exit check: current_visual type={type(current).__name__}, spiral_windows={len(self.spiral_windows) if self.spiral_windows else 0}")
+                        if isinstance(current, CustomVisual) and self.spiral_windows:
+                            for win in self.spiral_windows:
+                                has_comp = hasattr(win, 'comp')
+                                # Check for spiral_director OR director (different compositor types)
+                                has_spiral = (hasattr(win.comp, 'spiral_director') or hasattr(win.comp, 'director')) if has_comp else False
+                                logging.getLogger(__name__).info(f"[CustomVisual] Early-exit check: win has_comp={has_comp}, has_spiral={has_spiral}")
+                                if has_comp and has_spiral:
+                                    current.compositor = win.comp
+                                    logging.getLogger(__name__).info("[CustomVisual] About to call reapply_all_settings()...")
+                                    current.reapply_all_settings()
+                                    logging.getLogger(__name__).info("[CustomVisual] Re-applied all settings (early-exit path)")
+                                    break
+                    except Exception as e:
+                        logging.getLogger(__name__).warning(f"[CustomVisual] Failed to re-apply settings (early-exit): {e}")
+                        import traceback
+                        traceback.print_exc()
+            
             return
         self._destroy_spiral_windows()
         if LoomCompositor is None:
@@ -555,13 +1004,56 @@ class Launcher(QMainWindow):
             if idx == 0:
                 # Main spiral overlay (GL)
                 try:
-                    win = SpiralWindow(self.spiral_director, parent=None, screen_index=i)
+                    # Pass defer_timer flag to SpiralWindow so it sets flag BEFORE compositor init
+                    defer_timer = getattr(self, '_defer_compositor_timer', False)
+                    win = SpiralWindow(self.spiral_director, parent=None, screen_index=i, defer_timer=defer_timer)
                     win.setGeometry(sc.geometry())
                     win.set_active(True)
                     
+                    # CRITICAL: Update visual director to use spiral window's compositor
+                    # Visual director was initialized with launcher's preview compositor,
+                    # but we need to use the spiral window's compositor for actual rendering
+                    if self.visual_director and hasattr(win, 'comp'):
+                        try:
+                            self.visual_director.compositor = win.comp
+                            logging.getLogger(__name__).info("[visual] Updated visual director to use spiral window compositor")
+                            
+                            # CRITICAL: Also update text director to use spiral window's compositor
+                            if self.text_director:
+                                # IMPORTANT: Preserve opacity setting from old compositor
+                                old_opacity = 1.0
+                                if self.text_director.compositor and hasattr(self.text_director.compositor, 'get_text_opacity'):
+                                    old_opacity = self.text_director.compositor.get_text_opacity()
+                                    logging.getLogger(__name__).info(f"[text] Preserving opacity {old_opacity:.2f} from old compositor")
+                                
+                                self.text_director.compositor = win.comp
+                                win.comp.text_director = self.text_director  # Bidirectional link
+                                logging.getLogger(__name__).info("[text] Updated text director to use spiral window compositor")
+                                
+                                # Apply the preserved opacity to the new compositor
+                                if hasattr(win.comp, 'set_text_opacity'):
+                                    win.comp.set_text_opacity(old_opacity)
+                                    logging.getLogger(__name__).info(f"[text] Applied preserved opacity {old_opacity:.2f} to new compositor")
+                            
+                            # CRITICAL: Also attach visual director to compositor so paintGL can update it
+                            win.comp.visual_director = self.visual_director
+                            logging.getLogger(__name__).info("[visual] Attached visual director to compositor for auto-updates")
+                            
+                            # NOTE: Do NOT auto-load media here - wait for Launch button
+                            # User expects mode to load in "preview" state without starting playback
+                            # Media will load when Launch button is pressed
+                        except Exception as e:
+                            logging.getLogger(__name__).warning(f"[visual] Failed to update compositor: {e}")
+                    
                     # Apply current opacity to new window
+                    # For custom modes, set window opacity to 1.0 so JSON has 100% direct control
                     try:
-                        current_opacity = getattr(self, 'spiral_opacity', 0.85)
+                        if self.visual_director and self.visual_director.is_custom_mode_active():
+                            current_opacity = 1.0
+                            logging.getLogger(__name__).info("[CustomVisual] Setting window opacity to 1.0 for direct JSON control")
+                        else:
+                            current_opacity = getattr(self, 'spiral_opacity', 0.85)
+                        
                         if hasattr(win, 'comp') and hasattr(win.comp, 'setWindowOpacity'):
                             win.comp.setWindowOpacity(current_opacity)
                             logging.getLogger(__name__).info(f"[spiral.trace] Applied opacity {current_opacity} to new spiral window")
@@ -571,6 +1063,12 @@ class Launcher(QMainWindow):
                     win.showFullScreen(); win.raise_()
                     self.spiral_windows.append(win)
                     main_win = win
+                    # VR: connect frame stream to VR bridge if enabled
+                    try:
+                        if self.vr_bridge and hasattr(win, 'comp') and hasattr(win.comp, 'frame_drawn'):
+                            self._connect_vr_to_comp(win.comp)
+                    except Exception:
+                        pass
                 except Exception:
                     continue
             else:
@@ -593,8 +1091,14 @@ class Launcher(QMainWindow):
                     else:
                         logging.getLogger(__name__).warning(f"[launcher] No main_win for duplicate window on screen {sc.name()}")
                     # Apply current opacity to duplicate mirror window so overlay effect matches main.
+                    # For custom modes, set to 1.0 for direct JSON control
                     try:
-                        current_opacity = getattr(self, 'spiral_opacity', 0.85)
+                        if self.visual_director and self.visual_director.is_custom_mode_active():
+                            current_opacity = 1.0
+                            logging.getLogger(__name__).info("[CustomVisual] Setting duplicate window opacity to 1.0 for direct JSON control")
+                        else:
+                            current_opacity = getattr(self, 'spiral_opacity', 0.85)
+                        
                         if hasattr(dup_win, 'set_overlay_opacity'):
                             dup_win.set_overlay_opacity(current_opacity)
                     except Exception:
@@ -608,9 +1112,49 @@ class Launcher(QMainWindow):
             logging.getLogger(__name__).info("_create_spiral_windows done: created=%d", len(self.spiral_windows))
         except Exception:
             pass
+        
+        # If custom mode is active, re-apply all settings now that windows exist
+        if self.visual_director and self.visual_director.is_custom_mode_active():
+            try:
+                from mesmerglass.mesmerloom.custom_visual import CustomVisual
+                current = self.visual_director.current_visual
+                if isinstance(current, CustomVisual) and self.spiral_windows:
+                    # Re-apply all custom mode settings to newly created windows
+                    for win in self.spiral_windows:
+                        # Check for spiral_director OR director (different compositor types)
+                        has_spiral = hasattr(win, 'comp') and (hasattr(win.comp, 'spiral_director') or hasattr(win.comp, 'director'))
+                        if has_spiral:
+                            current.compositor = win.comp
+                            current.reapply_all_settings()
+                            logging.getLogger(__name__).info("[CustomVisual] Re-applied all settings to new window")
+                            break  # Only need to apply to first window (others mirror it)
+            except Exception as e:
+                logging.getLogger(__name__).warning(f"[CustomVisual] Failed to re-apply settings: {e}")
 
     def _destroy_spiral_windows(self):
         """Destroy all runtime spiral compositor windows."""
+        # Disconnect VR stream first
+        try:
+            self._disconnect_vr()
+        except Exception:
+            pass
+        # CRITICAL: Clear compositor references FIRST to prevent GL operations
+        # on deleted compositor (causes GL_INVALID_OPERATION errors)
+        # This ensures no texture uploads or rendering happens during destruction
+        if hasattr(self, 'visual_director') and self.visual_director:
+            try:
+                self.visual_director.compositor = None
+                logging.getLogger(__name__).info("[spiral.trace] Cleared visual_director.compositor before window destruction")
+            except Exception:
+                pass
+        if hasattr(self, 'text_director') and self.text_director:
+            try:
+                self.text_director.compositor = None
+                logging.getLogger(__name__).info("[spiral.trace] Cleared text_director.compositor before window destruction")
+            except Exception:
+                pass
+        
+        # Now safe to destroy windows (no GL operations will be attempted)
         for win in list(self.spiral_windows):
             try:
                 if hasattr(win, 'set_active'):
@@ -624,59 +1168,306 @@ class Launcher(QMainWindow):
                 pass
         self.spiral_windows.clear()
 
-    def _page_media(self):
-        def _pct_label(v: float) -> QLabel:
-            lab = QLabel(f"{int(v*100)}%")
-            lab.setMinimumWidth(48)
-            lab.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-            return lab
+    # ---------------- VR bridge wiring ----------------
+    def _init_vr_bridge(self):
+        """Initialize VrBridge according to env flags."""
+        try:
+            self.vr_bridge = VrBridge(enabled=True)
+            if self._vr_force_mock:
+                # Force mock mode regardless of OpenXR availability
+                try:
+                    setattr(self.vr_bridge, "_mock", True)
+                except Exception:
+                    pass
+            self.vr_bridge.start()
+            logging.getLogger(__name__).info("[vr] VrBridge initialized (mock=%s)", getattr(self.vr_bridge, "_mock", True))
+        except Exception as e:
+            logging.getLogger(__name__).warning("[vr] VrBridge init failed: %s", e)
+            self.vr_bridge = None
 
-        page = QWidget()
-        root = QVBoxLayout(page); root.setContentsMargins(6, 6, 6, 6); root.setSpacing(12)
+    def _connect_vr_to_comp(self, comp):
+        """Connect compositor frame signal to VR submit slot (idempotent)."""
+        if not self.vr_bridge:
+            return
+        try:
+            if self._vr_comp is comp:
+                return
+            if self._vr_comp is not None:
+                self._disconnect_vr()
+            self._vr_comp = comp
+            # Enable compositor VR safe mode if requested via env and supported
+            try:
+                import os as _os
+                if _os.environ.get("MESMERGLASS_VR_SAFE") in ("1", "true", "True") and hasattr(comp, "enable_vr_safe_mode"):
+                    comp.enable_vr_safe_mode(True)
+                    logging.getLogger(__name__).info("[vr] Enabled VR safe mode on compositor (offscreen FBO tap)")
+            except Exception:
+                pass
+            # Bind OpenXR session to THIS compositor's current GL context before connecting
+            did_make_current = False
+            try:
+                if hasattr(comp, 'makeCurrent'):
+                    # Only make current if not already current, to avoid interfering with paintGL
+                    try:
+                        from PyQt6.QtGui import QOpenGLContext  # type: ignore
+                    except Exception:
+                        QOpenGLContext = None  # type: ignore
+                    is_current = False
+                    if 'QOpenGLContext' in locals() and QOpenGLContext is not None:
+                        try:
+                            is_current = (QOpenGLContext.currentContext() is not None)
+                        except Exception:
+                            is_current = False
+                    if not is_current:
+                        comp.makeCurrent()
+                        did_make_current = True
+                # Attempt deferred VR init now that a context is definitely current
+                try:
+                    if hasattr(self.vr_bridge, 'ensure_initialized_with_current_context'):
+                        self.vr_bridge.ensure_initialized_with_current_context()
+                except Exception as e:
+                    logging.getLogger(__name__).debug("[vr] ensure_initialized_with_current_context failed: %s", e)
+            finally:
+                if did_make_current and hasattr(comp, 'doneCurrent'):
+                    try: comp.doneCurrent()
+                    except Exception: pass
+            if hasattr(comp, 'frame_drawn'):
+                comp.frame_drawn.connect(self._vr_on_frame)  # type: ignore[attr-defined]
+                logging.getLogger(__name__).info("[vr] Connected frame_drawn to VR submitter")
+        except Exception as e:
+            logging.getLogger(__name__).warning("[vr] Failed to connect VR submit: %s", e)
 
-        # Primary bubble
-        card_primary = _card("Primary video"); pv = QVBoxLayout(card_primary); pv.setContentsMargins(12, 8, 12, 8); pv.setSpacing(4)
-        self.lbl_primary = QLabel("(none)")
-        btn_pick_primary = QPushButton("Choose file…"); btn_pick_primary.clicked.connect(self._pick_primary)
-        pv.addWidget(_row("File", btn_pick_primary, self.lbl_primary))
+    def _disconnect_vr(self):
+        comp = self._vr_comp
+        if comp is None:
+            return
+        try:
+            if hasattr(comp, 'frame_drawn'):
+                comp.frame_drawn.disconnect(self._vr_on_frame)  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        self._vr_comp = None
 
-        self.sld_primary_op = QSlider(Qt.Orientation.Horizontal); self.sld_primary_op.setRange(0, 100); self.sld_primary_op.setValue(int(self.primary_op * 100))
-        self.lab_primary_pct = _pct_label(self.primary_op)
-        self.sld_primary_op.valueChanged.connect(lambda x: (setattr(self, "primary_op", x / 100.0), self.lab_primary_pct.setText(f"{x}%")))
-        pv.addWidget(_row("Opacity", self.sld_primary_op, self.lab_primary_pct))
+    def _vr_on_frame(self):
+        """Submit the latest compositor frame to the VR bridge."""
+        if not (self.vr_bridge and self._vr_comp):
+            return
+        comp = self._vr_comp
+        # Ensure a current GL context for VR submit, but avoid interfering
+        # when we're already inside paintGL (signal emitted inline).
+        did_make_current = False
+        try:
+            try:
+                from PyQt6.QtGui import QOpenGLContext  # type: ignore
+            except Exception:
+                QOpenGLContext = None  # type: ignore
+            current_ctx = None
+            if 'QOpenGLContext' in locals() and QOpenGLContext is not None:
+                try:
+                    current_ctx = QOpenGLContext.currentContext()
+                except Exception:
+                    current_ctx = None
+            if current_ctx is None and hasattr(comp, 'makeCurrent'):
+                comp.makeCurrent()
+                did_make_current = True
+        except Exception:
+            pass
+        try:
+            # If XR session was deferred, try to complete it now (once context is current)
+            try:
+                if hasattr(self.vr_bridge, 'ensure_initialized_with_current_context') and not getattr(self.vr_bridge, '_session_began', False):
+                    self.vr_bridge.ensure_initialized_with_current_context()
+            except Exception:
+                pass
+            # Determine source FBO and pixel size
+            fbo = 0
+            try:
+                # Prefer offscreen VR-safe FBO if available
+                if hasattr(comp, 'vr_fbo_info'):
+                    info = comp.vr_fbo_info()
+                    if info:
+                        fbo, w_px, h_px = info
+                        self.vr_bridge.submit_frame_from_fbo(int(fbo), int(w_px), int(h_px))
+                        return
+            except Exception:
+                fbo = 0
+            # Fallback for QOpenGLWidget: use defaultFramebufferObject() if available
+            try:
+                if hasattr(comp, 'defaultFramebufferObject'):
+                    fbo = int(comp.defaultFramebufferObject())
+            except Exception:
+                pass
+            try:
+                dpr = getattr(comp, 'devicePixelRatioF', lambda: 1.0)()
+            except Exception:
+                dpr = 1.0
+            try:
+                w_px = int(max(1, comp.width()) * float(dpr))
+                h_px = int(max(1, comp.height()) * float(dpr))
+            except Exception:
+                w_px, h_px = 1920, 1080
+            try:
+                self.vr_bridge.submit_frame_from_fbo(fbo, w_px, h_px)
+            except Exception as e:
+                logging.getLogger(__name__).debug("[vr] submit_frame_from_fbo failed: %s", e)
+        finally:
+            # Only release context if we acquired it here; if paintGL owns it,
+            # leave it alone to avoid driver instability.
+            if did_make_current:
+                try:
+                    if hasattr(comp, 'doneCurrent'):
+                        comp.doneCurrent()
+                except Exception:
+                    pass
 
-        root.addWidget(card_primary)
-
-        # Secondary bubble
-        card_secondary = _card("Secondary video"); sv = QVBoxLayout(card_secondary); sv.setContentsMargins(12, 8, 12, 8); sv.setSpacing(4)
-        self.lbl_secondary = QLabel("(none)")
-        btn_pick_secondary = QPushButton("Choose file…"); btn_pick_secondary.clicked.connect(self._pick_secondary)
-        sv.addWidget(_row("File", btn_pick_secondary, self.lbl_secondary))
-
-        self.sld_secondary_op = QSlider(Qt.Orientation.Horizontal); self.sld_secondary_op.setRange(0, 100); self.sld_secondary_op.setValue(int(self.secondary_op * 100))
-        self.lab_secondary_pct = _pct_label(self.secondary_op)
-        self.sld_secondary_op.valueChanged.connect(lambda x: (setattr(self, "secondary_op", x / 100.0), self.lab_secondary_pct.setText(f"{x}%")))
-        sv.addWidget(_row("Opacity", self.sld_secondary_op, self.lab_secondary_pct))
-
-        root.addWidget(card_secondary)
-        root.addStretch(1)
-        return page
+    # Media page removed
 
     def _page_displays(self):
         card = _card("Displays"); v = QVBoxLayout(card); v.setContentsMargins(12, 10, 12, 12); v.setSpacing(8)
+        
+        # Add label for monitors
+        monitors_label = QLabel("<b>Monitors</b>")
+        v.addWidget(monitors_label)
+        
         self.list_displays = QListWidget()
+        # Add physical monitors
         for s in QGuiApplication.screens():
-            it = QListWidgetItem(f"{s.name()}  {s.geometry().width()}x{s.geometry().height()}"); it.setCheckState(Qt.CheckState.Unchecked)
+            it = QListWidgetItem(f"🖥️ {s.name()}  {s.geometry().width()}x{s.geometry().height()}")
+            it.setCheckState(Qt.CheckState.Unchecked)
+            it.setData(Qt.ItemDataRole.UserRole, {"type": "monitor", "screen": s})
             self.list_displays.addItem(it)
+            
+        # Separator
+        separator = QListWidgetItem("─" * 40)
+        separator.setFlags(Qt.ItemFlag.NoItemFlags)  # Not selectable
+        self.list_displays.addItem(separator)
+        
+        # Add label for VR devices
+        vr_label_item = QListWidgetItem("<b>VR Devices (Wireless)</b>")
+        vr_label_item.setFlags(Qt.ItemFlag.NoItemFlags)  # Not selectable
+        self.list_displays.addItem(vr_label_item)
+        
+        # Add discovered VR clients
+        self._refresh_vr_displays()
+        
         v.addWidget(self.list_displays, 1)
 
         btn_sel_all = QPushButton("Select all"); btn_sel_pri = QPushButton("Primary only")
-        v.addWidget(_row("Quick select", btn_sel_all, btn_sel_pri))
+        btn_refresh_vr = QPushButton("🔄 Refresh VR")
+        btn_refresh_vr.clicked.connect(self._refresh_vr_displays)
+        
+        quick_row = QWidget()
+        quick_layout = QHBoxLayout(quick_row)
+        quick_layout.setContentsMargins(0, 0, 0, 0)
+        quick_label = QLabel("Quick select:")
+        quick_label.setMinimumWidth(160)
+        quick_layout.addWidget(quick_label)
+        quick_layout.addWidget(btn_sel_all)
+        quick_layout.addWidget(btn_sel_pri)
+        quick_layout.addWidget(btn_refresh_vr)
+        quick_layout.addStretch()
+        
+        v.addWidget(quick_row)
         btn_sel_all.clicked.connect(self._select_all_displays)
         btn_sel_pri.clicked.connect(self._select_primary_display)
 
         page = QWidget(); root = QVBoxLayout(page); root.addWidget(card); root.addStretch(1)
         return page
+
+    def _refresh_vr_displays(self):
+        """Refresh the VR devices section in the displays list."""
+        logging.getLogger(__name__).debug("[VR Refresh] Starting VR display refresh")
+        
+        if not hasattr(self, 'list_displays'):
+            return
+            
+        # Save the checked state of existing VR items (by client IP)
+        checked_ips = set()
+        for i in range(self.list_displays.count()):
+            item = self.list_displays.item(i)
+            data = item.data(Qt.ItemDataRole.UserRole)
+            if data and isinstance(data, dict) and data.get("type") == "vr":
+                if item.checkState() == Qt.CheckState.Checked:
+                    client_info = data.get("client")
+                    if client_info:
+                        checked_ips.add(client_info.get("ip"))
+        
+        # Find indices of monitors, separator, label, and VR devices
+        last_monitor_idx = -1
+        separator_idx = -1
+        vr_label_idx = -1
+        vr_device_indices = []
+        
+        for i in range(self.list_displays.count()):
+            item = self.list_displays.item(i)
+            data = item.data(Qt.ItemDataRole.UserRole)
+            text = item.text()
+            
+            # Track last monitor
+            if data and isinstance(data, dict) and data.get("type") == "monitor":
+                last_monitor_idx = i
+            # Track separator
+            elif "─" in text and separator_idx == -1:
+                separator_idx = i
+            # Track VR label
+            elif "VR Devices" in text and vr_label_idx == -1:
+                vr_label_idx = i
+            # Track VR devices
+            elif data and isinstance(data, dict) and data.get("type") == "vr":
+                vr_device_indices.append(i)
+        
+        # Remove existing VR devices (in reverse order to preserve indices)
+        for idx in reversed(vr_device_indices):
+            self.list_displays.takeItem(idx)
+        
+        # Ensure separator exists in correct position (after monitors)
+        if separator_idx == -1:
+            separator = QListWidgetItem("─" * 40)
+            separator.setFlags(Qt.ItemFlag.NoItemFlags)
+            insert_pos = last_monitor_idx + 1
+            self.list_displays.insertItem(insert_pos, separator)
+            separator_idx = insert_pos
+            # Adjust vr_label_idx if it exists and is after insertion
+            if vr_label_idx >= insert_pos:
+                vr_label_idx += 1
+        
+        # Ensure VR label exists in correct position (after separator)
+        if vr_label_idx == -1:
+            vr_label_item = QListWidgetItem("<b>VR Devices (Wireless)</b>")
+            vr_label_item.setFlags(Qt.ItemFlag.NoItemFlags)
+            insert_pos = separator_idx + 1
+            self.list_displays.insertItem(insert_pos, vr_label_item)
+            vr_label_idx = insert_pos
+            
+        # Get discovered VR clients from discovery service (if running)
+        discovered_clients = []
+        if self.vr_discovery_service:
+            try:
+                # Discovery service tracks clients that have broadcast "VR_HEADSET_HELLO"
+                discovered_clients = getattr(self.vr_discovery_service, 'discovered_clients', [])
+                logging.getLogger(__name__).info(f"[VR Refresh] Discovery service returned {len(discovered_clients)} clients")
+                if discovered_clients:
+                    for client in discovered_clients:
+                        logging.getLogger(__name__).info(f"  → {client.get('name')} at {client.get('ip')}")
+            except Exception as e:
+                logging.getLogger(__name__).error(f"Error getting VR clients from discovery: {e}")
+        
+        if discovered_clients:
+            # Add VR client items after the VR label (make them checkable and selectable)
+            insert_pos = vr_label_idx + 1
+            for client_info in discovered_clients:
+                name = client_info.get("name", "Unknown VR Device")
+                ip = client_info.get("ip", "0.0.0.0")
+                it = QListWidgetItem(f"📱 {name} ({ip})")
+                # Restore checked state if this client was previously checked
+                if ip in checked_ips:
+                    it.setCheckState(Qt.CheckState.Checked)
+                else:
+                    it.setCheckState(Qt.CheckState.Unchecked)
+                it.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable)
+                it.setData(Qt.ItemDataRole.UserRole, {"type": "vr", "client": client_info})
+                self.list_displays.insertItem(insert_pos, it)
+                insert_pos += 1  # Increment for next VR device
 
     # ========================== helpers / pickers ==========================
     def _bind_shortcuts(self):
@@ -783,17 +1574,7 @@ class Launcher(QMainWindow):
             if it0 is not None:
                 it0.setCheckState(Qt.CheckState.Checked)
 
-    def _pick_primary(self):
-        f, _ = QFileDialog.getOpenFileName(self, "Pick primary video", "", "Videos (*.mp4 *.mov *.mkv *.avi);;All (*.*)")
-        if f:
-            self.primary_path = f
-            self.lbl_primary.setText(os.path.basename(f))
-
-    def _pick_secondary(self):
-        f, _ = QFileDialog.getOpenFileName(self, "Pick secondary video", "", "Videos (*.mp4 *.mov *.mkv *.avi);;All (*.*)")
-        if f:
-            self.secondary_path = f
-            self.lbl_secondary.setText(os.path.basename(f))
+    # Media pickers removed
 
     def _pick_font(self):
         from PyQt6.QtWidgets import QFontDialog
@@ -992,9 +1773,9 @@ class Launcher(QMainWindow):
             if fpath and not getattr(self, 'current_font_path', None):
                 self.current_font_path = fpath
             # Update UI font label if page exists (ensures user sees restored font)
+            # Note: TextTab doesn't need font label updates (fonts controlled by modes)
             try:
-                if getattr(self, 'page_textfx', None) and hasattr(self.page_textfx, 'update_font_label'):
-                    self.page_textfx.update_font_label(fam)
+                pass  # No font UI updates needed for simplified text tab
             except Exception:
                 pass
             # Message pack path (if provided) — now we attempt to load automatically for user convenience.
@@ -1033,17 +1814,9 @@ class Launcher(QMainWindow):
         # Propagate changes to UI widgets where safe (best-effort; guard for headless tests)
         try:
             import os as _os
-            # --- Text/FX Page ---
-            pt = getattr(self, 'page_textfx', None)
-            if pt:
-                # Update text scale slider
-                if hasattr(pt, 'sld_txt_scale'):
-                    try:
-                        pt.sld_txt_scale.blockSignals(True)
-                        pt.sld_txt_scale.setValue(int(self.text_scale_pct))
-                    finally:
-                        try: pt.sld_txt_scale.blockSignals(False)
-                        except Exception: pass
+            # --- Text Tab (simplified - no UI updates needed) ---
+            # TextTab manages its own message library, no external updates needed
+            
             # --- Video Opacity Controls (Primary / Secondary) ---
             # Reflect restored opacity values in sliders & percentage labels; block signals to avoid feedback loops.
             if hasattr(self, 'sld_primary_op'):
@@ -1071,37 +1844,6 @@ class Launcher(QMainWindow):
                     if hasattr(ov, 'secondary_op'): ov.secondary_op = self.secondary_op
             except Exception:
                 pass
-                # FX mode combobox
-                if hasattr(pt, 'cmb_fx') and self.fx_mode:
-                    try: pt.cmb_fx.setCurrentText(self.fx_mode)
-                    except Exception: pass
-                # FX intensity slider
-                if hasattr(pt, 'sld_fx_int'):
-                    try:
-                        pt.sld_fx_int.blockSignals(True)
-                        pt.sld_fx_int.setValue(int(self.fx_intensity))
-                    finally:
-                        try: pt.sld_fx_int.blockSignals(False)
-                        except Exception: pass
-                # Flash interval/width
-                if hasattr(pt, 'spin_interval'):
-                    try: pt.spin_interval.setValue(int(self.flash_interval_ms))
-                    except Exception: pass
-                if hasattr(pt, 'spin_width'):
-                    try: pt.spin_width.setValue(int(self.flash_width_ms))
-                    except Exception: pass
-                # Pack name label (derive from path if available)
-                if getattr(self, 'current_pack_path', None) and hasattr(pt, 'lab_pack_name'):
-                    try: pt.lab_pack_name.setText(_os.path.basename(self.current_pack_path) or '(none)')
-                    except Exception: pass
-                # Text colour preview
-                if hasattr(pt, 'lab_color_preview') and getattr(self, 'text_color', None) is not None:
-                    try:
-                        col = self.text_color
-                        hexv = f"#{col.red():02X}{col.green():02X}{col.blue():02X}"
-                        pt.lab_color_preview.setText(hexv)
-                        pt.lab_color_preview.setStyleSheet(f"background:{hexv}; border:1px solid #555; padding:2px;")
-                    except Exception: pass
             # --- Audio Page ---
             if getattr(self, 'page_audio', None):
                 pa = self.page_audio
@@ -1404,13 +2146,56 @@ class Launcher(QMainWindow):
         else:                        self.pulse.stop()
         self.overlays.clear()
         screens = QGuiApplication.screens()
-        checked_idx = [i for i in range(self.list_displays.count())
-                       if self.list_displays.item(i).checkState()==Qt.CheckState.Checked]
-        if not checked_idx and self.list_displays.count()>0:
-            self.list_displays.item(0).setCheckState(Qt.CheckState.Checked)
-            checked_idx = [0]
+        
+        # Get checked displays (monitors and VR clients)
+        checked_items = [self.list_displays.item(i) for i in range(self.list_displays.count())
+                        if self.list_displays.item(i).checkState()==Qt.CheckState.Checked]
+        
+        logging.getLogger(__name__).info(f"[VR] Found {len(checked_items)} checked items in display list")
+        
+        # Separate monitors and VR clients
+        monitor_indices = []
+        vr_clients = []
+        for item in checked_items:
+            data = item.data(Qt.ItemDataRole.UserRole)
+            logging.getLogger(__name__).info(f"[VR] Checked item: text='{item.text()}' data={data}")
+            if data and isinstance(data, dict):
+                if data.get("type") == "monitor":
+                    # Find monitor index
+                    for i, s in enumerate(screens):
+                        if s == data.get("screen"):
+                            monitor_indices.append(i)
+                            break
+                elif data.get("type") == "vr":
+                    client_info = data.get("client")
+                    logging.getLogger(__name__).info(f"[VR] Found VR item! client_info={client_info}")
+                    if client_info:
+                        vr_clients.append(client_info)
+                        logging.getLogger(__name__).info(f"[VR] Added VR client: {client_info}")
+            else:
+                logging.getLogger(__name__).warning(f"[VR] Checked item has no data or invalid data: text='{item.text()}'")
+        
+        logging.getLogger(__name__).info(f"[VR] After processing: monitor_indices={monitor_indices}, vr_clients={vr_clients}")
+        
+        # Auto-select first monitor if none selected
+        # For VR streaming, we still need a monitor selected to create the compositor
+        if not monitor_indices and not vr_clients and len(screens) > 0:
+            monitor_indices = [0]
+            # Also check the first monitor item in the list
+            for i in range(self.list_displays.count()):
+                item = self.list_displays.item(i)
+                data = item.data(Qt.ItemDataRole.UserRole)
+                if data and data.get("type") == "monitor":
+                    item.setCheckState(Qt.CheckState.Checked)
+                    break
+        elif not monitor_indices and vr_clients:
+            # VR only selected - still create compositor but minimize window
+            monitor_indices = [0]
+            logging.getLogger(__name__).info("VR-only mode: using minimized compositor on monitor 0")
+        
+        # Create overlays for physical monitors
         shared_start_time = time.time()
-        for i in checked_idx:
+        for i in monitor_indices:
             sc = screens[i] if i < len(screens) else screens[0]
             ov = OverlayWindow(sc, self.primary_path or None, self.secondary_path or None,
                                self.primary_op, self.secondary_op, self.text, self.text_color, self.text_font,
@@ -1418,6 +2203,10 @@ class Launcher(QMainWindow):
                                self.fx_mode, self.fx_intensity)
             ov.start_time = shared_start_time
             self.overlays.append(ov)
+            
+        # VR streaming setup happens later after spiral windows are created
+        # (need compositor to capture frames from)
+            
         # Always use a single shared flash timer so message changes align exactly
         # with flash boundaries (prevents mid-flash text changes). Buzz logic
         # inside the timer remains conditional on enable_device_sync.
@@ -1425,12 +2214,357 @@ class Launcher(QMainWindow):
             self._wire_shared_flash_timer(shared_start_time)
         if self.enable_device_sync and self.enable_bursts:
             self._start_burst_scheduler()
-        # Create spiral windows last so they sit above overlays.
+        
+        # Auto-enable spiral if not already enabled
+        if not self.spiral_enabled:
+            try:
+                self._on_spiral_toggled(True)  # Enable spiral and start timer
+                logging.getLogger(__name__).info("[launch] Auto-enabled MesmerLoom spiral")
+            except Exception as e:
+                logging.getLogger(__name__).warning(f"[launch] Failed to auto-enable spiral: {e}")
+        
+        # Auto-set default intensity if currently zero (make spiral visible)
+        # Skip this for custom modes - they control intensity directly
         try:
-            if self.spiral_enabled:
-                self._create_spiral_windows()
-        except Exception:
-            pass
+            if self.visual_director and self.visual_director.is_custom_mode_active():
+                logging.getLogger(__name__).info("[CustomVisual] Skipping auto-intensity (custom mode controls intensity)")
+                
+                # CRITICAL: Start spiral timer NOW (was deferred during mode load for silence)
+                if getattr(self, '_needs_spiral_timer_init', False) or self.spiral_timer is None or not self.spiral_timer.isActive():
+                    logging.getLogger(__name__).info("[CustomVisual] Starting spiral timer on Launch...")
+                    # Create timer if needed
+                    if self.spiral_timer is None:
+                        self.spiral_timer = QTimer(self)
+                        self.spiral_timer.setInterval(16)  # ~60 FPS logic tick
+                        logging.getLogger(__name__).info("[CustomVisual] Created new QTimer")
+                    
+                    # ALWAYS ensure signal is connected (even if timer already existed)
+                    try:
+                        self.spiral_timer.timeout.disconnect()  # type: ignore[arg-type]
+                        logging.getLogger(__name__).info("[CustomVisual] Disconnected existing timer signal")
+                    except Exception:
+                        pass
+                    self.spiral_timer.timeout.connect(self._on_spiral_tick)
+                    logging.getLogger(__name__).info("[CustomVisual] Connected timer to _on_spiral_tick()")
+                    
+                    # Start timer
+                    if not self.spiral_timer.isActive():
+                        self.spiral_timer.start()
+                        logging.getLogger(__name__).info("[CustomVisual] Started spiral timer on Launch")
+                    
+                    # Clear flag
+                    self._needs_spiral_timer_init = False
+                
+                # CRITICAL: Resume visual director to start playback
+                # Visual director was paused during mode load (silent state)
+                self.visual_director.resume()
+                logging.getLogger(__name__).info("[CustomVisual] Resumed visual director (started playback)")
+                
+                # CRITICAL: Start compositor timers NOW (were deferred for complete silence)
+                if getattr(self, '_defer_compositor_timer', False):
+                    for win in self.spiral_windows:
+                        if hasattr(win, 'comp') and hasattr(win.comp, '_start_timer'):
+                            win.comp._start_timer()
+                            logging.getLogger(__name__).info("[CustomVisual] Started compositor timer on Launch")
+                    # Clear flag so future creates use normal behavior
+                    self._defer_compositor_timer = False
+                
+                # DON'T load media here - compositor might be deleted!
+                # Will load after _create_spiral_windows() ensures valid GL context
+                
+            elif hasattr(self, 'spiral_director') and self.spiral_director:
+                current_intensity = getattr(self.spiral_director.state, 'intensity', 0.0)
+                if current_intensity == 0.0:
+                    # Set to 70% intensity (comfortable default for hypnotic spiral)
+                    self.spiral_director.set_intensity(0.7)
+                    logging.getLogger(__name__).info("[launch] Set default spiral intensity: 0.7")
+                    # Update UI slider if panel exists
+                    if hasattr(self, 'page_mesmerloom') and hasattr(self.page_mesmerloom, 'sld_intensity'):
+                        self.page_mesmerloom.sld_intensity.setValue(70)  # 0-100 range
+        except Exception as e:
+            logging.getLogger(__name__).warning(f"[launch] Failed to set default intensity: {e}")
+        
+        # Create spiral windows first to establish valid GL context
+        try:
+            self._create_spiral_windows()
+        except Exception as e:
+            logging.getLogger(__name__).error(f"[launch] Failed to create spiral windows: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        # Start VR streaming if we have VR clients selected
+        # Create and start the streaming server on-demand
+        logging.getLogger(__name__).info(f"[VR] Checking VR clients: count={len(vr_clients)}, clients={vr_clients}")
+        if vr_clients and len(vr_clients) > 0:
+            logging.getLogger(__name__).info(f"[VR] Starting VR streaming for {len(vr_clients)} clients")
+            try:
+                # Get compositor from spiral window (fullscreen) instead of preview
+                streaming_compositor = None
+                if self.spiral_windows and len(self.spiral_windows) > 0:
+                    if hasattr(self.spiral_windows[0], 'comp'):
+                        streaming_compositor = self.spiral_windows[0].comp
+                        logging.getLogger(__name__).info("VR streaming: using spiral window compositor")
+                elif self.compositor:
+                    streaming_compositor = self.compositor
+                    logging.getLogger(__name__).info("VR streaming: using preview compositor (fallback)")
+                
+                if streaming_compositor:
+                    # Import streaming server
+                    from ..mesmervisor.streaming_server import VRStreamingServer
+                    from ..mesmervisor.gpu_utils import EncoderType
+                    import OpenGL.GL as GL
+                    import numpy as np
+                    
+                    # Create frame cache (populated by Qt signal, consumed by streaming thread)
+                    self._vr_streaming_active = True
+                    self._vr_last_frame = None
+                    self._vr_frame_lock = threading.Lock()
+                    
+                    def capture_frame():
+                        """Return cached frame for VR streaming (called from streaming thread)"""
+                        if not self._vr_streaming_active:
+                            return None
+                        
+                        # Return cached frame (NEVER call GL functions from streaming thread)
+                        with self._vr_frame_lock:
+                            if self._vr_last_frame is not None:
+                                frame = self._vr_last_frame.copy()  # Copy to avoid race conditions
+                                return frame
+                        
+                        return None  # No frame available yet
+                    
+                    # Create streaming server with frame callback (2048x1024 @ 30 FPS, JPEG encoding, quality=25 optimized for Oculus Go)
+                    self.vr_streaming_server = VRStreamingServer(
+                        width=1920,
+                        height=1080,
+                        fps=30,
+                        encoder_type=EncoderType.JPEG,
+                        quality=25,  # Optimized for Oculus Go: stable 20 FPS, 60 Mbps, good visual quality
+                        frame_callback=capture_frame
+                    )
+                    
+                    # Discovery service already running from __init__, just ensure it's started
+                    if self.vr_discovery_service and not hasattr(self.vr_discovery_service, '_running'):
+                        self.vr_discovery_service.start()
+                        logging.getLogger(__name__).info("VR discovery service started on UDP port 5556")
+                    
+                    # Start streaming server (TCP 5555)
+                    self.vr_streaming_server.start_server()
+                    logging.getLogger(__name__).info("VR streaming server started on TCP port 5555")
+                    
+                    # Connect compositor's frame_drawn signal to cache frames
+                    if hasattr(streaming_compositor, 'frame_drawn'):
+                        # Cache frame when compositor renders
+                        def on_frame_ready():
+                            """Cache frame from compositor (called from Qt main thread)"""
+                            if self._vr_streaming_active:
+                                try:
+                                    # Capture frame from compositor (GL calls safe here - main thread)
+                                    w_px = streaming_compositor.width()
+                                    h_px = streaming_compositor.height()
+                                    
+                                    # Read pixels from GL framebuffer
+                                    pixels = GL.glReadPixels(0, 0, w_px, h_px, GL.GL_RGB, GL.GL_UNSIGNED_BYTE)
+                                    frame = np.frombuffer(pixels, dtype=np.uint8).reshape(h_px, w_px, 3)
+                                    frame = np.flipud(frame)  # Flip vertically (GL origin is bottom-left)
+                                    
+                                    # Cache frame for streaming thread (thread-safe)
+                                    if frame is not None and frame.size > 0:
+                                        with self._vr_frame_lock:
+                                            self._vr_last_frame = frame
+                                except Exception as e:
+                                    logging.getLogger(__name__).error(f"VR frame cache error: {e}")
+                                    import traceback
+                                    traceback.print_exc()
+                        
+                        # Connect the signal
+                        streaming_compositor.frame_drawn.connect(on_frame_ready)
+                        logging.getLogger(__name__).info("VR streaming connected to compositor frame signal")
+                        logging.getLogger(__name__).info(f"VR streaming: compositor size={streaming_compositor.width()}x{streaming_compositor.height()}")
+                        
+                        # If VR-only mode (no monitors selected), minimize the spiral window
+                        if vr_clients and not any(data.get("type") == "monitor" 
+                                                  for item in checked_items 
+                                                  if (data := item.data(Qt.ItemDataRole.UserRole))):
+                            if self.spiral_windows and len(self.spiral_windows) > 0:
+                                self.spiral_windows[0].showMinimized()
+                                logging.getLogger(__name__).info("VR-only mode: minimized spiral window")
+                    else:
+                        logging.getLogger(__name__).warning("Compositor missing frame_drawn signal for VR streaming")
+                else:
+                    logging.getLogger(__name__).warning("Cannot start VR streaming: no compositor available")
+            except Exception as e:
+                logging.getLogger(__name__).error(f"Failed to start VR streaming: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        # NOW load media AFTER compositor is created and references updated
+        try:
+            if self.visual_director and self.visual_director.is_custom_mode_active():
+                current_visual = self.visual_director.current_visual
+                if current_visual and hasattr(current_visual, '_load_current_media'):
+                    # Ensure compositor reference is valid before uploading textures
+                    if self.visual_director.compositor is None:
+                        logging.getLogger(__name__).error("[CustomVisual] Cannot load media: compositor is None!")
+                    else:
+                        current_visual._load_current_media()
+                        logging.getLogger(__name__).info("[CustomVisual] Loaded initial media on Launch")
+                
+                # CRITICAL: Re-assert spiral opacity to make it visible
+                # Fixes issue where spiral doesn't show until opacity slider is moved
+                if hasattr(self, 'spiral_director') and self.spiral_director:
+                    spiral_config = current_visual.config.get('spiral', {})
+                    opacity = spiral_config.get('opacity', 0.5)
+                    self.spiral_director.set_opacity(opacity)
+                    logging.getLogger(__name__).info(f"[CustomVisual] Re-asserted spiral opacity: {opacity}")
+        except Exception as e:
+            logging.getLogger(__name__).error(f"[CustomVisual] Failed to load media: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        # Start media cycling (using SimpleVisual from visuals.py - proven working)
+        # In strict mode with a custom visual, drive media changes with a precise QTimer
+        # at the exact interval derived from the mode. Otherwise, use default behavior
+        # (note: built-in visuals are disabled in Phase 3).
+        try:
+            if self.visual_director and self.visual_director.is_custom_mode_active() and getattr(self, '_strict_mode', False):
+                current_visual = self.visual_director.current_visual
+                # Compute expected interval from mode's cycle_speed using shared formula
+                speed = 50
+                try:
+                    speed = int(current_visual.config.get('media', {}).get('cycle_speed', 50)) if current_visual and hasattr(current_visual, 'config') else 50
+                except Exception:
+                    speed = 50
+                s = max(1, min(100, speed))
+                # interval_ms = 10000 * 0.005^((s-1)/99)
+                import math as _m
+                interval_ms = int(10000.0 * _m.pow(0.005, (s - 1) / 99.0))
+                # Create precise timer
+                from PyQt6.QtCore import QTimer as _QTimer
+                self._strict_media_timer = getattr(self, '_strict_media_timer', None)
+                if self._strict_media_timer is None:
+                    self._strict_media_timer = _QTimer(self)
+                    try:
+                        self._strict_media_timer.setTimerType(_QTimer.TimerType.PreciseTimer)
+                    except Exception:
+                        pass
+                    self._strict_media_timer.timeout.connect(self._on_strict_media_tick)
+                self._strict_media_timer.setInterval(max(1, int(interval_ms)))
+                if not self._strict_media_timer.isActive():
+                    self._strict_media_timer.start()
+                logging.getLogger(__name__).info(f"[mode] Strict media timer started @ {interval_ms} ms (speed={s})")
+            else:
+                self._start_media_cycling()
+        except Exception as e:
+            logging.getLogger(__name__).warning(f"[mode] Strict media timer setup failed: {e}")
+            # Fallback to default behavior
+            try:
+                self._start_media_cycling()
+            except Exception:
+                pass
+
+    def _on_strict_media_tick(self):
+        """Strict-mode media tick: advance media exactly per mode interval."""
+        try:
+            if getattr(self, "_no_media", False):
+                return
+            if not (self.visual_director and self.visual_director.is_custom_mode_active()):
+                return
+            cv = self.visual_director.current_visual
+            if not cv:
+                return
+            # Manually advance media; ThemeBank selection handled inside
+            if hasattr(cv, '_media_paths') and isinstance(getattr(cv, '_media_paths', None), list) and cv._media_paths:
+                cv._current_media_index = (cv._current_media_index + 1) % len(cv._media_paths)
+            cv._load_current_media()
+        except Exception as e:
+            logging.getLogger(__name__).warning(f"[mode] Strict media tick error: {e}")
+
+    def _start_media_cycling(self):
+        """Start media cycling using appropriate visual based on media mode."""
+        try:
+            if getattr(self, "_no_media", False):
+                logging.getLogger(__name__).info("[media] NO_MEDIA active -> skipping media cycling")
+                return
+            logging.getLogger(__name__).info(f"[media] _start_media_cycling called, mode={self.media_mode}")
+            
+            if not self.visual_director:
+                logging.getLogger(__name__).warning("[media] Visual director not available")
+                return
+            
+            # Skip if custom mode is active - it manages its own visuals
+            if self.visual_director.is_custom_mode_active():
+                logging.getLogger(__name__).info("[media] Custom mode active, skipping built-in visual selection")
+                return
+            
+            # Log compositor status
+            if self.visual_director.compositor:
+                logging.getLogger(__name__).info("[media] Visual director has compositor ready")
+            else:
+                logging.getLogger(__name__).error("[media] Visual director compositor is None!")
+                return
+            
+            # Log video streamer status for video modes
+            if self.media_mode in [0, 2]:  # Images & Videos or Video Focus
+                if self.visual_director.video_streamer:
+                    logging.getLogger(__name__).info("[media] Video streamer available")
+                else:
+                    logging.getLogger(__name__).warning("[media] Video streamer not available for video mode")
+            
+            # Choose visual based on media mode:
+            # 0=Images & Videos → SimpleVisual (index 0) - images only
+            # 1=Images Only → SimpleVisual (index 0)
+            # 2=Video Focus → Show warning that videos aren't supported yet
+            
+            # NOTE: Background rendering (images/videos) requires full implementation
+            # in LoomWindowCompositor - currently only available in LoomCompositor
+            
+            if self.media_mode == 0:
+                # Images & Videos: Use MixedVisual (index 7) - alternates between images and videos
+                visual_index = 7  # MixedVisual (3 images, 2 videos per cycle)
+                mode_name = "Images & Videos"
+                # Enable zoom for mixed mode
+                if self.compositor:
+                    self.compositor.set_zoom_animation_enabled(True)
+            elif self.media_mode == 1:
+                # Images Only: Use SimpleVisual
+                visual_index = 0  # SimpleVisual
+                mode_name = "Images Only"
+                # Enable zoom for image mode
+                if self.compositor:
+                    self.compositor.set_zoom_animation_enabled(True)
+            else:  # media_mode == 2
+                # Video Focus: Use AnimationVisual
+                visual_index = 6  # AnimationVisual
+                mode_name = "Video Focus"
+                # Disable zoom for video focus mode
+                if self.compositor:
+                    self.compositor.set_zoom_animation_enabled(False)
+                    
+                # Warn if using LoomWindowCompositor (doesn't support background rendering yet)
+                if hasattr(self.compositor, '__class__') and 'Window' in self.compositor.__class__.__name__:
+                    logging.getLogger(__name__).warning(
+                        "[media] Video playback requires background rendering which is not yet "
+                        "implemented in LoomWindowCompositor. Videos will not display. "
+                        "Use 'Images Only' mode for now."
+                    )
+            
+            # NOTE: Built-in visual selection removed in Phase 3
+            # Media cycling now requires custom mode with media settings
+            logging.getLogger(__name__).warning(f"[media] Built-in visual selection removed - use custom JSON modes instead")
+            # logging.getLogger(__name__).info(f"[media] Selecting visual {visual_index} ({mode_name})")
+            # success = self.visual_director.select_visual(visual_index)  # Method removed in Phase 3
+            success = False  # Always fail - no built-in visuals
+            
+            if success:
+                logging.getLogger(__name__).info(f"[media] Started visual {visual_index} ({mode_name})")
+            else:
+                logging.getLogger(__name__).info(f"[media] Skipped built-in visual - load custom mode via MesmerLoom panel")
+                
+        except Exception as e:
+            logging.getLogger(__name__).error(f"[media] Failed to start media cycling: {e}")
+            import traceback
+            traceback.print_exc()
 
     def _wire_shared_flash_timer(self, shared_start_time: float):
         """Single synchronized flash timer (always used).
@@ -1523,6 +2657,9 @@ class Launcher(QMainWindow):
             try: self._burst_timer.stop()
             except Exception: pass
             self._burst_timer = None; step(3, "burst timer stopped")
+        # Stop media cycler
+        self._media_cycler = None
+        step(3.5, "media cycler stopped")
         for ov in list(self.overlays):
             try:
                 if hasattr(ov, 'shutdown'):
@@ -1534,6 +2671,13 @@ class Launcher(QMainWindow):
             except Exception:
                 pass
         self.overlays.clear(); step(5, "overlays cleared")
+        # Stop strict media timer if running
+        if hasattr(self, "_strict_media_timer") and getattr(self, "_strict_media_timer") is not None:
+            try:
+                self._strict_media_timer.stop()
+            except Exception:
+                pass
+            self._strict_media_timer = None; step(5.5, "strict media timer stopped")
         try: self.audio.stop(); step(6, "audio stopped")
         except Exception: pass
         try: self.pulse.stop(); step(7, "pulse stopped")
@@ -1542,6 +2686,23 @@ class Launcher(QMainWindow):
         # release cleanly without referencing shutting-down director.
         try:
             self._destroy_spiral_windows(); step(8, "spiral windows destroyed")
+        except Exception:
+            pass
+        # Stop VR streaming (but keep discovery service running for next session)
+        try:
+            self._vr_streaming_active = False
+            if hasattr(self, 'vr_streaming_server') and self.vr_streaming_server:
+                self.vr_streaming_server.stop_server()
+                self.vr_streaming_server = None
+                step(8.3, "vr streaming server stopped")
+            # Note: vr_discovery_service continues running to discover devices
+        except Exception as e:
+            log.warning(f"Error stopping VR streaming: {e}")
+        # Shutdown VR bridge last
+        try:
+            if getattr(self, 'vr_bridge', None):
+                self.vr_bridge.shutdown()  # type: ignore[union-attr]
+                step(8.5, "vr bridge shutdown")
         except Exception:
             pass
 
@@ -1564,6 +2725,13 @@ class Launcher(QMainWindow):
         step(0, "closeEvent begin")
         self._shutting_down = True
         step(0.5, f"shutdown flag set scan_in_progress={self.device_scan_in_progress}")
+        # Stop VR discovery early
+        try:
+            if hasattr(self, 'vr_discovery') and self.vr_discovery:
+                self.vr_discovery.stop()
+                step(0.7, "vr discovery stopped")
+        except Exception:
+            pass
         try:
             self.stop_all()
         except Exception:
@@ -1655,10 +2823,8 @@ class Launcher(QMainWindow):
             if first and (not getattr(self, 'text', None)):
                 self.text = first
             try:
-                if first and hasattr(self, 'page_textfx') and self.page_textfx and hasattr(self.page_textfx, 'set_text'):
-                    self.page_textfx.set_text(self.text)
-                if hasattr(self, 'page_textfx') and self.page_textfx and hasattr(self.page_textfx, 'set_pack_name'):
-                    self.page_textfx.set_pack_name(getattr(pack, 'name', '(pack)'))
+                # TextTab doesn't need UI updates for pack loading (messages controlled by mode files)
+                pass
             except Exception:
                 pass
             avg = getattr(pack, 'avg_intensity', None)
@@ -1712,8 +2878,7 @@ class Launcher(QMainWindow):
             import json
             with open(fn, 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
-            if hasattr(self.page_textfx, 'set_pack_name'):
-                self.page_textfx.set_pack_name(data.get('name'))
+            # TextTab doesn't need pack name updates (controlled by mode files)
             QMessageBox.information(self, "Message Pack", f"Saved pack to {fn}")
         except Exception as e:
             logging.getLogger(__name__).error("Error saving message pack: %s", e)
@@ -1730,10 +2895,7 @@ class Launcher(QMainWindow):
             if dlg.exec() == QDialog.DialogCode.Accepted and hasattr(dlg, 'result_pack'):
                 pack = dlg.result_pack
                 self.apply_session_pack(pack)
-                try:
-                    self.page_textfx.set_pack_name(getattr(pack, 'name', '(pack)'))
-                except Exception:
-                    pass
+                # TextTab doesn't need pack name updates (controlled by mode files)
         except Exception as e:
             logging.getLogger(__name__).error("Editor failed: %s", e)
 
@@ -1765,6 +2927,8 @@ class Launcher(QMainWindow):
             act_save = file_menu.addAction("Save State…"); act_save.triggered.connect(self._action_save_state)  # type: ignore[attr-defined]
             act_load = file_menu.addAction("Load State…"); act_load.triggered.connect(self._action_load_state)  # type: ignore[attr-defined]
             # Font load action removed (moved into Text & FX tab button)
+            file_menu.addSeparator()
+            act_vmc = file_menu.addAction("Visual Mode Creator..."); act_vmc.triggered.connect(self._action_open_vmc)  # type: ignore[attr-defined]
             file_menu.addSeparator()
         except Exception:
             pass
@@ -1817,6 +2981,36 @@ class Launcher(QMainWindow):
             except Exception:
                 pass
 
+    def _action_open_vmc(self):
+        """Launch Visual Mode Creator in a separate process."""
+        try:
+            import subprocess
+            import sys
+            from pathlib import Path
+            
+            # Get path to VMC script
+            vmc_script = Path(__file__).parent.parent.parent / "scripts" / "visual_mode_creator.py"
+            
+            if not vmc_script.exists():
+                from PyQt6.QtWidgets import QMessageBox
+                QMessageBox.warning(self, "Visual Mode Creator", f"Could not find Visual Mode Creator script at:\n{vmc_script}")
+                return
+            
+            # Launch VMC in separate process (non-blocking)
+            # Use same Python interpreter that's running the launcher
+            subprocess.Popen([sys.executable, str(vmc_script)], 
+                           creationflags=subprocess.CREATE_NEW_CONSOLE if sys.platform == "win32" else 0)
+            
+            logging.getLogger(__name__).info(f"[launcher] Launched Visual Mode Creator: {vmc_script}")
+            
+        except Exception as e:
+            logging.getLogger(__name__).error(f"Failed to launch VMC: {e}")
+            try:
+                from PyQt6.QtWidgets import QMessageBox
+                QMessageBox.critical(self, "Visual Mode Creator", f"Failed to launch:\n{e}")
+            except Exception:
+                pass
+
     # Legacy cycle timer methods removed (replaced by per-flash pre-pick logic above)
 
     def _prepare_pack_weights(self):  # Per-flash random message selection helper
@@ -1851,7 +3045,7 @@ class Launcher(QMainWindow):
             msg = items[idx].msg
             self.text = msg
             try:
-                if hasattr(self.page_textfx, 'set_text'): self.page_textfx.set_text(msg)
+                # TextTab doesn't need UI text updates (controlled by mode files)
                 # Update overlay texts live
                 for ov in getattr(self, 'overlays', []):
                     ov.text = msg
@@ -1902,8 +3096,8 @@ class Launcher(QMainWindow):
                 except Exception:
                     pass
             try:
-                if hasattr(self, 'page_textfx') and self.page_textfx and hasattr(self.page_textfx, 'update_font_label'):
-                    self.page_textfx.update_font_label(fam or '(font)')  # optional UI hook
+                # TextTab doesn't need font label updates (fonts controlled by mode files)
+                pass
             except Exception:
                 pass
             try:
@@ -1916,3 +3110,503 @@ class Launcher(QMainWindow):
                 QMessageBox.critical(self, "Font", f"Failed to load font: {e}")
             except Exception:
                 pass
+    
+    def _on_custom_mode_requested(self, mode_path: str):
+        """Custom mode load requested - load and start CustomVisual."""
+        try:
+            if not self.visual_director:
+                from PyQt6.QtWidgets import QMessageBox
+                QMessageBox.warning(
+                    self,
+                    "Visual Director Not Available",
+                    "Visual Director system failed to initialize.\n\n"
+                    "Check console for errors or contact support."
+                )
+                logging.getLogger(__name__).warning("[CustomVisual] VisualDirector not initialized")
+                return
+            
+            # CRITICAL: Ensure spiral windows are created before loading mode
+            # CustomVisual needs compositor to apply settings during initialization
+            needs_timer_start = False  # Track if we need to start timer after mode loads
+            if not self.spiral_windows:
+                logging.getLogger(__name__).info("[CustomVisual] Auto-enabling spiral for mode load")
+                # Auto-enable spiral if not already active
+                if not self.spiral_enabled:
+                    # Set flag but DON'T start timer yet - mode needs to load first to set opacity
+                    self.spiral_enabled = True
+                    needs_timer_start = True
+                    try:
+                        # Update UI checkbox to reflect auto-enable
+                        if hasattr(self, 'panel_mesmerloom') and hasattr(self.panel_mesmerloom, 'check_spiral_enable'):
+                            self.panel_mesmerloom.check_spiral_enable.setChecked(True)
+                    except Exception as e:
+                        logging.getLogger(__name__).warning(f"[CustomVisual] Failed to update spiral checkbox: {e}")
+                
+                # CRITICAL: Set flag to defer compositor timer (complete silence until Launch)
+                self._defer_compositor_timer = True
+                logging.getLogger(__name__).info("[CustomVisual] Set flag to defer compositor timer start")
+                
+                # Create spiral windows
+                self._create_spiral_windows()
+                
+                # CRITICAL: Stop compositor timers immediately after creation (complete silence until Launch)
+                if self.spiral_windows:
+                    for win in self.spiral_windows:
+                        if hasattr(win, 'comp') and hasattr(win.comp, '_stop_timer'):
+                            win.comp._stop_timer()
+                            logging.getLogger(__name__).info("[CustomVisual] Stopped compositor timer (will restart on Launch)")
+                
+                # Wait a moment for windows to initialize (ensure compositor is ready)
+                if not self.spiral_windows:
+                    from PyQt6.QtWidgets import QMessageBox
+                    QMessageBox.warning(
+                        self,
+                        "Spiral Initialization Failed",
+                        "Failed to automatically create spiral overlay.\n\n"
+                        "Try manually enabling the spiral checkbox before loading modes."
+                    )
+                    logging.getLogger(__name__).error("[CustomVisual] Failed to auto-create spiral windows")
+                    return
+            
+            from pathlib import Path
+            mode_file = Path(mode_path)
+            
+            logging.getLogger(__name__).info(f"[CustomVisual] Loading mode: {mode_file.name}")
+            
+            # CRITICAL: If already running (from Launch), stop completely before reloading
+            # This prevents race conditions where update() advances frames during mode transition
+            if self.running:
+                logging.getLogger(__name__).info("[CustomVisual] Already running - stopping before reload")
+                self.stop_all()
+            
+            # CRITICAL: Pause BEFORE loading mode to prevent any frames from advancing
+            # This prevents cycler from triggering during mode load transition
+            if hasattr(self, 'visual_director') and self.visual_director:
+                self.visual_director.pause()
+                logging.getLogger(__name__).info("[CustomVisual] Paused visual director BEFORE mode load (prevents auto-advance)")
+            
+            # Load custom visual
+            if self.visual_director.select_custom_visual(mode_file):
+                # Note: MesmerLoom controls are now always locked (simplified UI)
+                # Custom modes define all settings in JSON
+                logging.getLogger(__name__).info(f"[CustomVisual] Started custom mode: {mode_file.name}")
+                
+                # Keep paused - user expects mode to load in "silent" state
+                # Spiral timer will start when Launch button is pressed
+                logging.getLogger(__name__).info("[CustomVisual] Visual director remains paused (silent state - awaiting Launch)")
+                
+                # DON'T start spiral timer here - nothing should render until Launch
+                # Timer will be started in Launch button handler
+                logging.getLogger(__name__).info("[CustomVisual] Spiral timer will start on Launch (complete silence until then)")
+                
+                # Store needs_timer_start flag for Launch handler
+                self._needs_spiral_timer_init = needs_timer_start
+                
+                # Continue to next iteration (skip timer start logic)
+                if True:  # Skip the timer start block
+                    pass
+                else:
+                    # OLD CODE (disabled): This block started timer immediately
+                    # NOW: Timer starts only on Launch press
+                    pass
+                
+                if False:  # Disable old timer start logic
+                        logging.getLogger(__name__).info("[CustomVisual] Timer already active, skipping start()")
+            else:
+                from PyQt6.QtWidgets import QMessageBox
+                QMessageBox.warning(
+                    self,
+                    "Custom Mode Load Failed",
+                    f"Failed to load custom mode:\n{mode_file.name}\n\n"
+                    "Possible issues:\n"
+                    "- Invalid JSON format\n"
+                    "- Missing required fields\n"
+                    "- Incompatible version\n\n"
+                    "Check console for detailed error messages."
+                )
+                logging.getLogger(__name__).error(f"[CustomVisual] Failed to load mode: {mode_file.name}")
+        except Exception as e:
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.critical(
+                self,
+                "Custom Mode Error",
+                f"Error loading custom mode:\n\n{e}\n\n"
+                "Check console for full traceback."
+            )
+            logging.getLogger(__name__).error(f"[CustomVisual] Load error: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def _on_reload_custom_mode(self):
+        """Reload current custom mode from disk (for live editing)."""
+        try:
+            if not self.visual_director:
+                logging.getLogger(__name__).warning("[CustomVisual] VisualDirector not initialized")
+                return
+            
+            # Check if custom mode is active
+            if not self.visual_director.is_custom_mode_active():
+                from PyQt6.QtWidgets import QMessageBox
+                QMessageBox.information(
+                    self,
+                    "No Custom Mode Active",
+                    "Please load a custom mode first before reloading."
+                )
+                return
+            
+            from ..mesmerloom.custom_visual import CustomVisual
+            if isinstance(self.visual_director.current_visual, CustomVisual):
+                mode_name = self.visual_director.current_visual.mode_name
+                logging.getLogger(__name__).info(f"[CustomVisual] Reloading mode '{mode_name}' from disk...")
+                
+                # Reload from disk
+                if self.visual_director.current_visual.reload_from_disk():
+                    from PyQt6.QtWidgets import QMessageBox
+                    QMessageBox.information(
+                        self,
+                        "Mode Reloaded",
+                        f"Successfully reloaded '{mode_name}' from disk.\n\n"
+                        "All settings have been refreshed."
+                    )
+                    logging.getLogger(__name__).info(f"[CustomVisual] Reload successful: {mode_name}")
+                else:
+                    from PyQt6.QtWidgets import QMessageBox
+                    QMessageBox.warning(
+                        self,
+                        "Reload Failed",
+                        f"Failed to reload '{mode_name}'.\n\n"
+                        "Check console for error details."
+                    )
+                    logging.getLogger(__name__).error(f"[CustomVisual] Reload failed: {mode_name}")
+        except Exception as e:
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.critical(
+                self,
+                "Reload Error",
+                f"Error reloading custom mode:\n\n{e}"
+            )
+            logging.getLogger(__name__).error(f"[CustomVisual] Reload error: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def _rebuild_media_library(self, images_dir: Optional[Path] = None, videos_dir: Optional[Path] = None, silent: bool = False):
+        """Rebuild ThemeBank with custom or default media directories.
+        
+        Args:
+            images_dir: Custom images directory (None = use default MEDIA/Images)
+            videos_dir: Custom videos directory (None = use default MEDIA/Videos)
+            silent: If True, suppress success notification popup (for mode loading)
+        """
+        try:
+            from ..content.theme import ThemeConfig
+            
+            # Store custom directories so they persist across mode loads
+            self._custom_images_dir = images_dir
+            self._custom_videos_dir = videos_dir
+            
+            # Get base media directory
+            media_dir = Path(__file__).parent.parent.parent / "MEDIA"
+            
+            # Use custom directories or defaults
+            images_path = images_dir if images_dir else (media_dir / "Images")
+            videos_path = videos_dir if videos_dir else (media_dir / "Videos")
+            
+            logging.getLogger(__name__).info(
+                f"[MesmerLoom] Rebuilding media library:\n"
+                f"  Images: {images_path}\n"
+                f"  Videos: {videos_path}"
+            )
+            logging.getLogger(__name__).info(f"[MesmerLoom] Stored custom dirs: images={self._custom_images_dir}, videos={self._custom_videos_dir}")
+            
+            # Build media lists
+            test_images = []
+            test_videos = []
+            test_text = [
+                "Welcome to MesmerGlass",
+                "Trance Visual Programs",
+                "Relax and Focus",
+                "Let Go",
+                "Deep and Deeper",
+                "Spiral Down",
+                "Good Subject",
+                "Obey and Enjoy"
+            ]
+            
+            # Determine root_path FIRST (needed for relative path calculation)
+            root_path_for_scanning = images_dir.parent if images_dir else media_dir
+            logging.getLogger(__name__).info(f"[MesmerLoom] root_path for scanning: {root_path_for_scanning}")
+            
+            # Scan images directory
+            if images_path.exists() and images_path.is_dir():
+                for ext in ['*.jpg', '*.jpeg', '*.png', '*.gif', '*.webp']:
+                    for img_path in images_path.glob(ext):
+                        # Store relative path from root_path
+                        try:
+                            relative_path = img_path.relative_to(root_path_for_scanning)
+                            test_images.append(str(relative_path))
+                        except ValueError:
+                            # If relative_to fails, store as absolute (shouldn't happen)
+                            logging.getLogger(__name__).warning(f"[MesmerLoom] Could not make path relative, using absolute: {img_path}")
+                            test_images.append(str(img_path))
+                
+                # Show first few images as sample
+                if test_images:
+                    sample = test_images[:3] if len(test_images) > 3 else test_images
+                    logging.getLogger(__name__).info(f"[MesmerLoom] Sample image paths (relative to root): {sample}")
+            else:
+                logging.getLogger(__name__).warning(f"[MesmerLoom] Images directory does not exist: {images_path}")
+            
+            # Scan videos directory
+            if videos_path.exists() and videos_path.is_dir():
+                for ext in ['*.mp4', '*.webm', '*.mkv', '*.avi']:
+                    for vid_path in videos_path.glob(ext):
+                        # Store relative path from root_path
+                        try:
+                            relative_path = vid_path.relative_to(root_path_for_scanning)
+                            test_videos.append(str(relative_path))
+                        except ValueError:
+                            # If relative_to fails, store as absolute (shouldn't happen)
+                            logging.getLogger(__name__).warning(f"[MesmerLoom] Could not make path relative, using absolute: {vid_path}")
+                            test_videos.append(str(vid_path))
+            else:
+                logging.getLogger(__name__).warning(f"[MesmerLoom] Videos directory does not exist: {videos_path}")
+            
+            # Create new theme config
+            default_theme = ThemeConfig(
+                name="Media Library",
+                enabled=True,
+                image_path=test_images,
+                animation_path=test_videos,
+                font_path=[],
+                text_line=test_text
+            )
+            
+            # Use root_path calculated earlier (consistent with path scanning)
+            root_path = root_path_for_scanning
+            if not root_path.exists():
+                root_path = media_dir
+                logging.getLogger(__name__).warning(f"[MesmerLoom] root_path does not exist, falling back to media_dir: {media_dir}")
+            
+            self.theme_bank = ThemeBank(
+                themes=[default_theme],
+                root_path=root_path,
+                image_cache_size=64
+            )
+            
+            # Activate the theme
+            if len(self.theme_bank._themes) > 0:
+                self.theme_bank.set_active_themes(primary_index=1)
+            
+            img_count = len(test_images)
+            vid_count = len(test_videos)
+            txt_count = len(test_text)
+            logging.getLogger(__name__).info(
+                f"[MesmerLoom] Media library rebuilt: "
+                f"{img_count} images, {vid_count} videos, {txt_count} text lines"
+            )
+            
+            # Update VisualDirector's theme_bank reference if it exists
+            if self.visual_director and hasattr(self.visual_director, 'theme_bank'):
+                self.visual_director.theme_bank = self.theme_bank
+                logging.getLogger(__name__).info("[MesmerLoom] Updated VisualDirector's theme_bank reference")
+                
+                # If a custom mode is active, reload its media with the new ThemeBank
+                if hasattr(self.visual_director, 'current_visual') and self.visual_director.current_visual:
+                    from ..mesmerloom.custom_visual import CustomVisual
+                    if isinstance(self.visual_director.current_visual, CustomVisual):
+                        logging.getLogger(__name__).info("[MesmerLoom] Reloading custom mode media with new ThemeBank...")
+                        # Re-apply media settings to pick up new ThemeBank
+                        self.visual_director.current_visual._apply_media_settings()
+                        logging.getLogger(__name__).info("[MesmerLoom] Custom mode media reloaded")
+            
+            # Show success notification (unless silent mode for mode loading)
+            if not silent:
+                from PyQt6.QtWidgets import QMessageBox
+                QMessageBox.information(
+                    self,
+                    "Media Library Updated",
+                    f"Successfully loaded media from:\n\n"
+                    f"Images: {images_path.name if not images_dir else images_path}\n"
+                    f"Videos: {videos_path.name if not videos_dir else videos_path}\n\n"
+                    f"Found: {img_count} images, {vid_count} videos"
+                )
+            
+        except Exception as e:
+            logging.getLogger(__name__).error(f"[MesmerLoom] Media library rebuild failed: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.critical(
+                self,
+                "Media Library Error",
+                f"Failed to rebuild media library:\n\n{e}"
+            )
+    
+    def _load_media_bank_config(self):
+        """Load Media Bank configuration from file."""
+        config_path = Path(__file__).parent.parent.parent / "media_bank.json"
+        if config_path.exists():
+            try:
+                with open(config_path, 'r', encoding='utf-8') as f:
+                    self._media_bank = json.load(f)
+                logging.getLogger(__name__).info(f"[MediaBank] Loaded {len(self._media_bank)} entries from config")
+            except Exception as e:
+                logging.getLogger(__name__).error(f"[MediaBank] Failed to load config: {e}")
+                self._media_bank = []
+        else:
+            logging.getLogger(__name__).info("[MediaBank] No saved config found - starting with empty bank")
+    
+    def _save_media_bank_config(self):
+        """Save Media Bank configuration to file."""
+        config_path = Path(__file__).parent.parent.parent / "media_bank.json"
+        try:
+            with open(config_path, 'w', encoding='utf-8') as f:
+                json.dump(self._media_bank, f, indent=2, ensure_ascii=False)
+            logging.getLogger(__name__).info(f"[MediaBank] Saved {len(self._media_bank)} entries to config")
+        except Exception as e:
+            logging.getLogger(__name__).error(f"[MediaBank] Failed to save config: {e}")
+    
+    def _rebuild_media_library_from_selections(self, bank_indices: List[int], silent: bool = True):
+        """Rebuild ThemeBank using only selected Media Bank indices.
+        
+        This is called when loading a custom mode that specifies which
+        Media Bank entries to use via bank_selections in the JSON.
+        
+        Args:
+            bank_indices: List of indices into self._media_bank array
+            silent: If True, suppress notifications (default for mode loading)
+        """
+        try:
+            from ..content.theme import ThemeConfig
+            
+            logging.getLogger(__name__).info(f"[MediaBank] Rebuilding from bank selections: {bank_indices}")
+            
+            # Validate indices
+            valid_indices = [i for i in bank_indices if 0 <= i < len(self._media_bank)]
+            if len(valid_indices) != len(bank_indices):
+                logging.getLogger(__name__).warning(
+                    f"[MediaBank] Some indices out of range. Using valid indices only: {valid_indices}"
+                )
+            
+            if not valid_indices:
+                logging.getLogger(__name__).error("[MediaBank] No valid bank indices provided")
+                return
+            
+            # Collect paths from selected bank entries
+            images_dirs = []
+            videos_dirs = []
+            
+            for idx in valid_indices:
+                entry = self._media_bank[idx]
+                if not entry.get('enabled', True):
+                    logging.getLogger(__name__).info(f"[MediaBank] Skipping disabled entry: {entry['name']}")
+                    continue
+                
+                entry_type = entry.get('type', 'images')
+                entry_path = Path(entry['path'])
+                
+                if entry_type in ('images', 'both') and entry_path.exists():
+                    images_dirs.append(entry_path)
+                if entry_type in ('videos', 'both') and entry_path.exists():
+                    videos_dirs.append(entry_path)
+            
+            logging.getLogger(__name__).info(
+                f"[MediaBank] Selected directories:\n"
+                f"  Images: {len(images_dirs)} directories\n"
+                f"  Videos: {len(videos_dirs)} directories"
+            )
+            
+            # Build media lists
+            test_images = []
+            test_videos = []
+            test_text = [
+                "Welcome to MesmerGlass",
+                "Trance Visual Programs",
+                "Relax and Focus",
+                "Let Go",
+                "Deep and Deeper",
+                "Spiral Down",
+                "Good Subject",
+                "Obey and Enjoy"
+            ]
+            
+            # Determine root_path (use first image directory's parent, or default MEDIA)
+            media_dir = Path(__file__).parent.parent.parent / "MEDIA"
+            root_path_for_scanning = images_dirs[0].parent if images_dirs else media_dir
+            logging.getLogger(__name__).info(f"[MediaBank] root_path for scanning: {root_path_for_scanning}")
+            
+            # Scan all selected image directories
+            for img_dir in images_dirs:
+                if img_dir.is_dir():
+                    for ext in ['*.jpg', '*.jpeg', '*.png', '*.gif', '*.webp']:
+                        for img_path in img_dir.glob(ext):
+                            try:
+                                relative_path = img_path.relative_to(root_path_for_scanning)
+                                test_images.append(str(relative_path))
+                            except ValueError:
+                                logging.getLogger(__name__).warning(
+                                    f"[MediaBank] Could not make path relative, using absolute: {img_path}"
+                                )
+                                test_images.append(str(img_path))
+            
+            # Scan all selected video directories
+            for vid_dir in videos_dirs:
+                if vid_dir.is_dir():
+                    for ext in ['*.mp4', '*.webm', '*.mkv', '*.avi']:
+                        for vid_path in vid_dir.glob(ext):
+                            try:
+                                relative_path = vid_path.relative_to(root_path_for_scanning)
+                                test_videos.append(str(relative_path))
+                            except ValueError:
+                                logging.getLogger(__name__).warning(
+                                    f"[MediaBank] Could not make path relative, using absolute: {vid_path}"
+                                )
+                                test_videos.append(str(vid_path))
+            
+            # Create new theme config
+            default_theme = ThemeConfig(
+                name="Media Bank Selection",
+                enabled=True,
+                image_path=test_images,
+                animation_path=test_videos,
+                font_path=[],
+                text_line=test_text
+            )
+            
+            # Use calculated root_path
+            root_path = root_path_for_scanning
+            if not root_path.exists():
+                root_path = media_dir
+                logging.getLogger(__name__).warning(
+                    f"[MediaBank] root_path does not exist, falling back to media_dir: {media_dir}"
+                )
+            
+            self.theme_bank = ThemeBank(
+                themes=[default_theme],
+                root_path=root_path,
+                image_cache_size=64
+            )
+            
+            # Activate the theme
+            if len(self.theme_bank._themes) > 0:
+                self.theme_bank.set_active_themes(primary_index=1)
+            
+            img_count = len(test_images)
+            vid_count = len(test_videos)
+            txt_count = len(test_text)
+            logging.getLogger(__name__).info(
+                f"[MediaBank] Media library rebuilt from bank selections: "
+                f"{img_count} images, {vid_count} videos, {txt_count} text lines"
+            )
+            
+            # Update VisualDirector's theme_bank reference
+            if self.visual_director and hasattr(self.visual_director, 'theme_bank'):
+                self.visual_director.theme_bank = self.theme_bank
+                logging.getLogger(__name__).info("[MediaBank] Updated VisualDirector's theme_bank reference")
+            
+        except Exception as e:
+            logging.getLogger(__name__).error(f"[MediaBank] Rebuild from selections failed: {e}")
+            import traceback
+            traceback.print_exc()
+    

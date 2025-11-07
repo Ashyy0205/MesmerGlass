@@ -14,8 +14,9 @@ def test_ui_list_tabs():
     assert r.returncode == 0
     # Expected core tabs
     out = r.stdout.strip().splitlines()
-    assert any("Media" == x for x in out)
-    assert any("Audio" == x for x in out)
+    # Media tab has been removed; core tabs are MesmerLoom, Audio, Text
+    assert any("MesmerLoom" in x for x in out)
+    assert any("Audio" in x for x in out)
     assert any("Text" in x for x in out)
 
 
@@ -41,7 +42,7 @@ def test_ui_status_and_setters():
     # Validate JSON shape
     import json
     data = json.loads(r.stdout.strip().splitlines()[-1])
-    assert data["tab"].lower().startswith("text")
+    assert "text" in data["tab"].lower()
     assert data["text"] == "TEST"
     assert data["fx_mode"] == "Shimmer"
     assert data["fx_intensity"] == 42

@@ -22,6 +22,36 @@ dist/
 build/
 *.egg-info/
 *.log
+*.spec
+
+# PyInstaller / Launcher builds
+*.exe
+mesmerglass_launcher.*
+build_launcher.ps1
+LAUNCHER_README.md
 
 # Jupyter
 .ipynb_checkpoints/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Debug logs (VR streaming, etc.)
+vr_*.log
+vr_*.txt
+
+# Temporary files
+*.tmp
+*.bak
+*~
+
+# User configuration
+media_bank.json
+
+# Large media files (store locally or use Git LFS)
+MEDIA/Videos/*.mp4
+MEDIA/Videos/*.avi
+MEDIA/Videos/*.mov
+MEDIA/Videos/*.mkv

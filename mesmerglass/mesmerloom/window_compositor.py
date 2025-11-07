@@ -57,6 +57,50 @@ class LoomWindowCompositor(QOpenGLWindow):
         self._log_interval = 60
         self._active = True
         self.available = False
+        # VR safe mirror settings (offscreen FBO tap)
+        self._vr_safe = bool(os.environ.get("MESMERGLASS_VR_SAFE") in ("1", "true", "True"))
+        self._vr_fbo = None
+        self._vr_tex = None
+        self._vr_size = (0, 0)
+        
+        # Background texture support (for Visual Programs)
+        self._background_texture = None
+        self._background_enabled = False
+        self._background_zoom = 1.0
+        self._background_image_width = 1920
+        self._background_image_height = 1080
+        self._background_offset = [0.0, 0.0]  # XY drift offset
+        self._background_kaleidoscope = False  # Kaleidoscope mirroring
+        self._background_program = None  # Background shader program
+        
+        # Fade transition support (for smooth image/video changes)
+        self._fade_enabled = False
+        self._fade_duration = 0.5
+        self._fade_progress = 0.0
+        self._fade_active = False
+        self._fade_old_texture = None
+        self._fade_old_zoom = 1.0
+        self._fade_old_width = 1920
+        self._fade_old_height = 1080
+        self._fade_frame_start = 0
+        
+        # Multi-layer ghosting support (when fade duration > cycle time)
+        self._fade_queue = []  # Queue of fading textures for ghosting effect
+        
+        # Zoom animation support (duration-based)
+        self._zoom_animating = False
+        self._zoom_current = 1.0
+        self._zoom_target = 1.5  # Max zoom target
+        self._zoom_start = 1.0
+        self._zoom_duration_frames = 0
+        self._zoom_elapsed_frames = 0
+        self._zoom_start_time = time.time()  # Real time start (for consistent speed)
+        self._zoom_enabled = True  # Can be disabled for video focus mode
+        self._zoom_mode = "exponential"  # Zoom animation mode
+        self._zoom_rate = 0.42  # Zoom rate for exponential mode
+        
+        # Text rendering support
+        self._text_opacity = 1.0  # Global text opacity multiplier
 
         # Animation timer
         self.timer = QTimer()
@@ -214,7 +258,8 @@ class LoomWindowCompositor(QOpenGLWindow):
             
             # Configure OpenGL state for transparency
             GL.glEnable(GL.GL_BLEND)         # Enable blending for transparency
-            GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA)  # Standard alpha blending
+            # Use premultiplied alpha blending to match spiral.frag output
+            GL.glBlendFunc(GL.GL_ONE, GL.GL_ONE_MINUS_SRC_ALPHA)
             GL.glDisable(GL.GL_DEPTH_TEST)   # No depth testing needed
             GL.glDisable(GL.GL_DITHER)       # Disable dithering completely
             GL.glDisable(GL.GL_MULTISAMPLE)  # Disable multisampling
@@ -225,6 +270,11 @@ class LoomWindowCompositor(QOpenGLWindow):
                 GL.glDisable(GL.GL_LINE_SMOOTH)
                 GL.glDisable(GL.GL_POINT_SMOOTH)
                 GL.glDisable(0x8C36)  # GL_SAMPLE_SHADING
+            except Exception:
+                pass
+            # Mark compositor as available after successful GL init
+            try:
+                self.available = True
             except Exception:
                 pass
             
@@ -355,27 +405,93 @@ class LoomWindowCompositor(QOpenGLWindow):
         
         self.vao.release()
         logger.info("[spiral.trace] Geometry setup complete")
+
+    # --- VR safe FBO helpers ---
+    def _ensure_vr_fbo(self, w: int, h: int) -> None:
+        """Create or resize the offscreen FBO used to mirror frames to VR."""
+        try:
+            if not self._vr_safe:
+                return
+            if self._vr_fbo is not None and self._vr_size == (w, h):
+                return
+            # Delete prior
+            if self._vr_tex is not None:
+                try: GL.glDeleteTextures(1, [int(self._vr_tex)])
+                except Exception: pass
+                self._vr_tex = None
+            if self._vr_fbo is not None:
+                try: GL.glDeleteFramebuffers(1, [int(self._vr_fbo)])
+                except Exception: pass
+                self._vr_fbo = None
+            # Create texture and FBO
+            self._vr_tex = GL.glGenTextures(1)
+            GL.glBindTexture(GL.GL_TEXTURE_2D, self._vr_tex)
+            GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MIN_FILTER, GL.GL_LINEAR)
+            GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MAG_FILTER, GL.GL_LINEAR)
+            GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_S, GL.GL_CLAMP_TO_EDGE)
+            GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_T, GL.GL_CLAMP_TO_EDGE)
+            GL.glTexImage2D(GL.GL_TEXTURE_2D, 0, GL.GL_RGBA8, int(w), int(h), 0, GL.GL_RGBA, GL.GL_UNSIGNED_BYTE, None)
+            self._vr_fbo = GL.glGenFramebuffers(1)
+            GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, self._vr_fbo)
+            GL.glFramebufferTexture2D(GL.GL_FRAMEBUFFER, GL.GL_COLOR_ATTACHMENT0, GL.GL_TEXTURE_2D, self._vr_tex, 0)
+            status = GL.glCheckFramebufferStatus(GL.GL_FRAMEBUFFER)
+            if status != GL.GL_FRAMEBUFFER_COMPLETE:
+                logger.warning(f"[vr] VR FBO incomplete 0x{int(status):04X}; disabling vr-safe mode")
+                try: GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, 0)
+                except Exception: pass
+                self._vr_safe = False
+                return
+            GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, 0)
+            self._vr_size = (w, h)
+        except Exception as e:
+            logger.warning(f"[vr] Failed to (re)create VR FBO: {e}")
+            self._vr_safe = False
+
+    def vr_fbo_info(self):
+        """Return (fbo, w, h) if VR safe mode FBO is available, else None."""
+        if self._vr_safe and self._vr_fbo:
+            w, h = self._vr_size
+            return int(self._vr_fbo), int(w), int(h)
+        return None
     
     def paintGL(self):
-        """Render the spiral directly to window - no FBO blit!"""
+        """Render the spiral; if VR safe mode is enabled, render to offscreen FBO then blit to window."""
         if not self.initialized or not self.program_id or not self._active:
             return
             
         self.frame_count += 1
         
-        # Setup viewport
-        GL.glViewport(0, 0, self.width(), self.height())
+        # Setup viewport and optional VR FBO
+        w_px, h_px = self.width(), self.height()
+        if self._vr_safe:
+            self._ensure_vr_fbo(w_px, h_px)
+            if self._vr_fbo:
+                GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, self._vr_fbo)
+        GL.glViewport(0, 0, w_px, h_px)
         
         # CRITICAL FIX: Clear with transparent background for proper window transparency
         # Using alpha=0.0 makes the background completely transparent to the desktop
         GL.glClearColor(0.0, 0.0, 0.0, 0.0)  # Transparent background - key fix!
         GL.glClear(GL.GL_COLOR_BUFFER_BIT)
         
-        # Use shader program
-        GL.glUseProgram(self.program_id)
-        
-        # Get window size for fallback
+        # Get window size for rendering
         w_px, h_px = self.width(), self.height()
+        
+        # RENDER BACKGROUND FIRST (images/videos behind spiral)
+        try:
+            self._render_background(w_px, h_px)
+        except Exception as e:
+            if self.frame_count <= 3:  # Only log errors on first few frames
+                logger.error(f"[visual] Background render failed: {e}")
+        
+        # Update zoom animation
+        try:
+            self.update_zoom_animation()
+        except Exception:
+            pass
+        
+        # Use spiral shader program
+        GL.glUseProgram(self.program_id)
         
         # Update director and get current parameters (same as original compositor)
         try:
@@ -394,7 +510,8 @@ class LoomWindowCompositor(QOpenGLWindow):
                 if self._trace and self.frame_count <= 3:
                     logger.info(f"[spiral.debug] Frame {self.frame_count}: Using window resolution {w_px}x{h_px} (no screen detected)")
             
-            self.director.update()
+            # Use fixed dt=1/60 to match Visual Mode Creator's timing (ensures 1:1 parity)
+            self.director.update(dt=1/60.0)
             uniforms = self.director.export_uniforms()
             
             # Debug: Check critical values every few frames
@@ -409,20 +526,32 @@ class LoomWindowCompositor(QOpenGLWindow):
         # Set uniforms using the same approach as original compositor
         def _set1(name, val):
             loc = GL.glGetUniformLocation(self.program_id, name)
-            if loc >= 0: 
-                GL.glUniform1f(loc, float(val))
+            if loc != -1:  # -1 means not found; 0+ are valid locations
+                try:
+                    GL.glUniform1f(loc, float(val))
+                except GL.GLError:
+                    pass  # Silently ignore invalid uniforms
         def _seti(name, val):
             loc = GL.glGetUniformLocation(self.program_id, name)
-            if loc >= 0: 
-                GL.glUniform1i(loc, int(val))
+            if loc != -1:
+                try:
+                    GL.glUniform1i(loc, int(val))
+                except GL.GLError:
+                    pass
         def _set2(name, val: tuple):
             loc = GL.glGetUniformLocation(self.program_id, name)
-            if loc >= 0: 
-                GL.glUniform2f(loc, float(val[0]), float(val[1]))
+            if loc != -1:
+                try:
+                    GL.glUniform2f(loc, float(val[0]), float(val[1]))
+                except GL.GLError:
+                    pass
         def _set3(name, val: tuple):
             loc = GL.glGetUniformLocation(self.program_id, name)
-            if loc >= 0: 
-                GL.glUniform3f(loc, float(val[0]), float(val[1]), float(val[2]))
+            if loc != -1:
+                try:
+                    GL.glUniform3f(loc, float(val[0]), float(val[1]), float(val[2]))
+                except GL.GLError:
+                    pass
         
         # Set core uniforms (same as original compositor approach)
         current_time = time.time() - self.t0
@@ -444,6 +573,9 @@ class LoomWindowCompositor(QOpenGLWindow):
             # Skip uTime and uResolution as we set them manually above (same as original)
             if k in ('uTime', 'uResolution'):
                 continue  
+            # Debug log rotation_speed uniform value
+            if k == 'rotation_speed' and self.frame_count % 120 == 0:
+                logger.info(f"[rotation_speed] Sending to shader: {v}")
             if isinstance(v, int): 
                 _seti(k, v)
             elif isinstance(v, (tuple, list)):
@@ -469,9 +601,9 @@ class LoomWindowCompositor(QOpenGLWindow):
         if getattr(self, '_frame_count', 0) % 60 == 1:  # Log every 60 frames
             logger.info(f"[spiral.debug] Frame {getattr(self, '_frame_count', 0)}: uWindowOpacity={getattr(self, '_window_opacity', 1.0)}")
         
-        # Enable GL blending for transparency
+        # Enable GL blending for transparency (premultiplied alpha)
         GL.glEnable(GL.GL_BLEND)
-        GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA)
+        GL.glBlendFunc(GL.GL_ONE, GL.GL_ONE_MINUS_SRC_ALPHA)
         
         # Render fullscreen quad
         self.vao.bind()
@@ -487,6 +619,17 @@ class LoomWindowCompositor(QOpenGLWindow):
                 logger.info(f"[spiral.trace] Director uniforms: {list(uniforms.keys())}")
                 logger.info(f"[spiral.trace] Key values: uIntensity={uniforms.get('uIntensity', 'MISSING')}, uPhase={uniforms.get('uPhase', 'MISSING')}, uBarWidth={uniforms.get('uBarWidth', 'MISSING')}")
         
+        # If rendering to offscreen FBO, blit it to the window default framebuffer now
+        if self._vr_safe and self._vr_fbo:
+            try:
+                GL.glBindFramebuffer(GL.GL_READ_FRAMEBUFFER, self._vr_fbo)
+                GL.glBindFramebuffer(GL.GL_DRAW_FRAMEBUFFER, 0)
+                GL.glBlitFramebuffer(0, 0, w_px, h_px, 0, 0, w_px, h_px, GL.GL_COLOR_BUFFER_BIT, GL.GL_NEAREST)
+                GL.glBindFramebuffer(GL.GL_READ_FRAMEBUFFER, 0)
+                GL.glBindFramebuffer(GL.GL_DRAW_FRAMEBUFFER, 0)
+            except Exception:
+                pass
+
         # Notify listeners (duplicate/mirror windows) that a new frame is available
         try:
             self.frame_drawn.emit()
@@ -532,6 +675,602 @@ class LoomWindowCompositor(QOpenGLWindow):
     def set_render_scale(self, scale: float):
         """Set render scale (for compatibility)"""
         logger.info(f"[spiral.trace] set_render_scale({scale}) called - not implemented for QOpenGLWindow")
+    
+    # ===== Background Texture Support (for Visual Programs) =====
+    
+    def set_background_texture(self, texture_id: int, zoom: float = 1.0, image_width: int = None, image_height: int = None) -> None:
+        """Set background image texture with optional fade transition (Visual Programs support).
+        
+        Args:
+            texture_id: OpenGL texture ID (from texture.upload_image_to_gpu)
+            zoom: Zoom factor (1.0 = fit to screen, >1.0 = zoomed in)
+            image_width: Original image width (for aspect ratio)
+            image_height: Original image height (for aspect ratio)
+        """
+        # If fade is enabled and we have a current texture, start fade transition
+        if self._fade_enabled and self._background_texture is not None and self._background_enabled:
+            current_frame = getattr(self, '_frame_counter', 0)
+            
+            # Add current texture to fade queue for ghosting effect
+            self._fade_queue.append({
+                'texture': self._background_texture,
+                'zoom': self._background_zoom,
+                'width': self._background_image_width,
+                'height': self._background_image_height,
+                'start_frame': current_frame
+            })
+            
+            # Also store in old texture for backward compatibility
+            self._fade_old_texture = self._background_texture
+            self._fade_old_zoom = self._background_zoom
+            self._fade_old_width = self._background_image_width
+            self._fade_old_height = self._background_image_height
+            self._fade_active = True
+            self._fade_progress = 0.0
+            self._fade_frame_start = current_frame
+            logger.info(f"[fade] Starting fade transition (duration={self._fade_duration:.2f}s, queue_size={len(self._fade_queue)})")
+        
+        self._background_texture = texture_id
+        self._background_zoom = max(0.1, min(5.0, zoom))
+        
+        if image_width is not None and image_height is not None:
+            self._background_image_width = max(1, image_width)
+            self._background_image_height = max(1, image_height)
+        
+        self._background_enabled = True
+        logger.info(f"[visual] Background texture set: id={texture_id}, zoom={zoom}, size={image_width}x{image_height}")
+    
+    def clear_background_texture(self) -> None:
+        """Clear background image texture."""
+        self._background_texture = None
+        self._background_enabled = False
+    
+    def set_fade_duration(self, duration_seconds: float) -> None:
+        """Set fade transition duration for media changes.
+        
+        Args:
+            duration_seconds: Fade duration in seconds (0.0 = instant, 0.5 = half second, etc.)
+        """
+        self._fade_duration = max(0.0, min(5.0, duration_seconds))
+        self._fade_enabled = duration_seconds > 0.0
+        logger.info(f"[fade] Fade duration set to {self._fade_duration:.2f}s (enabled={self._fade_enabled})")
+        logger.info("[visual] Background texture cleared")
+    
+    def set_background_zoom(self, zoom: float) -> None:
+        """Set background zoom factor."""
+        self._background_zoom = max(0.1, min(5.0, zoom))
+    
+    def start_zoom_animation(self, target_zoom: float = 1.5, start_zoom: float = 1.0, duration_frames: int = 48, mode: str = "exponential", rate: float = None) -> None:
+        """Start duration-based zoom-in animation.
+        
+        Args:
+            target_zoom: Final zoom level (clamped to 0.1-5.0)
+            start_zoom: Starting zoom level (clamped to 0.1-5.0)
+            duration_frames: Number of frames over which to animate (e.g., 48 for images, 300 for videos)
+            mode: "exponential" (continuous zoom in/out), "pulse" (wave), "linear" (legacy), "falling" (zoom out)
+            rate: Optional explicit zoom rate (overrides auto-calculation)
+        """
+        # Don't start zoom if disabled (e.g., video focus mode)
+        if not self._zoom_enabled:
+            return
+        
+        self._zoom_start = max(0.1, min(5.0, start_zoom))
+        self._zoom_target = max(0.1, min(5.0, target_zoom))
+        self._zoom_current = self._zoom_start
+        self._zoom_duration_frames = max(1, duration_frames)
+        self._zoom_elapsed_frames = 0
+        self._zoom_start_time = time.time()  # Reset time for consistent speed
+        
+        # Store zoom mode for update calculations
+        self._zoom_mode = mode if mode in ["exponential", "pulse", "linear", "falling"] else "exponential"
+        
+        # Set explicit zoom rate if provided, otherwise use default calculation
+        if rate is not None:
+            self._zoom_rate = rate
+            # For exponential mode (zoom in), rate should be POSITIVE (zoom value increases)
+            # Shader uses / uZoom, so LARGER zoom = shows LESS = visual zoom in
+            if mode == "exponential" and self._zoom_rate < 0:
+                self._zoom_rate = abs(self._zoom_rate)
+            # For falling mode (zoom out), rate should be NEGATIVE (zoom value decreases)
+            elif mode == "falling" and self._zoom_rate > 0:
+                self._zoom_rate = -self._zoom_rate
+        
+        self._background_zoom = self._zoom_current
+        self._zoom_animating = True
+    
+    def set_zoom_animation_enabled(self, enabled: bool) -> None:
+        """Enable or disable zoom animations.
+        
+        Args:
+            enabled: True to enable zoom animations, False to disable
+        """
+        self._zoom_enabled = enabled
+        if not enabled:
+            # Reset zoom to 1.0 when disabling
+            self._zoom_animating = False
+            self._zoom_current = 1.0
+            self._zoom_target = 1.0
+            self._background_zoom = 1.0
+        logger.info(f"[compositor] Zoom animations {'enabled' if enabled else 'disabled'}")
+    
+    def set_zoom_target(self, target_zoom: float) -> None:
+        """Set the maximum zoom target (used for future zoom animations).
+        
+        Args:
+            target_zoom: Maximum zoom level (0.1 to 5.0)
+        """
+        self._zoom_target = max(0.1, min(5.0, target_zoom))
+        logger.info(f"[compositor] Zoom target set to {self._zoom_target}x")
+    
+    def update_zoom_animation(self) -> None:
+        """Update zoom animation (exponential, pulse, falling, or linear modes)."""
+        if not self._zoom_animating:
+            return
+        
+        # Increment elapsed frames
+        self._zoom_elapsed_frames += 1
+        elapsed_time = time.time() - self._zoom_start_time  # Use real time for consistent speed
+        
+        # Calculate zoom based on mode
+        if self._zoom_mode == "exponential":
+            # Exponential zoom IN: zoom value increases (shader divides by it)
+            # With positive rate, zoom: 1.0 → 1.5 → 2.0 → 3.0
+            # Shader /zoom with larger values = see LESS = visual zoom in
+            import math
+            self._zoom_current = self._zoom_start * math.exp(self._zoom_rate * elapsed_time)
+            
+            # Reset when zoom gets too large (deep zoom limit)
+            if self._zoom_current > 3.0:  # Reset at 3x zoom
+                self._zoom_start = 1.0
+                self._zoom_current = 1.0
+                self._zoom_start_time = time.time()
+        
+        elif self._zoom_mode == "falling":
+            # Falling mode: zoom OUT (zoom value decreases)
+            import math
+            self._zoom_current = self._zoom_start * math.exp(self._zoom_rate * elapsed_time)  # rate should be negative
+            
+            # Reset when zoom gets too small (zoomed out limit)
+            if self._zoom_current < 0.5:
+                self._zoom_start = 1.0
+                self._zoom_current = 1.0
+                self._zoom_start_time = time.time()
+        
+        elif self._zoom_mode == "pulse":
+            # Pulsing wave: scale = 1.0 + amplitude * sin(rate * time)
+            # Creates repeating zoom in/out effect synced to spiral
+            import math
+            amplitude = 0.3  # 30% zoom variation (1.0 to 1.3)
+            self._zoom_current = 1.0 + amplitude * math.sin(self._zoom_rate * elapsed_time)
+        
+        else:  # "linear" mode (legacy)
+            # Linear interpolation from start to target over fixed duration
+            progress = min(1.0, self._zoom_elapsed_frames / self._zoom_duration_frames)
+            self._zoom_current = self._zoom_start + (self._zoom_target - self._zoom_start) * progress
+            
+            # Stop animation when complete
+            if progress >= 1.0:
+                self._zoom_current = self._zoom_target
+                self._zoom_animating = False
+        
+        # Clamp to safe range
+        self._zoom_current = max(0.1, min(5.0, self._zoom_current))
+        
+        # Update background zoom
+        self._background_zoom = self._zoom_current
+    
+    def set_background_video_frame(self, frame_data, width: int, height: int, zoom: float = 1.0, new_video: bool = False) -> None:
+        """Update background with video frame (efficient GPU upload).
+        
+        Args:
+            frame_data: RGB frame data as numpy array (shape: height x width x 3, dtype=uint8)
+            width: Frame width in pixels
+            height: Frame height in pixels
+            zoom: Zoom factor (1.0 = fit to screen, >1.0 = zoomed in)
+            new_video: True if this is the first frame of a new video (triggers fade transition)
+        """
+        try:
+            from OpenGL import GL
+            import numpy as np
+            
+            # Check if OpenGL context is ready
+            if not self.initialized:
+                return
+            
+            # Ensure frame data is correct format
+            if not isinstance(frame_data, np.ndarray):
+                logger.error("frame_data must be numpy array")
+                return
+            
+            if frame_data.shape != (height, width, 3):
+                logger.error(f"frame_data shape mismatch: expected ({height}, {width}, 3), got {frame_data.shape}")
+                return
+            
+            if frame_data.dtype != np.uint8:
+                logger.error(f"frame_data dtype mismatch: expected uint8, got {frame_data.dtype}")
+                return
+            
+            # DOUBLE FLIP (matches LoomCompositor line 1276):
+            # 1. Flip data here: top-left -> bottom-left  
+            # 2. Shader flips again: bottom-left -> top-left
+            # Result: Original orientation preserved (which is what we want!)
+            # NO DATA FLIP - test if videos are already correct
+            frame_data_flipped = frame_data
+            
+            # Create or reuse texture
+            needs_new_texture = (
+                self._background_texture is None or 
+                not GL.glIsTexture(self._background_texture) or
+                self._background_image_width != width or 
+                self._background_image_height != height
+            )
+            
+            # Trigger fade transition if this is a new video and we have existing content
+            if new_video and self._fade_enabled and self._background_texture is not None and self._background_enabled:
+                current_frame = getattr(self, '_frame_counter', 0)
+                
+                # Add current texture to fade queue for ghosting effect
+                self._fade_queue.append({
+                    'texture': self._background_texture,
+                    'zoom': self._background_zoom,
+                    'width': self._background_image_width,
+                    'height': self._background_image_height,
+                    'start_frame': current_frame
+                })
+                
+                # Also store in old texture for backward compatibility
+                self._fade_old_texture = self._background_texture
+                self._fade_old_zoom = self._background_zoom
+                self._fade_old_width = self._background_image_width
+                self._fade_old_height = self._background_image_height
+                self._fade_active = True
+                self._fade_progress = 0.0
+                self._fade_frame_start = current_frame
+                logger.info(f"[fade] Starting fade transition for video (duration={self._fade_duration:.2f}s, queue_size={len(self._fade_queue)})")
+                
+                # Force texture recreation so we don't overwrite the old texture during fade
+                needs_new_texture = True
+            
+            if needs_new_texture:
+                # Delete old texture if it exists
+                if self._background_texture is not None and GL.glIsTexture(self._background_texture):
+                    GL.glDeleteTextures([self._background_texture])
+                
+                # Generate new texture
+                self._background_texture = GL.glGenTextures(1)
+                GL.glBindTexture(GL.GL_TEXTURE_2D, self._background_texture)
+                
+                # Set texture parameters
+                GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MIN_FILTER, GL.GL_LINEAR)
+                GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MAG_FILTER, GL.GL_LINEAR)
+                GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_S, GL.GL_REPEAT)
+                GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_T, GL.GL_REPEAT)
+                
+                # Upload initial frame data (flipped)
+                GL.glTexImage2D(
+                    GL.GL_TEXTURE_2D,
+                    0,  # Mipmap level
+                    GL.GL_RGB,  # Internal format
+                    width,
+                    height,
+                    0,  # Border
+                    GL.GL_RGB,  # Format
+                    GL.GL_UNSIGNED_BYTE,
+                    frame_data_flipped
+                )
+                
+                logger.debug(f"Created video texture {self._background_texture} ({width}x{height})")
+            else:
+                # Reuse existing texture (faster)
+                GL.glBindTexture(GL.GL_TEXTURE_2D, self._background_texture)
+                GL.glTexSubImage2D(
+                    GL.GL_TEXTURE_2D,
+                    0,  # Mipmap level
+                    0, 0,  # Offset
+                    width,
+                    height,
+                    GL.GL_RGB,
+                    GL.GL_UNSIGNED_BYTE,
+                    frame_data_flipped
+                )
+            
+            # Update state
+            self._background_image_width = width
+            self._background_image_height = height
+            self._background_zoom = max(0.1, min(5.0, zoom))
+            self._background_enabled = True
+            
+        except Exception as e:
+            logger.error(f"Failed to upload video frame: {e}")
+    
+    def set_text_opacity(self, opacity: float) -> None:
+        """Set global text opacity (0.0 to 1.0). Affects all text elements."""
+        self._text_opacity = max(0.0, min(1.0, opacity))
+        logger.info(f"[Text] Global text opacity set to {self._text_opacity:.2f}")
+    
+    def get_text_opacity(self) -> float:
+        """Get current global text opacity."""
+        return getattr(self, '_text_opacity', 1.0)
+    
+    def _build_background_program(self) -> int:
+        """Build shader program for background image/video rendering."""
+        # Simple vertex shader (fullscreen quad)
+        vs_src = """#version 330 core
+layout(location = 0) in vec2 aPos;
+layout(location = 1) in vec2 aTexCoord;
+
+out vec2 vTexCoord;
+
+void main() {
+    gl_Position = vec4(aPos, 0.0, 1.0);
+    // NO FLIP in vertex shader
+    vTexCoord = aTexCoord;
+}
+"""
+        
+        # Fragment shader with zoom, aspect ratio, and kaleidoscope support
+        fs_src = self._background_fs_source()
+        
+        # Compile and link
+        vs = self._compile_shader(vs_src, GL.GL_VERTEX_SHADER)
+        fs = self._compile_shader(fs_src, GL.GL_FRAGMENT_SHADER)
+        
+        prog = GL.glCreateProgram()
+        GL.glAttachShader(prog, vs)
+        GL.glAttachShader(prog, fs)
+        GL.glLinkProgram(prog)
+        
+        if not GL.glGetProgramiv(prog, GL.GL_LINK_STATUS):
+            log = GL.glGetProgramInfoLog(prog).decode('utf-8', 'ignore')
+            raise RuntimeError(f"Background program link failed: {log}")
+        
+        GL.glDeleteShader(vs)
+        GL.glDeleteShader(fs)
+        
+        logger.info(f"[visual] Built background shader program: {prog}")
+        return int(prog)
+
+    @staticmethod
+    def _background_fs_source() -> str:
+        """Return background fragment shader source.
+
+        Exposed for testing so we can validate it without requiring a GL context.
+        """
+        return """#version 330 core
+in vec2 vTexCoord;
+out vec4 FragColor;
+
+uniform sampler2D uTexture;
+uniform vec2 uResolution;
+uniform float uZoom;
+uniform vec2 uOffset;
+uniform int uKaleidoscope;
+uniform vec2 uImageSize;
+uniform float uOpacity;  // Opacity for fade transitions (0.0-1.0)
+
+void main() {
+    // Compute aspects once
+    float windowAspect = uResolution.x / uResolution.y;
+    float imageAspect = uImageSize.x / uImageSize.y;
+
+    vec2 uv = vTexCoord;
+
+    // Aspect-ratio-preserving fit (letterbox/pillarbox)
+    if (imageAspect > windowAspect) {
+        float scale = windowAspect / imageAspect;
+        uv.y = (uv.y - 0.5) / scale + 0.5;
+    } else {
+        float scale = imageAspect / windowAspect;
+        uv.x = (uv.x - 0.5) / scale + 0.5;
+    }
+
+    // Apply offset
+    uv += uOffset;
+
+    // Apply zoom around center
+    vec2 center = vec2(0.5, 0.5);
+    uv = center + (uv - center) / uZoom;
+
+    // Wrap for tiling
+    uv = fract(uv);
+
+    // Kaleidoscope mirroring
+    if (uKaleidoscope == 1) {
+        vec2 quadrant = floor(uv * 2.0);
+        vec2 tileUV = fract(uv * 2.0);
+        if (mod(quadrant.x, 2.0) == 1.0) tileUV.x = 1.0 - tileUV.x;
+        if (mod(quadrant.y, 2.0) == 1.0) tileUV.y = 1.0 - tileUV.y;
+        uv = tileUV;
+    }
+
+    // FINAL FLIP - right before texture sample (to match upload path)
+    uv.y = 1.0 - uv.y;
+
+    vec4 color = texture(uTexture, uv);
+    
+    // Apply opacity for fade transitions
+    color.a = uOpacity;
+    
+    FragColor = color;
+}
+"""
+    
+    def _render_background(self, w_px: int, h_px: int) -> None:
+        """Render background image/video texture with optional fade transition.
+        
+        Args:
+            w_px: Viewport width
+            h_px: Viewport height
+        """
+        if not self._background_enabled or self._background_texture is None:
+            return
+        
+        # Update fade progress and clean up expired textures in queue
+        current_frame = getattr(self, '_frame_counter', 0)
+        fade_duration_frames = self._fade_duration * 60.0  # Convert seconds to frames (60 FPS)
+        
+        # Remove fully faded textures from queue
+        self._fade_queue = [
+            item for item in self._fade_queue
+            if (current_frame - item['start_frame']) < fade_duration_frames
+        ]
+        
+        # Update main fade progress if active
+        if self._fade_active:
+            frames_elapsed = current_frame - self._fade_frame_start
+            
+            if fade_duration_frames > 0:
+                self._fade_progress = min(1.0, frames_elapsed / fade_duration_frames)
+            else:
+                self._fade_progress = 1.0
+            
+            # End fade when complete
+            if self._fade_progress >= 1.0:
+                self._fade_active = False
+                self._fade_old_texture = None
+                logger.debug(f"[fade] Fade complete")
+        
+        # Disable blending for opaque background
+        was_blend_enabled = GL.glIsEnabled(GL.GL_BLEND)
+        if was_blend_enabled:
+            GL.glDisable(GL.GL_BLEND)
+        
+        # Lazily build background shader program once
+        if not self._background_program or not GL.glIsProgram(self._background_program):
+            self._background_program = self._build_background_program()
+        
+        # Use background shader
+        GL.glUseProgram(self._background_program)
+        
+        # Set common uniforms
+        loc = GL.glGetUniformLocation(self._background_program, 'uResolution')
+        if loc >= 0:
+            GL.glUniform2f(loc, float(w_px), float(h_px))
+        
+        # Render all fading textures for ghosting effect (oldest to newest)
+        if self._fade_queue:
+            first_layer = True
+            
+            for item in self._fade_queue:
+                frames_elapsed = current_frame - item['start_frame']
+                fade_progress = min(1.0, frames_elapsed / fade_duration_frames) if fade_duration_frames > 0 else 1.0
+                opacity = 1.0 - fade_progress  # Fade out
+                
+                # Skip if fully faded
+                if opacity <= 0.01:
+                    continue
+                
+                # First layer renders without blending (opaque background)
+                # Subsequent layers blend on top
+                if not first_layer:
+                    GL.glEnable(GL.GL_BLEND)
+                    GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA)
+                
+                GL.glActiveTexture(GL.GL_TEXTURE0)
+                GL.glBindTexture(GL.GL_TEXTURE_2D, item['texture'])
+                
+                loc = GL.glGetUniformLocation(self._background_program, 'uTexture')
+                if loc >= 0:
+                    GL.glUniform1i(loc, 0)
+                
+                loc = GL.glGetUniformLocation(self._background_program, 'uZoom')
+                if loc >= 0:
+                    GL.glUniform1f(loc, item['zoom'])
+                
+                loc = GL.glGetUniformLocation(self._background_program, 'uOffset')
+                if loc >= 0:
+                    offset = getattr(self, '_background_offset', [0.0, 0.0])
+                    GL.glUniform2f(loc, offset[0], offset[1])
+                
+                loc = GL.glGetUniformLocation(self._background_program, 'uKaleidoscope')
+                if loc >= 0:
+                    kaleidoscope = getattr(self, '_background_kaleidoscope', False)
+                    GL.glUniform1i(loc, 1 if kaleidoscope else 0)
+                
+                loc = GL.glGetUniformLocation(self._background_program, 'uImageSize')
+                if loc >= 0:
+                    GL.glUniform2f(loc, float(item['width']), float(item['height']))
+                
+                loc = GL.glGetUniformLocation(self._background_program, 'uOpacity')
+                if loc >= 0:
+                    GL.glUniform1f(loc, opacity)
+                
+                # Draw texture
+                self.vao.bind()
+                GL.glDrawElements(GL.GL_TRIANGLES, 6, GL.GL_UNSIGNED_INT, None)
+                
+                first_layer = False
+            
+            # Enable blending for current texture (blend on top of all fading textures)
+            GL.glEnable(GL.GL_BLEND)
+            GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA)
+            
+            # Render current texture (fading in if fade is active)
+            GL.glActiveTexture(GL.GL_TEXTURE0)
+            GL.glBindTexture(GL.GL_TEXTURE_2D, self._background_texture)
+            
+            loc = GL.glGetUniformLocation(self._background_program, 'uTexture')
+            if loc >= 0:
+                GL.glUniform1i(loc, 0)
+            
+            loc = GL.glGetUniformLocation(self._background_program, 'uZoom')
+            if loc >= 0:
+                GL.glUniform1f(loc, self._background_zoom)
+            
+            loc = GL.glGetUniformLocation(self._background_program, 'uImageSize')
+            if loc >= 0:
+                GL.glUniform2f(loc, float(self._background_image_width), float(self._background_image_height))
+            
+            loc = GL.glGetUniformLocation(self._background_program, 'uOpacity')
+            if loc >= 0:
+                # Fade in if fade is active, otherwise full opacity
+                opacity = self._fade_progress if self._fade_active else 1.0
+                GL.glUniform1f(loc, opacity)
+            
+            # Draw current texture
+            self.vao.bind()
+            GL.glDrawElements(GL.GL_TRIANGLES, 6, GL.GL_UNSIGNED_INT, None)
+            
+            # Disable blending again
+            GL.glDisable(GL.GL_BLEND)
+        else:
+            # No fade - render normally
+            GL.glActiveTexture(GL.GL_TEXTURE0)
+            GL.glBindTexture(GL.GL_TEXTURE_2D, self._background_texture)
+            
+            loc = GL.glGetUniformLocation(self._background_program, 'uTexture')
+            if loc >= 0:
+                GL.glUniform1i(loc, 0)
+            
+            loc = GL.glGetUniformLocation(self._background_program, 'uZoom')
+            if loc >= 0:
+                GL.glUniform1f(loc, self._background_zoom)
+            
+            loc = GL.glGetUniformLocation(self._background_program, 'uOffset')
+            if loc >= 0:
+                offset = getattr(self, '_background_offset', [0.0, 0.0])
+                GL.glUniform2f(loc, offset[0], offset[1])
+            
+            loc = GL.glGetUniformLocation(self._background_program, 'uKaleidoscope')
+            if loc >= 0:
+                kaleidoscope = getattr(self, '_background_kaleidoscope', False)
+                GL.glUniform1i(loc, 1 if kaleidoscope else 0)
+            
+            loc = GL.glGetUniformLocation(self._background_program, 'uImageSize')
+            if loc >= 0:
+                GL.glUniform2f(loc, float(self._background_image_width), float(self._background_image_height))
+            
+            loc = GL.glGetUniformLocation(self._background_program, 'uOpacity')
+            if loc >= 0:
+                GL.glUniform1f(loc, 1.0)  # Full opacity
+            
+            # Draw fullscreen quad
+            self.vao.bind()
+            GL.glDrawElements(GL.GL_TRIANGLES, 6, GL.GL_UNSIGNED_INT, None)
+        
+        # Re-enable blending for spiral
+        if was_blend_enabled:
+            GL.glEnable(GL.GL_BLEND)
     
     def cleanup(self):
         """Clean up OpenGL resources"""

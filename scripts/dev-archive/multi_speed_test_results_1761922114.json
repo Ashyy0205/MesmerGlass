@@ -1,0 +1,168 @@
+{
+  "comparison": {
+    "timestamp": "2025-10-31 14:48:34",
+    "test_speeds": [
+      4.0,
+      8.0,
+      16.0,
+      24.0
+    ],
+    "speed_comparisons": {
+      "4.0": {
+        "vmc_degrees_per_sec": 9253.654161714732,
+        "launcher_degrees_per_sec": 338565.47014289245,
+        "difference_degrees_per_sec": 329311.81598117773,
+        "percentage_difference": 97.2668051004111,
+        "vmc_accuracy": 42840.991489420056,
+        "launcher_accuracy": 1567432.7321430205,
+        "match_status": "MISMATCH",
+        "vmc_zoom_rate": 0.02,
+        "launcher_zoom_rate": 0.0,
+        "zoom_difference": 0.02,
+        "zoom_percentage_difference": 100.0,
+        "vmc_zoom_accuracy": 100.0,
+        "launcher_zoom_accuracy": 0.0,
+        "zoom_match_status": "MISMATCH",
+        "vmc_consistency": 57.39435501447657,
+        "launcher_consistency": 1329.98641220183
+      },
+      "8.0": {
+        "vmc_degrees_per_sec": 26.62898202964587,
+        "launcher_degrees_per_sec": 12.387919896602188,
+        "difference_degrees_per_sec": 14.24106213304368,
+        "percentage_difference": 53.47955891512939,
+        "vmc_accuracy": 61.64116210566173,
+        "launcher_accuracy": 28.675740501393953,
+        "match_status": "MISMATCH",
+        "vmc_zoom_rate": 0.04,
+        "launcher_zoom_rate": 0.0,
+        "zoom_difference": 0.04,
+        "zoom_percentage_difference": 100.0,
+        "vmc_zoom_accuracy": 100.0,
+        "launcher_zoom_accuracy": 0.0,
+        "zoom_match_status": "MISMATCH",
+        "vmc_consistency": 0.0019874297827915453,
+        "launcher_consistency": 0
+      },
+      "16.0": {
+        "vmc_degrees_per_sec": 79673.07286797135,
+        "launcher_degrees_per_sec": 26.171612140061438,
+        "difference_degrees_per_sec": 79646.90125583128,
+        "percentage_difference": 99.96715124546101,
+        "vmc_accuracy": 92214.20470830017,
+        "launcher_accuracy": 30.29121775470073,
+        "match_status": "MISMATCH",
+        "vmc_zoom_rate": 0.08,
+        "launcher_zoom_rate": 0.0,
+        "zoom_difference": 0.08,
+        "zoom_percentage_difference": 100.0,
+        "vmc_zoom_accuracy": 100.0,
+        "launcher_zoom_accuracy": 0.0,
+        "zoom_match_status": "MISMATCH",
+        "vmc_consistency": 275.7538614505785,
+        "launcher_consistency": 0
+      },
+      "24.0": {
+        "vmc_degrees_per_sec": 69558.25014882084,
+        "launcher_degrees_per_sec": 219873.39687802823,
+        "difference_degrees_per_sec": 150315.1467292074,
+        "percentage_difference": 68.36440827472761,
+        "vmc_accuracy": 53671.489312361744,
+        "launcher_accuracy": 169655.39882563904,
+        "match_status": "MISMATCH",
+        "vmc_zoom_rate": 0.12,
+        "launcher_zoom_rate": 0.0,
+        "zoom_difference": 0.12,
+        "zoom_percentage_difference": 100.0,
+        "vmc_zoom_accuracy": 100.0,
+        "launcher_zoom_accuracy": 0.0,
+        "zoom_match_status": "MISMATCH",
+        "vmc_consistency": 385.9063463801809,
+        "launcher_consistency": 863.5982475510998
+      }
+    },
+    "overall_accuracy": {
+      "vmc_average_accuracy": 47197.08166804691,
+      "launcher_average_accuracy": 434286.7744817289,
+      "vmc_accuracy_std": 37899.800327088444,
+      "launcher_accuracy_std": 759650.8662811051
+    },
+    "consistency_analysis": {}
+  },
+  "vmc_results": {
+    "4.0": {
+      "target_speed": 4.0,
+      "measured_degrees_per_sec": 9253.654161714732,
+      "measured_rotations_per_sec": 25.704594893652036,
+      "sample_count": 108,
+      "duration": 6.969033718109131,
+      "accuracy_percentage": 42840.991489420056,
+      "speed_consistency": 57.39435501447657
+    },
+    "8.0": {
+      "target_speed": 8.0,
+      "measured_degrees_per_sec": 26.62898202964587,
+      "measured_rotations_per_sec": 0.07396939452679407,
+      "sample_count": 113,
+      "duration": 6.985010862350464,
+      "accuracy_percentage": 61.64116210566173,
+      "speed_consistency": 0.0019874297827915453
+    },
+    "16.0": {
+      "target_speed": 16.0,
+      "measured_degrees_per_sec": 79673.07286797135,
+      "measured_rotations_per_sec": 221.31409129992042,
+      "sample_count": 103,
+      "duration": 6.95288872718811,
+      "accuracy_percentage": 92214.20470830017,
+      "speed_consistency": 275.7538614505785
+    },
+    "24.0": {
+      "target_speed": 24.0,
+      "measured_degrees_per_sec": 69558.25014882084,
+      "measured_rotations_per_sec": 193.21736152450234,
+      "sample_count": 92,
+      "duration": 5.234710693359375,
+      "accuracy_percentage": 53671.489312361744,
+      "speed_consistency": 385.9063463801809
+    }
+  },
+  "launcher_results": {
+    "4.0": {
+      "target_speed": 4.0,
+      "measured_degrees_per_sec": 338565.47014289245,
+      "measured_rotations_per_sec": 940.4596392858123,
+      "sample_count": 36,
+      "duration": 3.747232675552368,
+      "accuracy_percentage": 1567432.7321430205,
+      "speed_consistency": 1329.98641220183
+    },
+    "8.0": {
+      "target_speed": 8.0,
+      "measured_degrees_per_sec": 12.387919896602188,
+      "measured_rotations_per_sec": 0.03441088860167275,
+      "sample_count": 25,
+      "duration": 3.75169038772583,
+      "accuracy_percentage": 28.675740501393953,
+      "speed_consistency": 0
+    },
+    "16.0": {
+      "target_speed": 16.0,
+      "measured_degrees_per_sec": 26.171612140061438,
+      "measured_rotations_per_sec": 0.07269892261128177,
+      "sample_count": 28,
+      "duration": 3.5516207218170166,
+      "accuracy_percentage": 30.29121775470073,
+      "speed_consistency": 0
+    },
+    "24.0": {
+      "target_speed": 24.0,
+      "measured_degrees_per_sec": 219873.39687802823,
+      "measured_rotations_per_sec": 610.7594357723007,
+      "sample_count": 32,
+      "duration": 3.751255512237549,
+      "accuracy_percentage": 169655.39882563904,
+      "speed_consistency": 863.5982475510998
+    }
+  }
+}

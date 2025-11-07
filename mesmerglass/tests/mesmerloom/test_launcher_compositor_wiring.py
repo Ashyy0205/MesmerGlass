@@ -34,12 +34,15 @@ def test_launcher_compositor_activation(qtbot, monkeypatch):
     qtbot.addWidget(win)
     comp = getattr(win, 'compositor', None)
     assert comp and getattr(comp, 'available', False)
+    
+    # Track update calls (works with both LoomCompositor and LoomWindowCompositor)
     calls = {}
-    def _req(): calls['called'] = True
-    monkeypatch.setattr(comp, 'request_draw', _req)
+    def _update(): calls['called'] = True
+    monkeypatch.setattr(comp, 'update', _update)
+    
     win._on_spiral_toggled(True)
     assert win.spiral_enabled and getattr(comp, '_active', False)
     win._on_spiral_tick()
-    assert calls.get('called'), "request_draw not invoked on tick"
+    assert calls.get('called'), "update not invoked on tick"
     win._on_spiral_toggled(False)
     assert not getattr(comp, '_active', True)

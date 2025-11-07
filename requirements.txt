@@ -3,6 +3,8 @@ opencv-python
 pygame
 websockets
 numpy
+Pillow
+av>=10.0.0             # PyAV for GPU-accelerated video encoding (NVENC)
 
 # Real device control dependencies
 bleak>=0.21.0          # Bluetooth Low Energy support

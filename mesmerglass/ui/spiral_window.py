@@ -17,53 +17,54 @@ import os
 from typing import Any
 import logging
 
-try:
-    # Try QOpenGLWindow compositor first (artifact-free)
-    from ..mesmerloom.window_compositor import LoomWindowCompositor
-    logging.getLogger(__name__).info("[spiral.trace] LoomWindowCompositor import succeeded in spiral_window.py")
-    _USE_WINDOW_COMPOSITOR = True
-except ImportError:
-    # Fallback to QOpenGLWidget compositor (has FBO artifacts)
+# FORCE QOpenGLWidget compositor (QOpenGLWindow doesn't display on some Windows systems)
+# Check for environment variable override
+_FORCE_WIDGET_COMPOSITOR = os.environ.get("MESMERGLASS_FORCE_WIDGET_COMPOSITOR", "1") == "1"
+
+if _FORCE_WIDGET_COMPOSITOR:
+    # Use QOpenGLWidget compositor (more compatible with Windows desktop composition)
     try:
         from ..mesmerloom.compositor import LoomCompositor
-        logging.getLogger(__name__).info("[spiral.trace] LoomCompositor fallback import succeeded in spiral_window.py")
+        logging.getLogger(__name__).info("[spiral.trace] LoomCompositor (QOpenGLWidget) selected - better Windows compatibility")
         _USE_WINDOW_COMPOSITOR = False
     except Exception as e:
-        logging.getLogger(__name__).error(f"[spiral.trace] All compositor imports failed in spiral_window.py: {e}")
-        LoomCompositor = None  # type: ignore
-        _USE_WINDOW_COMPOSITOR = False
+        logging.getLogger(__name__).error(f"[spiral.trace] LoomCompositor import failed: {e}")
+        # Fallback to QOpenGLWindow
+        from ..mesmerloom.window_compositor import LoomWindowCompositor
+        logging.getLogger(__name__).info("[spiral.trace] LoomWindowCompositor fallback import succeeded")
+        _USE_WINDOW_COMPOSITOR = True
+else:
+    # Try QOpenGLWindow compositor first (artifact-free but may not display on some systems)
+    try:
+        from ..mesmerloom.window_compositor import LoomWindowCompositor
+        logging.getLogger(__name__).info("[spiral.trace] LoomWindowCompositor import succeeded in spiral_window.py")
+        _USE_WINDOW_COMPOSITOR = True
+    except ImportError:
+        # Fallback to QOpenGLWidget compositor
+        try:
+            from ..mesmerloom.compositor import LoomCompositor
+            logging.getLogger(__name__).info("[spiral.trace] LoomCompositor fallback import succeeded in spiral_window.py")
+            _USE_WINDOW_COMPOSITOR = False
+        except Exception as e:
+            logging.getLogger(__name__).error(f"[spiral.trace] All compositor imports failed in spiral_window.py: {e}")
+            LoomCompositor = None  # type: ignore
+            _USE_WINDOW_COMPOSITOR = False
 
 
 class SpiralWindow(QWidget):  # pragma: no cover - runtime/UI centric
-    def __init__(self, director, parent=None, screen_index=0):
-        # --- SpiralWindow diagnostics: compositor/screen assignment ---
+    def __init__(self, director, parent=None, screen_index=0, defer_timer=False):
+        super().__init__(parent)
+        logger = logging.getLogger(__name__)
+        self._defer_timer = defer_timer  # Store for compositor initialization
+        
+        # Get target screen
         try:
             from PyQt6.QtWidgets import QApplication
-            from PyQt6.QtGui import QGuiApplication
             screens = QApplication.screens()
             screen = screens[screen_index] if 0 <= screen_index < len(screens) else screens[0]
-            logging.getLogger(__name__).info(f"[spiral.trace] SpiralWindow: LoomCompositor will be attached to screen={screen.name()} index={screen_index} geometry={screen.geometry()} size={screen.geometry().size()}")
-            logging.getLogger(__name__).info("[spiral.trace] Available screens:")
-            for idx, sc in enumerate(QGuiApplication.screens()):
-                logging.getLogger(__name__).info(f"  Screen {idx}: name={sc.name()} geometry={sc.geometry()}")
-            logging.getLogger(__name__).info(f"[spiral.trace] Assigned to screen index {screen_index}: {screen.name()} ({screen.geometry()})")
-            logging.getLogger(__name__).info(f"[spiral.trace] Post-assignment: screen={screen.name()} geometry={self.geometry()} pos={self.pos()} size={self.size()}")
-            # Fallback: forcibly move window if not on target screen
-            if self.screen() != screen:
-                logging.getLogger(__name__).warning(f"[spiral.trace] Fallback: forced geometry to {screen.geometry()}")
-                self.setGeometry(screen.geometry())
-            # DPI and availableGeometry
-            try:
-                dpi = screen.logicalDotsPerInch()
-                avail = screen.availableGeometry()
-                logging.getLogger(__name__).info(f"[spiral.trace] DPI={dpi} availableGeometry={avail}")
-            except Exception as e:
-                logging.getLogger(__name__).warning(f"[spiral.trace] DPI/availableGeometry error: {e}")
+            logger.debug(f"SpiralWindow targeting screen {screen_index}: {screen.name()}")
         except Exception as e:
-            logging.getLogger(__name__).warning(f"[spiral.trace] SpiralWindow: error logging LoomCompositor/screen assignment: {e}")
-        super().__init__(parent)
-        # Diagnostic: log SpiralWindow creation and window info
-        logging.getLogger(__name__).info(f"[spiral.trace] SpiralWindow.__init__: screen_index={screen_index} parent={parent} winId={self.winId()} windowFlags={self.windowFlags():#x}")
+            logger.warning(f"Screen assignment error: {e}")
         # Optional debug surface mode disables translucency & click-through (can help some drivers)
         self._debug_surface = bool(os.environ.get("MESMERGLASS_SPIRAL_DEBUG_SURFACE"))
         if not self._debug_surface:
@@ -79,43 +80,17 @@ class SpiralWindow(QWidget):  # pragma: no cover - runtime/UI centric
         lay = QVBoxLayout(self); lay.setContentsMargins(0,0,0,0)
         self._glwindow_attempted = False
         self._using_qglwindow = bool(_USE_WINDOW_COMPOSITOR)
-        # Forced QScreen assignment
+        
+        # Assign to target screen
         try:
             from PyQt6.QtWidgets import QApplication
             screens = QApplication.screens()
-            logging.getLogger(__name__).info(f"[spiral.trace] Available screens:")
-            for idx, screen in enumerate(screens):
-                logging.getLogger(__name__).info(f"  Screen {idx}: name={screen.name()} geometry={screen.geometry()}")
             if 0 <= screen_index < len(screens):
                 self.setScreen(screens[screen_index])
-                logging.getLogger(__name__).info(f"[spiral.trace] Assigned to screen index {screen_index}: {screens[screen_index].name()} ({screens[screen_index].geometry()})")
-                # Log after assignment
-                assigned_screen = self.screen() if hasattr(self, 'screen') else None
-                assigned_name = assigned_screen.name() if assigned_screen else None
-                logging.getLogger(__name__).info(f"[spiral.trace] Post-assignment: screen={assigned_name} geometry={self.geometry()} pos={self.pos()} size={self.size()}")
-                # Fallback: force geometry to match screen if not fullscreen
-                try:
-                    geom = screens[screen_index].geometry()
-                    self.setGeometry(geom)
-                    logging.getLogger(__name__).info(f"[spiral.trace] Fallback: forced geometry to {geom}")
-                    dpi = screens[screen_index].logicalDotsPerInch()
-                    avail_geom = screens[screen_index].availableGeometry()
-                    logging.getLogger(__name__).info(f"[spiral.trace] DPI={dpi} availableGeometry={avail_geom}")
-                except Exception as e:
-                    logging.getLogger(__name__).warning(f"[spiral.trace] Fallback geometry/DPI error: {e}")
-            else:
-                logging.getLogger(__name__).warning(f"[spiral.trace] Invalid screen_index {screen_index}, defaulting to primary.")
+                self.setGeometry(screens[screen_index].geometry())
+                logger.debug(f"Assigned to screen {screen_index}: {screens[screen_index].name()}")
         except Exception as e:
-            logging.getLogger(__name__).warning(f"[spiral.trace] Error assigning QScreen: {e}")
-        # Diagnostic: log screen assignment and geometry
-        try:
-            screen = self.screen() if hasattr(self, 'screen') else None
-            screen_name = screen.name() if screen else None
-            logging.getLogger(__name__).info(
-                f"[spiral.trace] SpiralWindow.__init__: screen={screen_name} geometry={self.geometry()} pos={self.pos()} size={self.size()}"
-            )
-        except Exception as e:
-            logging.getLogger(__name__).warning(f"[spiral.trace] SpiralWindow.__init__: error logging screen info: {e}")
+            logger.debug(f"Screen assignment error: {e}")
         # Restore main compositor as child widget or window
         try:
             # For QOpenGLWindow path we DO NOT show this QWidget wrapper; keep it off-screen/hidden
@@ -140,6 +115,11 @@ class SpiralWindow(QWidget):  # pragma: no cover - runtime/UI centric
                     pass
                 # Use QOpenGLWindow compositor (artifact-free)
                 self.comp = LoomWindowCompositor(director)
+                
+                # CRITICAL: If deferring timer, set flag BEFORE initializeGL is called
+                if self._defer_timer:
+                    self.comp._defer_timer_start = True
+                    logging.getLogger(__name__).info("[spiral.trace] Set _defer_timer_start flag on LoomWindowCompositor")
 
                 # IMPORTANT: Do NOT reset flags here; LoomWindowCompositor has already set
                 # the correct flags and applying setFlags again may recreate the native
@@ -156,11 +136,35 @@ class SpiralWindow(QWidget):  # pragma: no cover - runtime/UI centric
                     pass
 
                 # Delay first show slightly so layered styles/alpha settle, then show and position
-                from PyQt6.QtCore import QTimer
+                from PyQt6.QtCore import QTimer, Qt as QtCore_Qt
                 def _show_and_position():
                     try:
-                        # Show fullscreen (styles already applied keep it transparent)
-                        self.comp.showFullScreen()
+                        # Get target screen geometry FIRST
+                        screens = QApplication.screens()
+                        if 0 <= screen_index < len(screens):
+                            target_screen = screens[screen_index]
+                            target_geometry = target_screen.geometry()
+                            
+                            # CRITICAL: Set screen, geometry, and window state BEFORE showing
+                            self.comp.setScreen(target_screen)
+                            self.comp.setGeometry(target_geometry)
+                            
+                            # Use setWindowState instead of showFullScreen (more reliable on Windows)
+                            self.comp.setWindowState(QtCore_Qt.WindowState.WindowFullScreen)
+                            
+                            logging.getLogger(__name__).info(f"[spiral.debug] QOpenGLWindow screen={target_screen.name()} geometry={target_geometry}")
+                        else:
+                            logging.getLogger(__name__).warning(f"[spiral.debug] Invalid screen_index {screen_index}, using default")
+                            # Fallback to primary screen
+                            target_screen = screens[0] if screens else None
+                            if target_screen:
+                                target_geometry = target_screen.geometry()
+                                self.comp.setScreen(target_screen)
+                                self.comp.setGeometry(target_geometry)
+                                self.comp.setWindowState(QtCore_Qt.WindowState.WindowFullScreen)
+                        
+                        # NOW show the window (geometry already set)
+                        self.comp.show()
 
                         # Force window to top immediately after showing
                         self.comp.raise_()
@@ -169,26 +173,6 @@ class SpiralWindow(QWidget):  # pragma: no cover - runtime/UI centric
                         # Use Windows API for stronger topmost behavior
                         if hasattr(self.comp, '_force_topmost_windows'):
                             self.comp._force_topmost_windows()
-
-                        # Set target screen AFTER showFullScreen() to override auto-placement
-                        screens = QApplication.screens()
-                        if 0 <= screen_index < len(screens):
-                            target_screen = screens[screen_index]
-                            self.comp.setScreen(target_screen)
-                            logging.getLogger(__name__).info(f"[spiral.debug] QOpenGLWindow assigned to target screen: {target_screen.name()} (index {screen_index}) AFTER showFullScreen")
-
-                            # Force geometry to target screen to ensure proper placement
-                            target_geometry = target_screen.geometry()
-                            self.comp.setGeometry(target_geometry)
-                            logging.getLogger(__name__).info(f"[spiral.debug] QOpenGLWindow geometry forced to: {target_geometry}")
-
-                            # Force window to top again after geometry changes
-                            self.comp.raise_()
-                            self.comp.requestActivate()
-                            if hasattr(self.comp, '_force_topmost_windows'):
-                                self.comp._force_topmost_windows()
-                        else:
-                            logging.getLogger(__name__).warning(f"[spiral.debug] Invalid screen_index {screen_index}, QOpenGLWindow using default screen")
 
                         self.comp.raise_()
 
@@ -236,13 +220,24 @@ class SpiralWindow(QWidget):  # pragma: no cover - runtime/UI centric
                 # Fallback to QOpenGLWidget compositor (has FBO artifacts)
                 from ..mesmerloom.compositor import LoomCompositor
                 self.comp = LoomCompositor(director, parent=self)
-                lay.addWidget(self.comp)  # Layout will always fit the compositor
+                
+                # CRITICAL: Set defer flag BEFORE adding to layout (which triggers initializeGL)
+                if self._defer_timer:
+                    self.comp._defer_timer_start = True
+                    logging.getLogger(__name__).info("[spiral.trace] Set _defer_timer_start flag on LoomCompositor BEFORE addWidget")
+                
+                lay.addWidget(self.comp)  # Layout will always fit the compositor (triggers initializeGL)
                 self.comp.show()
                 self.comp.raise_()
                 self.comp.activateWindow()
                 logging.getLogger(__name__).info("SpiralWindow: LoomCompositor attached to layout (fallback - has FBO artifacts)")
             
-            self.comp.update()  # Force GL context creation
+            # CRITICAL: Skip initial update if deferring timer (complete silence until Launch)
+            if not self._defer_timer:
+                self.comp.update()  # Force GL context creation
+                logging.getLogger(__name__).info("SpiralWindow: Initial comp.update() called")
+            else:
+                logging.getLogger(__name__).info("SpiralWindow: Skipped initial comp.update() (deferred until Launch)")
             
             # Diagnostic: log widget visibility and GL context
             if hasattr(self.comp, 'geometry'):
@@ -250,12 +245,17 @@ class SpiralWindow(QWidget):  # pragma: no cover - runtime/UI centric
             else:
                 logging.getLogger(__name__).info(f"[spiral.trace] SpiralWindow visible={self.isVisible()} comp visible=True (QOpenGLWindow)")
                 
-            # QTimer to force delayed update
-            from PyQt6.QtCore import QTimer
-            def _delayed_update():
-                self.comp.update()
-                logging.getLogger(__name__).info("SpiralWindow: QTimer forced comp.update() (delayed)")
-            QTimer.singleShot(100, _delayed_update)
+            # CRITICAL: Skip delayed update if deferring timer (complete silence until Launch)
+            if not self._defer_timer:
+                # QTimer to force delayed update
+                from PyQt6.QtCore import QTimer
+                def _delayed_update():
+                    self.comp.update()
+                    logging.getLogger(__name__).info("SpiralWindow: QTimer forced comp.update() (delayed)")
+                QTimer.singleShot(100, _delayed_update)
+                logging.getLogger(__name__).info("SpiralWindow: Scheduled delayed comp.update()")
+            else:
+                logging.getLogger(__name__).info("SpiralWindow: Skipped delayed comp.update() (deferred until Launch)")
         except Exception as e:
             logging.getLogger(__name__).error("SpiralWindow: Compositor creation failed: %s", e)
 

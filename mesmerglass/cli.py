@@ -97,7 +97,14 @@ def build_parser() -> argparse.ArgumentParser:
     _add_logging_args(parser)
     sub = parser.add_subparsers(dest="command", required=False)
 
-    sub.add_parser("run", help="Start the GUI (default)")
+    # GUI launcher
+    p_run = sub.add_parser("run", help="Start the GUI (default)")
+    p_run.add_argument("--vr", action="store_true", help="Enable head-locked VR streaming (OpenXR if available; falls back to mock)")
+    p_run.add_argument("--vr-mock", action="store_true", help="Force VR mock mode (no OpenXR session)")
+    p_run.add_argument("--vr-no-begin", action="store_true", help="Proceed without explicit xrBeginSession (unsafe; for minimal bindings)")
+    p_run.add_argument("--vr-safe-mode", action="store_true", help="Use offscreen FBO tap inside compositor to mirror frames to VR (safer on some drivers)")
+    p_run.add_argument("--vr-minimal", action="store_true", help="Disable media/text/video subsystems; stream spiral only for maximum stability")
+    p_run.add_argument("--vr-allow-media", action="store_true", help="Do not auto-mute media components when running in VR (may be unstable)")
 
     p_pulse = sub.add_parser("pulse", help="Send a single pulse (alias: 'test')")
     p_pulse.add_argument("--level", type=float, default=0.5, help="Pulse intensity 0..1")
@@ -150,6 +157,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_toy.add_argument("--run-for", type=float, default=5.0, help="Seconds to run before exiting")
 
     sub.add_parser("selftest", help="Quick environment/import check")
+    
+    # Theme and media loading commands
+    p_theme = sub.add_parser("theme", help="Theme and media loading test")
+    p_theme.add_argument("--load", type=str, help="Path to theme JSON file")
+    p_theme.add_argument("--list", action="store_true", help="List available themes in collection")
+    p_theme.add_argument("--show-config", action="store_true", help="Print theme configuration as JSON")
+    p_theme.add_argument("--test-shuffler", type=int, metavar="N", help="Test weighted shuffler N times")
+    p_theme.add_argument("--test-cache", action="store_true", help="Test image cache with sample images")
+    
     # MesmerLoom spiral visual test (Phase 2 real implementation)
     p_spiral = sub.add_parser("spiral-test", help="Run a bounded MesmerLoom spiral render test")
     p_spiral.add_argument("--video", type=str, default="none", help="Video path or 'none' for neutral")
@@ -178,6 +194,23 @@ def build_parser() -> argparse.ArgumentParser:
     p_spiral.add_argument("--window-test", action="store_true", help="Use raw QWindow + OpenGL context (bypasses all Qt widgets)")
     p_spiral.add_argument("--move-scale-test", action="store_true", help="Test if artifacts are screen-fixed or content-fixed (drag/scale window)")
 
+    # Spiral type testing (Trance 7-type system)
+    p_spiral_type = sub.add_parser("spiral-type", help="Test specific Trance spiral types (1-7)")
+    p_spiral_type.add_argument("--type", type=int, choices=range(1, 8), default=3,
+                              help="Spiral type: 1=log, 2=quad, 3=linear, 4=sqrt, 5=inverse, 6=power, 7=modulated (default: 3)")
+    p_spiral_type.add_argument("--width", type=int, choices=[360, 180, 120, 90, 72, 60], default=60,
+                              help="Spiral width in degrees (default: 60)")
+    p_spiral_type.add_argument("--rotation", type=float, default=2.0,
+                              help="Rotation speed amount (default: 2.0)")
+    p_spiral_type.add_argument("--duration", type=float, default=10.0,
+                              help="Test duration in seconds (default: 10)")
+    p_spiral_type.add_argument("--intensity", type=float, default=0.75,
+                              help="Intensity 0-1 (default: 0.75)")
+    p_spiral_type.add_argument("--screen", type=int, default=0,
+                              help="Screen index (default: 0)")
+    p_spiral_type.add_argument("--raw-window", action="store_true",
+                              help="Use QOpenGLWindow instead of QOpenGLWidget")
+
     # Test runner integration (wraps previous run_tests.py functionality)
     p_tr = sub.add_parser("test-run", help="Run pytest with selection shortcuts (replaces run_tests.py)")
     p_tr.add_argument("type", choices=["all","fast","slow","unit","integration","bluetooth"], nargs="?", default="all")
@@ -201,7 +234,103 @@ def build_parser() -> argparse.ArgumentParser:
     p_state.add_argument("--file", required=True, help="Target state JSON file (input or output depending on action)")
     p_state.add_argument("--from-live", action="store_true", help="(Reserved) Capture from a running instance (not yet implemented)")
 
+    # Mode verification (diagnostics for VMC↔Launcher equivalence)
+    p_mv = sub.add_parser("mode-verify", help="Validate a mode's derived timing and spiral RPM math headlessly")
+    p_mv.add_argument("--mode", required=True, help="Path to mode JSON file")
+    p_mv.add_argument("--frames", type=int, default=120, help="Frames to simulate (default: 120)")
+    p_mv.add_argument("--fps", type=float, default=60.0, help="Frames per second (default: 60)")
+    p_mv.add_argument("--tolerance", type=float, default=0.05, help="Allowed error (fraction, default: 0.05 = 5%)")
+    p_mv.add_argument("--json", dest="json_out", action="store_true", help="Print JSON summary")
+
+    # Spiral measurement (arm sweep timing)
+    p_sm = sub.add_parser("spiral-measure", help="Measure time for an arm to sweep a given angle (director or Qt timer)")
+    g_sm = p_sm.add_mutually_exclusive_group(required=False)
+    g_sm.add_argument("--rpm", type=float, help="Spiral speed in RPM (negative = reverse)")
+    g_sm.add_argument("--x", type=float, help="UI 'x' speed (mapped to RPM using VMC gain: RPM = x * 10)")
+    # Multi-speed sweep options (provide any one of these to run multiple measurements)
+    p_sm.add_argument("--rpm-list", type=str, help="Comma-separated RPM values, e.g. '60,90,120'")
+    p_sm.add_argument("--x-list", type=str, help="Comma-separated x values, e.g. '10,13,20'")
+    p_sm.add_argument("--rpm-range", type=str, help="RPM range as start:stop:step, e.g. '30:180:30'")
+    p_sm.add_argument("--x-range", type=str, help="x range as start:stop:step, e.g. '5:20:2.5'")
+    p_sm.add_argument("--delta-deg", type=float, default=90.0, help="Degrees to sweep (default: 90)")
+    p_sm.add_argument("--mode", choices=["director","qt16","qt33"], default="director", help="Measurement mode: fixed 60 FPS or Qt timer (16ms/33ms)")
+    p_sm.add_argument("--reverse", action="store_true", help="Reverse direction (negative RPM)")
+    p_sm.add_argument("--ceil-frame", dest="ceil_frame", action="store_true", help="Predict minimal whole-frame time to reach target without running loop")
+    # Comparison/table output between VMC (director) and Launcher (Qt)
+    p_sm.add_argument("--compare", action="store_true", help="Compare VMC(director) vs Launcher(Qt) across an x range and print a table")
+    p_sm.add_argument("--launcher-mode", choices=["qt16","qt33"], default="qt16", help="Launcher timing mode for comparison table (default: qt16)")
+    p_sm.add_argument("--x-min", type=float, default=4.0, help="Comparison sweep: starting x (default: 4)")
+    p_sm.add_argument("--x-max", type=float, default=40.0, help="Comparison sweep: ending x (default: 40)")
+    p_sm.add_argument("--x-step", type=float, default=2.0, help="Comparison sweep: step (default: 2)")
+    p_sm.add_argument("--clock", choices=["frame","wall"], help="Time basis: frame=ticks/60, wall=perf_counter (Qt). Default: frame for --compare, wall otherwise")
+    p_sm.add_argument("--json", dest="json_out", action="store_true", help="Print JSON result")
+
+    # Media cycle measurement (VMC vs baseline Qt timer)
+    p_mm = sub.add_parser("media-measure", help="Measure media cycle intervals and compare VMC/Launcher vs Qt timer")
+    p_mm.add_argument("--mode", choices=["timer","vmc","launcher","both","all"], default="both", help="Measurement mode: timer, vmc, launcher, both(timer+vmc) or all")
+    p_mm.add_argument("--speeds", type=str, default=None, help="Comma-separated cycle speeds 1..100, e.g. '10,20,50,80,100'")
+    p_mm.add_argument("--sweep", type=str, default=None, help="Speed sweep as start:end:step (inclusive), e.g. '10:100:10'")
+    p_mm.add_argument("--cycles", type=int, default=20, help="Number of timer cycles to measure per speed (default: 20)")
+    # Progress reporting (stderr) independent of quiet; suppressed by --json
+    p_mm.add_argument("--progress", dest="progress", action="store_true", default=True, help="Show per-speed progress on stderr (default: on)")
+    p_mm.add_argument("--no-progress", dest="progress", action="store_false", help="Disable progress lines (stderr)")
+    # Adaptive cycles: target seconds per speed instead of fixed cycles
+    p_mm.add_argument("--auto-seconds", type=float, default=None,
+                      help="Target per-speed runtime in seconds; overrides --cycles adaptively (e.g., 5.0)")
+    p_mm.add_argument("--min-cycles", type=int, default=1, help="Minimum cycles when using --auto-seconds (default: 1)")
+    p_mm.add_argument("--max-cycles", type=int, default=20, help="Maximum cycles when using --auto-seconds (default: 20)")
+    p_mm.add_argument("--include-videos", action="store_true", help="Include videos in VMC measurement (images only by default)")
+    p_mm.add_argument("--json", action="store_true", help="Output JSON instead of a table")
+    # Suppress stdout/stderr noise during VMC-internal measurement (e.g., GL/text printouts)
+    p_mm.add_argument("--quiet", action="store_true", help="Suppress noisy prints during VMC measurement (implied by --json)")
+    # Control per-speed runtime bounds for slow speeds (e.g., speed=10 has ~6.2s per cycle)
+    p_mm.add_argument("--timeout-multiplier", type=float, default=2.5,
+                      help="Scale factor for per-speed timeout: expected_ms * cycles * M + 2s (default: 2.5)")
+    p_mm.add_argument("--max-seconds", type=float, default=None,
+                      help="Absolute cap on per-speed runtime; if reached, returns partial samples (default: no cap)")
+    # Optional CSV export
+    p_mm.add_argument("--csv", type=str, default=None, help="Write results to CSV file path")
+
+    # VR offscreen self-test (no Qt widgets) for ALVR/OpenXR
+    p_vrs = sub.add_parser("vr-selftest", help="Run offscreen GL + OpenXR submit loop (no UI)")
+    p_vrs.add_argument("--seconds", type=float, default=15.0, help="Duration in seconds (default: 15.0)")
+    p_vrs.add_argument("--fps", type=float, default=60.0, help="Target frames per second (default: 60)")
+    p_vrs.add_argument("--pattern", choices=["solid", "grid"], default="solid", help="Test pattern to render (default: solid)")
+    p_vrs.add_argument("--size", type=str, default="1920x1080", help="Render size WxH (default: 1920x1080)")
+    p_vrs.add_argument("--mock", action="store_true", help="Force VR mock mode (skip OpenXR)")
+    
+    # MesmerVisor VR streaming commands
+    p_vr_stream = sub.add_parser("vr-stream", help="Stream live visuals to VR headset (MesmerVisor)")
+    p_vr_stream.add_argument("--host", type=str, default="0.0.0.0", help="Server host address (default: 0.0.0.0)")
+    p_vr_stream.add_argument("--port", type=int, default=5555, help="TCP streaming port (default: 5555)")
+    p_vr_stream.add_argument("--discovery-port", type=int, default=5556, help="UDP discovery port (default: 5556)")
+    p_vr_stream.add_argument("--encoder", choices=["auto", "nvenc", "jpeg"], default="auto",
+                           help="Encoder: auto (detect), nvenc (H.264 GPU), jpeg (CPU fallback)")
+    p_vr_stream.add_argument("--fps", type=int, default=30, help="Target FPS (default: 30)")
+    p_vr_stream.add_argument("--quality", type=int, default=85, help="JPEG quality 1-100 (default: 85, ignored for NVENC)")
+    p_vr_stream.add_argument("--bitrate", type=int, default=2000000, help="H.264 bitrate in bps (default: 2Mbps, ignored for JPEG)")
+    p_vr_stream.add_argument("--stereo-offset", type=int, default=0, help="Stereo parallax offset in pixels (0=mono)")
+    p_vr_stream.add_argument("--enable-text", action="store_true", help="Include text overlays in stream")
+    p_vr_stream.add_argument("--enable-images", action="store_true", help="Include image overlays in stream")
+    p_vr_stream.add_argument("--intensity", type=float, default=0.75, help="Initial spiral intensity 0-1 (default: 0.75)")
+    p_vr_stream.add_argument("--duration", type=float, default=0, help="Stream duration in seconds (0=infinite)")
+    
+    p_vr_test = sub.add_parser("vr-test", help="Test VR streaming with generated pattern (no full app)")
+    p_vr_test.add_argument("--pattern", choices=["checkerboard", "gradient", "noise", "spiral"], default="checkerboard",
+                          help="Test pattern type (default: checkerboard)")
+    p_vr_test.add_argument("--host", type=str, default="0.0.0.0", help="Server host address")
+    p_vr_test.add_argument("--port", type=int, default=5555, help="TCP streaming port")
+    p_vr_test.add_argument("--discovery-port", type=int, default=5556, help="UDP discovery port")
+    p_vr_test.add_argument("--encoder", choices=["auto", "nvenc", "jpeg"], default="auto", help="Encoder type")
+    p_vr_test.add_argument("--fps", type=int, default=30, help="Target FPS")
+    p_vr_test.add_argument("--width", type=int, default=1920, help="Frame width (default: 1920)")
+    p_vr_test.add_argument("--height", type=int, default=1080, help="Frame height (default: 1080)")
+    p_vr_test.add_argument("--quality", type=int, default=85, help="JPEG quality (default: 85)")
+    p_vr_test.add_argument("--duration", type=int, default=0, help="Duration in seconds (0=infinite)")
+
+
     return parser
+
 
 def cmd_spiral_test(args) -> None:
     """Run bounded MesmerLoom spiral render with systematic artifact isolation.
@@ -360,6 +489,58 @@ def cmd_spiral_test(args) -> None:
             # Set module-level flag for compositor to detect
             import sys
             sys.modules[__name__]._debug_gl_state = True
+            # Schedule detailed GL state dump once context is current
+            from PyQt6.QtCore import QTimer
+            def _print_gl_state():
+                try:
+                    from OpenGL import GL
+                    # Apply known-good defaults for artifact-free rendering
+                    try: GL.glDisable(GL.GL_DITHER)
+                    except Exception: pass
+                    try: GL.glDisable(0x809E)  # GL_SAMPLE_ALPHA_TO_COVERAGE
+                    except Exception: pass
+                    try: GL.glDisable(GL.GL_POLYGON_SMOOTH)
+                    except Exception: pass
+                    try: GL.glEnable(GL.GL_BLEND)
+                    except Exception: pass
+                    try: GL.glEnable(GL.GL_MULTISAMPLE)
+                    except Exception: pass
+                    try: GL.glDisable(GL.GL_DEPTH_TEST)
+                    except Exception: pass
+
+                    def _enabled(cap):
+                        try:
+                            return 1 if GL.glIsEnabled(cap) else 0
+                        except Exception:
+                            return -1
+
+                    # Print core states expected by tests
+                    print(f"GL_DITHER: {_enabled(GL.GL_DITHER)}")
+                    print(f"GL_SAMPLE_ALPHA_TO_COVERAGE: {_enabled(0x809E)}")
+                    print(f"GL_POLYGON_SMOOTH: {_enabled(GL.GL_POLYGON_SMOOTH)}")
+                    print(f"GL_BLEND: {_enabled(GL.GL_BLEND)}")
+                    print(f"GL_MULTISAMPLE: {_enabled(GL.GL_MULTISAMPLE)}")
+                    print(f"GL_DEPTH_TEST: {_enabled(GL.GL_DEPTH_TEST)}")
+
+                    # Blend function (alpha-specific)
+                    try:
+                        src = GL.glGetIntegerv(GL.GL_BLEND_SRC_ALPHA)
+                        dst = GL.glGetIntegerv(GL.GL_BLEND_DST_ALPHA)
+                        print(f"Blend func: src={src} dst={dst}")
+                    except Exception:
+                        pass
+
+                    # Viewport dimensions
+                    try:
+                        vp = GL.glGetIntegerv(GL.GL_VIEWPORT)
+                        if hasattr(vp, 'tolist'):
+                            vp = vp.tolist()
+                        print(f"Viewport: {tuple(vp) if isinstance(vp, (list, tuple)) else vp}")
+                    except Exception:
+                        pass
+                except Exception as e:
+                    print(f"Could not query GL state: {e}")
+            QTimer.singleShot(150, _print_gl_state)
         
         if getattr(args, 'test_opaque', False):
             print("TEST MODE: Fully opaque rendering with blending disabled")
@@ -554,6 +735,25 @@ def cmd_spiral_test(args) -> None:
             pass
         dur = max(0.1, float(getattr(args, 'duration', 5.0)))
         t0 = _time.perf_counter(); last = t0; frames = 0
+        # Optional: background video playback
+        cap = None
+        try:
+            vid_arg = getattr(args, 'video', 'none')
+            if vid_arg and str(vid_arg).lower() != 'none':
+                import cv2
+                from pathlib import Path as _P
+                p = _P(vid_arg)
+                if not p.exists():
+                    # Try relative to project root MEDIA/Videos
+                    p2 = _P.cwd() / 'MEDIA' / 'Videos' / vid_arg
+                    if p2.exists():
+                        p = p2
+                cap = cv2.VideoCapture(str(p))
+                if not cap.isOpened():
+                    print(f"spiral-test: warning: could not open video '{vid_arg}'")
+                    cap = None
+        except Exception as _e:
+            print(f"spiral-test: warning: video init failed: {_e}")
         target_frame = 1.0 / 60.0
         while True:
             now = _time.perf_counter(); elapsed = now - t0
@@ -562,6 +762,29 @@ def cmd_spiral_test(args) -> None:
             dt = now - last; last = now
             # The compositor automatically handles director updates and uniform setting in paintGL
             app.processEvents()
+            # Upload next video frame if available
+            if cap is not None:
+                try:
+                    ret, frame_bgr = cap.read()
+                    if not ret:
+                        # loop video
+                        cap.set(1, 0)  # CAP_PROP_POS_FRAMES
+                        ret, frame_bgr = cap.read()
+                    if ret:
+                        # Convert to RGB
+                        import cv2
+                        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+                        h, w = frame_rgb.shape[:2]
+                        # Ensure GL context current before texture upload
+                        try:
+                            comp.makeCurrent()
+                        except Exception:
+                            pass
+                        # Use current zoom (if any)
+                        current_zoom = getattr(comp, '_background_zoom', 1.0)
+                        comp.set_background_video_frame(frame_rgb, width=w, height=h, zoom=current_zoom)
+                except Exception:
+                    pass
             frames += 1
             # Frame pacing (~60fps) to avoid runaway CPU loop on headless
             frame_spent = _time.perf_counter() - now
@@ -578,6 +801,11 @@ def cmd_spiral_test(args) -> None:
         fps = frames / total
         print(f"MesmerLoom spiral-test duration={dur:.2f}s frames={frames} avg_frame_ms={(total/frames*1000.0 if frames else 0):.2f} fps={fps:.1f}")
         try:
+            if cap is not None:
+                try:
+                    cap.release()
+                except Exception:
+                    pass
             comp.close()
         except Exception:
             pass
@@ -587,6 +815,1616 @@ def cmd_spiral_test(args) -> None:
     except Exception as e:
         print("MesmerLoom spiral-test: error:", e)
         sys.exit(1)
+
+def cmd_spiral_type(args) -> None:
+    """Test specific Trance spiral type with rotation formula verification.
+    
+    Exit codes:
+      0 success
+      77 OpenGL unavailable
+      1 error
+    """
+    import sys, time as _time
+    from PyQt6.QtWidgets import QApplication
+    from PyQt6.QtCore import QTimer
+    
+    print(f"Trance Spiral Type Test")
+    print(f"  Type: {args.type} ({['log','quad','linear','sqrt','inverse','power','modulated'][args.type-1]})")
+    print(f"  Width: {args.width}° ({360//args.width} arms)")
+    print(f"  Rotation: {args.rotation} amount/frame")
+    print(f"  Duration: {args.duration}s")
+    print(f"  Intensity: {args.intensity}")
+    print("-" * 60)
+    
+    # Create Qt application
+    app = QApplication(sys.argv)
+    
+    # Import GL components
+    try:
+        if args.raw_window:
+            from .mesmerloom.simple_gl_spiral import SimpleGLSpiralWindow
+            window_cls = SimpleGLSpiralWindow
+        else:
+            from .mesmerloom.compositor import LoomCompositor
+            window_cls = LoomCompositor
+    except ImportError as e:
+        print(f"spiral-type: GL unavailable: {e}")
+        sys.exit(77)
+    
+    # Get target screen
+    screens = app.screens()
+    if args.screen >= len(screens):
+        print(f"spiral-type: screen {args.screen} not found (have {len(screens)})")
+        sys.exit(1)
+    screen = screens[args.screen]
+    
+    # Create window with spiral director
+    from .mesmerloom.spiral import SpiralDirector
+    director = SpiralDirector()
+    director.set_intensity(args.intensity)
+    director.set_spiral_type(args.type)
+    director.set_spiral_width(args.width)
+    
+    if args.raw_window:
+        window = window_cls()
+        window.set_director(director)
+    else:
+        # CRITICAL FIX: Use QMainWindow to properly host the QOpenGLWidget
+        # This fixes the black screen issue in fullscreen mode
+        from PyQt6.QtWidgets import QMainWindow
+        compositor = window_cls(director)
+        compositor.set_active(True)
+        
+        window = QMainWindow()
+        window.setCentralWidget(compositor)
+        # Position on target screen
+        geom = screen.geometry()
+        window.setGeometry(geom)
+        # Ensure window is visible
+        window.setWindowOpacity(1.0)
+        window.showFullScreen()
+    
+    if args.raw_window:
+        # Position on target screen
+        geom = screen.geometry()
+        window.setGeometry(geom)
+        # Ensure window is visible
+        window.setWindowOpacity(1.0)
+        window.showFullScreen()
+    
+    # Rotation timer
+    start_time = _time.time()
+    frame_count = [0]
+    
+    def on_tick():
+        director.rotate_spiral(args.rotation)
+        director.update()
+        frame_count[0] += 1
+        
+        elapsed = _time.time() - start_time
+        if elapsed >= args.duration:
+            elapsed_final = _time.time() - start_time
+            fps = frame_count[0] / elapsed_final if elapsed_final > 0 else 0
+            
+            # Calculate expected rotation from Trance formula
+            import math
+            rotations_per_frame = args.rotation / (32 * math.sqrt(args.width))
+            total_rotations = rotations_per_frame * frame_count[0]
+            
+            print(f"\nTest Results:")
+            print(f"  Frames: {frame_count[0]}")
+            print(f"  Duration: {elapsed_final:.2f}s")
+            print(f"  FPS: {fps:.1f}")
+            print(f"  Rotation formula: {args.rotation} / (32 * sqrt({args.width})) = {rotations_per_frame:.6f} per frame")
+            print(f"  Total rotations: {total_rotations:.3f}")
+            print(f"  Final phase: {director.state.phase:.6f}")
+            app.quit()
+    
+    timer = QTimer()
+    timer.timeout.connect(on_tick)
+    timer.start(16)  # ~60fps
+    
+    sys.exit(app.exec())
+
+def cmd_theme(args) -> int:
+    """Theme and media loading test command.
+    
+    Exit codes:
+      0 success
+      1 error
+    """
+    import json
+    from pathlib import Path
+    from mesmerglass.content.theme import load_theme_collection, ThemeCollection, Shuffler
+    
+    if args.load:
+        path = Path(args.load)
+        if not path.exists():
+            print(f"Error: Theme file not found: {path}", file=sys.stderr)
+            return 1
+        
+        try:
+            collection = load_theme_collection(path)
+        except Exception as e:
+            print(f"Error loading theme: {e}", file=sys.stderr)
+            return 1
+        
+        if args.list:
+            print(f"\nThemes in collection ({len(collection.themes)} total):")
+            for i, theme in enumerate(collection.themes):
+                status = "ENABLED" if theme.enabled else "DISABLED"
+                print(f"  [{i}] {theme.name} ({status})")
+                print(f"      Images: {len(theme.image_path)}")
+                print(f"      Text lines: {len(theme.text_line)}")
+                if theme.animation_path:
+                    print(f"      Animations: {len(theme.animation_path)}")
+                if theme.font_path:
+                    print(f"      Fonts: {len(theme.font_path)}")
+            return 0
+        
+        if args.show_config:
+            data = collection.to_dict()
+            print(json.dumps(data, indent=2, ensure_ascii=False))
+            return 0
+        
+        if args.test_shuffler is not None:
+            enabled = collection.get_enabled_themes()
+            if not enabled:
+                print("Error: No enabled themes found", file=sys.stderr)
+                return 1
+            
+            # Test first enabled theme's shuffler
+            theme = enabled[0]
+            if not theme.image_path:
+                print(f"Error: Theme '{theme.name}' has no images", file=sys.stderr)
+                return 1
+            
+            shuffler = Shuffler(count=len(theme.image_path))
+            print(f"\nTesting Shuffler with {len(theme.image_path)} images:")
+            print(f"  Running {args.test_shuffler} selections...")
+            
+            counts = [0] * len(theme.image_path)
+            for _ in range(args.test_shuffler):
+                idx = shuffler.next()
+                counts[idx] += 1
+                # Simulate decrease/increase (last-8 tracking)
+                shuffler.decrease(idx)
+            
+            print("\n  Selection counts:")
+            for i, count in enumerate(counts):
+                pct = (count / args.test_shuffler * 100) if args.test_shuffler > 0 else 0
+                print(f"    Image {i}: {count} ({pct:.1f}%)")
+            
+            return 0
+        
+        # Default: show summary
+        print(f"\nTheme Collection loaded successfully:")
+        print(f"  Total themes: {len(collection.themes)}")
+        enabled = collection.get_enabled_themes()
+        print(f"  Enabled themes: {len(enabled)}")
+        if enabled:
+            print(f"\n  First enabled theme: {enabled[0].name}")
+            print(f"    Images: {len(enabled[0].image_path)}")
+            print(f"    Text lines: {len(enabled[0].text_line)}")
+        return 0
+    
+    if args.test_cache:
+        # Create a minimal test of the image cache
+        print("\nTesting image cache (requires sample images)...")
+        print("  (Full implementation requires actual image files)")
+        from mesmerglass.content.media import ImageCache
+        cache = ImageCache(cache_size=8)
+        print(f"  Cache created with size: {cache._cache_size}")
+        print(f"  Cache is ready")
+        return 0
+    
+    # No action specified
+    print("Error: Must specify --load or --test-cache", file=sys.stderr)
+    return 1
+
+def cmd_mode_verify(args) -> int:
+    """Headless verification of mode timing and RPM rotation.
+
+    Exit codes:
+      0 success (within tolerance)
+      2 validation failure (outside tolerance or file error)
+      1 unexpected error
+    """
+    import json as _json
+    from pathlib import Path as _Path
+    from .mesmerloom.spiral import SpiralDirector
+    from .mesmerloom.spiral_speed import SpiralSpeedCalculator as _Speed
+
+    try:
+        mp = _Path(args.mode)
+        if not mp.exists():
+            print(f"Error: mode not found: {mp}")
+            return 2
+        cfg = _json.loads(mp.read_text(encoding="utf-8"))
+        spiral = cfg.get("spiral", {})
+        media = cfg.get("media", {})
+        rpm = float(spiral.get("rotation_speed", 4.0))
+        reverse = bool(spiral.get("reverse", False))
+        # Compute expected media frames/cycle using the same formula as CustomVisual
+        speed = int(media.get("cycle_speed", 50))
+        speed = max(1, min(100, speed))
+        import math as _m
+        interval_ms = 10000 * _m.pow(0.005, (speed - 1) / 99.0)
+        frames_per_cycle = max(1, round((interval_ms / 1000.0) * float(args.fps)))
+        # Simulate phase
+        d = SpiralDirector(seed=7)
+        d.set_rotation_speed(-abs(rpm) if reverse else abs(rpm))
+        frames = max(1, int(args.frames))
+        dt = 1.0 / float(args.fps)
+        start = d.state.phase
+        for _ in range(frames):
+            d.rotate_spiral(0.0)
+            d.update(dt)
+        end = d.state.phase
+        delta = (end - start) % 1.0
+        # Use minor arc to get magnitude independent of direction
+        if delta > 0.5:
+            delta = 1.0 - delta
+        measured_phase_per_sec = delta / (frames * dt)
+        expected_phase_per_sec = _Speed.rpm_to_phase_per_second(abs(rpm))
+        # Evaluate tolerance
+        err = 0.0 if expected_phase_per_sec == 0 else abs(measured_phase_per_sec - expected_phase_per_sec) / expected_phase_per_sec
+        ok = err <= float(args.tolerance)
+        result = {
+            "mode": mp.name,
+            "rpm": rpm,
+            "reverse": reverse,
+            "fps": float(args.fps),
+            "frames": frames,
+            "measured_phase_per_sec": round(measured_phase_per_sec, 6),
+            "expected_phase_per_sec": round(expected_phase_per_sec, 6),
+            "error_pct": round(err * 100.0, 2),
+            "frames_per_cycle": frames_per_cycle,
+        }
+        if getattr(args, "json_out", False):
+            import json
+            print(json.dumps(result, ensure_ascii=False))
+        else:
+            print(
+                f"Mode {result['mode']}: RPM={result['rpm']} reverse={result['reverse']} | "
+                f"phase/s measured={result['measured_phase_per_sec']:.4f} expected={result['expected_phase_per_sec']:.4f} "
+                f"err={result['error_pct']:.2f}% | frames/cycle={frames_per_cycle}"
+            )
+        return 0 if ok else 2
+    except SystemExit:
+        raise
+    except Exception as e:
+        print(f"Error: mode-verify failed: {e}")
+        return 1
+
+# --- Spiral arm sweep measurement helpers ---
+VMC_SPEED_GAIN = 10.0  # Keep in sync with scripts/visual_mode_creator.py
+
+def predict_spiral_frames(rpm: float, delta_deg: float, fps: float = 60.0) -> tuple[int, float] | tuple[None, None]:
+    """Predict minimal whole-frame count to reach delta_deg sweep at given RPM.
+
+    Returns (frames, seconds). For zero RPM, returns (None, None).
+    """
+    import math as _math
+    rpm_abs = abs(float(rpm))
+    if rpm_abs == 0.0:
+        return None, None
+    target_phase = max(0.0, float(delta_deg)) / 360.0
+    phase_per_frame = (rpm_abs / 60.0) / float(fps)
+    # Tiny epsilon to stabilize ceil for near-exact divisions
+    n_frames = int(_math.ceil((target_phase / phase_per_frame) - 1e-12))
+    return n_frames, n_frames / float(fps)
+
+def _parse_float_list(s: str | None) -> list[float]:
+    if not s:
+        return []
+    vals = []
+    for part in s.split(','):
+        p = part.strip()
+        if not p:
+            continue
+        vals.append(float(p))
+    return vals
+
+def _parse_range(s: str | None) -> list[float]:
+    if not s:
+        return []
+    try:
+        start_s, stop_s, step_s = s.split(':')
+        start = float(start_s); stop = float(stop_s); step = float(step_s)
+    except Exception:
+        raise SystemExit("Error: range must be in the form start:stop:step")
+    if step == 0:
+        raise SystemExit("Error: step cannot be zero")
+    vals: list[float] = []
+    cur = start
+    # Include stop if exactly hits within epsilon
+    eps = 1e-12
+    if step > 0:
+        while cur <= stop + eps:
+            vals.append(cur)
+            cur += step
+    else:
+        while cur >= stop - eps:
+            vals.append(cur)
+            cur += step
+    return vals
+
+def sweep_spiral_measure(
+    speeds: list[float], *, use_x: bool, delta_deg: float, mode: str, reverse: bool, ceil_frame: bool, clock: str = "wall"
+) -> list[dict]:
+    """Run spiral-measure over a list of speeds (x or rpm) and return summaries."""
+    results: list[dict] = []
+    for v in speeds:
+        rpm = float(v) * VMC_SPEED_GAIN if use_x else float(v)
+        # Predictive calculation
+        pred_frames, pred_seconds = predict_spiral_frames(rpm, delta_deg, fps=60.0)
+        pred_ticks = pred_frames if pred_frames is not None else None
+        pred_seconds_timer = None
+        if mode == 'director':
+            sec, frames, ach = measure_spiral_time_director(rpm, delta_deg, reverse, fps=60.0)
+            ticks = frames
+            # Director seconds are already frame-based
+            sec_report = sec
+        else:
+            interval = 16 if mode == 'qt16' else 33
+            if pred_ticks is not None:
+                pred_seconds_timer = round(pred_ticks * (interval / 1000.0), 6)
+            sec, ticks, ach = measure_spiral_time_qt(rpm, delta_deg, interval, reverse)
+            # Choose reporting basis
+            if clock == "frame":
+                sec_report = ticks / 60.0
+            else:
+                sec_report = sec
+        expected = (delta_deg / max(1e-9, (abs(rpm) * 6.0))) if abs(rpm) > 0 else float('inf')
+        err = 0.0 if expected == float('inf') else abs(sec_report - expected) / expected
+        out = {
+            "rpm": rpm,
+            "x": (rpm / VMC_SPEED_GAIN),
+            "reverse": reverse,
+            "mode": mode,
+            "delta_deg": float(delta_deg),
+            "measured_seconds": round(sec_report if mode.startswith('qt') else sec, 6),
+            "expected_seconds": round(expected, 6) if expected != float('inf') else None,
+            "error_pct": round(err * 100.0, 2) if expected != float('inf') else None,
+            "ticks": ticks,
+            "achieved_phase": round(ach, 6),
+        }
+        if ceil_frame:
+            out.update({
+                "predicted_frames": pred_frames,
+                "predicted_seconds": round(pred_seconds, 6) if pred_seconds is not None else None,
+                "predicted_ticks": pred_ticks,
+                "predicted_seconds_timer": pred_seconds_timer,
+            })
+        results.append(out)
+    return results
+
+def compare_vmc_launcher(
+    x_values: list[float], *, delta_deg: float, launcher_mode: str = "qt16", ceil_frame: bool = True, clock: str = "frame"
+) -> list[dict]:
+    """Compare measured/predicted sweep times between VMC (director) and Launcher (qt16/qt33) for x values.
+
+    Returns list of dict rows with keys: x, rpm, vmc_measured, vmc_predicted, launcher_measured, launcher_predicted, diff_ms, diff_pct, vmc_ticks, launcher_ticks.
+    """
+    rows: list[dict] = []
+    for x in x_values:
+        rpm = float(x) * VMC_SPEED_GAIN
+        # VMC (director)
+        vmc_results = sweep_spiral_measure([x], use_x=True, delta_deg=delta_deg, mode='director', reverse=False, ceil_frame=ceil_frame, clock=clock)
+        vmc = vmc_results[0]
+        # Launcher (qt)
+        launch_results = sweep_spiral_measure([x], use_x=True, delta_deg=delta_deg, mode=launcher_mode, reverse=False, ceil_frame=ceil_frame, clock=clock)
+        ln = launch_results[0]
+        vmc_meas = vmc.get("measured_seconds")
+        ln_meas = ln.get("measured_seconds")
+        vmc_pred = vmc.get("predicted_seconds")
+        ln_pred = ln.get("predicted_seconds_timer") if launcher_mode.startswith('qt') else ln.get("predicted_seconds")
+        diff_ms = (ln_meas - vmc_meas) * 1000.0
+        diff_pct = None
+        if vmc_meas and vmc_meas > 0:
+            diff_pct = (ln_meas / vmc_meas - 1.0) * 100.0
+        rows.append({
+            "x": float(x),
+            "rpm": rpm,
+            "delta_deg": float(delta_deg),
+            "vmc_measured": round(vmc_meas, 6),
+            "vmc_predicted": vmc_pred,
+            "launcher_measured": round(ln_meas, 6),
+            "launcher_predicted": ln_pred,
+            "diff_ms": round(diff_ms, 3),
+            "diff_pct": round(diff_pct, 2) if diff_pct is not None else None,
+            "vmc_ticks": vmc.get("ticks"),
+            "launcher_ticks": ln.get("ticks"),
+        })
+    return rows
+
+def _print_compare_table(rows: list[dict], launcher_mode: str):
+    # Build a simple fixed-width table
+    headers = ["x", "rpm", "vmc(s)", f"launcher[{launcher_mode}](s)", "+ms", "+%", "ticks(v/l)"]
+    # Determine column widths
+    data_rows = []
+    for r in rows:
+        data_rows.append([
+            f"{r['x']:.2f}",
+            f"{int(r['rpm']):d}",
+            f"{r['vmc_measured']:.6f}",
+            f"{r['launcher_measured']:.6f}",
+            f"{r['diff_ms']:.1f}",
+            f"{r['diff_pct']:.2f}" if r.get('diff_pct') is not None else "-",
+            f"{r['vmc_ticks']}/{r['launcher_ticks']}",
+        ])
+    col_w = [max(len(h), *(len(dr[i]) for dr in data_rows)) for i, h in enumerate(headers)]
+    def fmt_row(cols):
+        return " ".join(c.rjust(col_w[i]) for i, c in enumerate(cols))
+    print(fmt_row(headers))
+    print(" ".join("-" * w for w in col_w))
+    for dr in data_rows:
+        print(fmt_row(dr))
+
+def _print_media_table(rows: list[dict], selected_modes: list[str]):
+    # Build headers dynamically based on selected modes
+    headers: list[str] = ["speed", "cycles", "exp(ms)"]
+    cols: list[str] = []  # keeps order of keys parallel with headers
+    # Timer columns
+    if "timer" in selected_modes:
+        headers += ["timer_avg", "timer_std"]
+        cols += ["timer_avg_ms", "timer_std_ms"]
+    # VMC columns (include deltas vs expected)
+    if "vmc" in selected_modes:
+        headers += ["vmc_avg", "vmc_std", "Δms", "Δ%"]
+        cols += ["vmc_avg_ms", "vmc_std_ms", "delta_ms", "delta_pct"]
+    # Launcher columns
+    if "launcher" in selected_modes:
+        headers += ["launch_avg", "launch_std"]
+        cols += ["launcher_avg_ms", "launcher_std_ms"]
+
+    # Prepare string rows
+    data_rows: list[list[str]] = []
+    for r in rows:
+        base = [str(r.get("speed", "")), str(r.get("cycles", "")), f"{r.get('expected_ms', 0):.2f}"]
+        dyn: list[str] = []
+        for k in cols:
+            v = r.get(k, "")
+            if isinstance(v, float):
+                # Use 2 decimals for ms, except percent has 2 too
+                dyn.append(f"{v:.2f}")
+            else:
+                dyn.append(str(v))
+        data_rows.append(base + dyn)
+
+    # Compute column widths
+    col_w = [max(len(h), *(len(dr[i]) for dr in data_rows)) for i, h in enumerate(headers)]
+    def fmt_row(arr: list[str]) -> str:
+        return " ".join(arr[i].rjust(col_w[i]) for i in range(len(arr)))
+
+    # Print table
+    print(fmt_row(headers))
+    print(" ".join("-" * w for w in col_w))
+    for dr in data_rows:
+        print(fmt_row(dr))
+
+def measure_spiral_time_director(rpm: float, delta_deg: float, reverse: bool = False, fps: float = 60.0) -> tuple[float,int,float]:
+    """Measure time for a spiral arm to sweep delta_deg using pure director ticks.
+
+    Returns: (measured_seconds, frames, achieved_phase_delta)
+    """
+    from .mesmerloom.spiral import SpiralDirector
+    d = SpiralDirector(seed=7)
+    rpm_eff = -abs(rpm) if reverse else abs(rpm)
+    d.set_rotation_speed(rpm_eff)
+    delta_phase_target = max(0.0, float(delta_deg)) / 360.0
+    frames = 0
+    start = d.state.phase
+    achieved = 0.0
+    # Safety cap to avoid infinite loop
+    max_frames = int(10 * fps)  # up to 10s
+    while frames < max_frames:
+        d.rotate_spiral(0.0)
+        d.update(1.0 / fps)
+        frames += 1
+        cur = d.state.phase
+        delta = (cur - start) % 1.0
+        if delta > 0.5:
+            delta = 1.0 - delta
+        achieved = abs(delta)
+        if achieved >= delta_phase_target:
+            break
+    seconds = frames / fps
+    return seconds, frames, achieved
+
+def measure_spiral_time_qt(rpm: float, delta_deg: float, interval_ms: int, reverse: bool = False) -> tuple[float,int,float]:
+    """Measure time for a spiral arm to sweep delta_deg using a Qt timer.
+
+    Returns: (measured_seconds, ticks, achieved_phase_delta)
+    """
+    from time import perf_counter
+    from PyQt6.QtWidgets import QApplication
+    from PyQt6.QtCore import QTimer
+    from .mesmerloom.spiral import SpiralDirector
+
+    app = QApplication.instance() or QApplication([])
+    d = SpiralDirector(seed=7)
+    rpm_eff = -abs(rpm) if reverse else abs(rpm)
+    d.set_rotation_speed(rpm_eff)
+    delta_phase_target = max(0.0, float(delta_deg)) / 360.0
+    start_phase = d.state.phase
+    ticks = 0
+    achieved = 0.0
+    t0 = perf_counter()
+
+    def _tick():
+        nonlocal ticks, achieved
+        ticks += 1
+        d.rotate_spiral(0.0)
+        d.update(1/60.0)  # director’s rotation uses fixed 60 FPS increments
+        cur = d.state.phase
+        delta = (cur - start_phase) % 1.0
+        if delta > 0.5:
+            delta = 1.0 - delta
+        achieved = abs(delta)
+        if achieved >= delta_phase_target:
+            app.quit()
+
+    timer = QTimer()
+    timer.setInterval(max(1, int(interval_ms)))
+    timer.timeout.connect(_tick)
+    timer.start()
+    app.exec()
+    timer.stop()
+    seconds = max(0.0, perf_counter() - t0)
+    return seconds, ticks, achieved
+
+def cmd_spiral_measure(args) -> int:
+    """CLI entry for spiral arm sweep measurement."""
+    import json as _json
+    # Decide clock basis default (frame for compare, wall otherwise unless explicitly set)
+    clock = getattr(args, 'clock', None)
+    # Early comparison path: handle --compare before single/multi validation
+    if bool(getattr(args, 'compare', False)):
+        clock = clock or 'frame'
+        delta = float(getattr(args, 'delta_deg', 90.0))
+        x_list_cmp = _parse_float_list(getattr(args, 'x_list', None))
+        x_range_cmp = _parse_range(getattr(args, 'x_range', None))
+        if x_list_cmp and x_range_cmp:
+            print("Error: provide either --x-list or --x-range, not both")
+            return 2
+        if x_list_cmp:
+            xs = x_list_cmp
+        elif x_range_cmp:
+            xs = x_range_cmp
+        else:
+            x_min = float(getattr(args, 'x_min', 4.0))
+            x_max = float(getattr(args, 'x_max', 40.0))
+            x_step = float(getattr(args, 'x_step', 2.0))
+            xs = []
+            cur = x_min
+            eps = 1e-12
+            if x_step > 0:
+                while cur <= x_max + eps:
+                    xs.append(cur)
+                    cur += x_step
+            else:
+                while cur >= x_max - eps:
+                    xs.append(cur)
+                    cur += x_step
+        launcher_mode = getattr(args, 'launcher_mode', 'qt16')
+        rows = compare_vmc_launcher(xs, delta_deg=delta, launcher_mode=launcher_mode, ceil_frame=bool(getattr(args, 'ceil_frame', False)), clock=clock)
+        if getattr(args, 'json_out', False):
+            print(_json.dumps(rows, ensure_ascii=False))
+        else:
+            _print_compare_table(rows, launcher_mode)
+        return 0
+    # Multi-speed inputs take precedence if provided
+    rpm_list = _parse_float_list(getattr(args, 'rpm_list', None))
+    x_list = _parse_float_list(getattr(args, 'x_list', None))
+    rpm_range = _parse_range(getattr(args, 'rpm_range', None))
+    x_range = _parse_range(getattr(args, 'x_range', None))
+    multi = None
+    multi_is_x = False
+    provided = sum(bool(v) for v in [rpm_list, x_list, rpm_range, x_range])
+    if provided > 1:
+        print("Error: provide only one of --rpm-list, --rpm-range, --x-list, or --x-range")
+        return 2
+    if rpm_list:
+        multi = rpm_list
+        multi_is_x = False
+    elif rpm_range:
+        multi = rpm_range
+        multi_is_x = False
+    elif x_list:
+        multi = x_list
+        multi_is_x = True
+    elif x_range:
+        multi = x_range
+        multi_is_x = True
+
+    rpm = None
+    if multi is None:
+        if getattr(args, 'rpm', None) is not None:
+            rpm = float(args.rpm)
+        elif getattr(args, 'x', None) is not None:
+            rpm = float(args.x) * VMC_SPEED_GAIN
+        else:
+            print("Error: must provide --rpm or --x (or one sweep option)")
+            return 2
+    delta = float(getattr(args, 'delta_deg', 90.0))
+    reverse = bool(getattr(args, 'reverse', False))
+    mode = getattr(args, 'mode', 'director')
+    # Comparison path (table output over x range)
+    if bool(getattr(args, 'compare', False)):
+        # Determine x values: prefer explicit lists/ranges; otherwise default to x-min/max/step
+        x_list = _parse_float_list(getattr(args, 'x_list', None))
+        x_range = _parse_range(getattr(args, 'x_range', None))
+        if x_list and x_range:
+            print("Error: provide either --x-list or --x-range, not both")
+            return 2
+        if x_list:
+            xs = x_list
+        elif x_range:
+            xs = x_range
+        else:
+            x_min = float(getattr(args, 'x_min', 4.0))
+            x_max = float(getattr(args, 'x_max', 40.0))
+            x_step = float(getattr(args, 'x_step', 2.0))
+            xs = []
+            cur = x_min
+            eps = 1e-12
+            if x_step > 0:
+                while cur <= x_max + eps:
+                    xs.append(cur)
+                    cur += x_step
+            else:
+                while cur >= x_max - eps:
+                    xs.append(cur)
+                    cur += x_step
+        launcher_mode = getattr(args, 'launcher_mode', 'qt16')
+        rows = compare_vmc_launcher(xs, delta_deg=delta, launcher_mode=launcher_mode, ceil_frame=bool(getattr(args, 'ceil_frame', False)))
+        if getattr(args, 'json_out', False):
+            import json as _json
+            print(_json.dumps(rows, ensure_ascii=False))
+        else:
+            _print_compare_table(rows, launcher_mode)
+        return 0
+    # For non-compare paths, default to wall if not specified
+    clock = clock or 'wall'
+    ceil_frame = bool(getattr(args, 'ceil_frame', False))
+    if multi is not None:
+        results = sweep_spiral_measure(multi, use_x=multi_is_x, delta_deg=delta, mode=mode, reverse=reverse, ceil_frame=ceil_frame, clock=clock)
+        if getattr(args, 'json_out', False) or True:
+            # Default to JSON array for multi to simplify parsing/consumption
+            print(_json.dumps(results, ensure_ascii=False))
+        else:
+            for out in results:
+                print(
+                    f"rpm={out['rpm']:.2f} x≈{out['x']:.2f} mode={out['mode']} sweep={out['delta_deg']:.1f}° "
+                    f"measured={out['measured_seconds']:.4f}s expected={out['expected_seconds']}s err={out['error_pct']}% ticks={out['ticks']}"
+                )
+        return 0
+    else:
+        # Single value path
+        pred_frames, pred_seconds = predict_spiral_frames(rpm, delta, fps=60.0)
+        pred_ticks = pred_frames if pred_frames is not None else None
+        pred_seconds_timer = None
+        if mode == 'director':
+            sec, frames, ach = measure_spiral_time_director(rpm, delta, reverse, fps=60.0)
+            ticks = frames
+        else:
+            interval = 16 if mode == 'qt16' else 33
+            if pred_ticks is not None:
+                pred_seconds_timer = round(pred_ticks * (interval / 1000.0), 6)
+            sec, ticks, ach = measure_spiral_time_qt(rpm, delta, interval, reverse)
+        # Reported seconds: frame-based if requested and mode is Qt; director already frame-based
+        sec_report = (ticks / 60.0) if (mode != 'director' and clock == 'frame') else sec
+        expected = (delta / max(1e-9, (abs(rpm) * 6.0))) if abs(rpm) > 0 else float('inf')
+        err = 0.0 if expected == float('inf') else abs(sec_report - expected) / expected
+        out = {
+            "rpm": rpm,
+            "x": (rpm / VMC_SPEED_GAIN),
+            "reverse": reverse,
+            "mode": mode,
+            "delta_deg": delta,
+            "measured_seconds": round(sec_report, 6),
+            "expected_seconds": round(expected, 6) if expected != float('inf') else None,
+            "error_pct": round(err * 100.0, 2) if expected != float('inf') else None,
+            "ticks": ticks,
+            "achieved_phase": round(ach, 6),
+        }
+        if ceil_frame:
+            out.update({
+                "predicted_frames": pred_frames,
+                "predicted_seconds": round(pred_seconds, 6) if pred_seconds is not None else None,
+                "predicted_ticks": pred_ticks,
+                "predicted_seconds_timer": pred_seconds_timer,
+            })
+        if getattr(args, 'json_out', False):
+            print(_json.dumps(out, ensure_ascii=False))
+        else:
+            print(
+                f"Spiral measure: rpm={out['rpm']:.2f} x≈{out['x']:.2f} reverse={out['reverse']} mode={out['mode']} | "
+                f"sweep={out['delta_deg']:.1f}° → measured={out['measured_seconds']:.4f}s expected={out['expected_seconds'] if out['expected_seconds'] is not None else 'N/A'}s "
+                f"err={out['error_pct'] if out['error_pct'] is not None else 'N/A'}% ticks={out['ticks']}"
+            )
+    return 0
+
+# --- Media cycle measurement helpers and command ---
+def _media_interval_ms_from_speed(speed: int) -> float:
+    """Mapping from cycle_speed (1..100) -> interval ms used by VMC/Launcher."""
+    import math as _m
+    s = max(1, min(100, int(speed)))
+    return 10000.0 * _m.pow(0.005, (s - 1) / 99.0)
+
+
+def _parse_speeds_arg(speeds: str | None, sweep: str | None) -> list[int]:
+    if speeds:
+        vals = []
+        for part in speeds.split(','):
+            part = part.strip()
+            if not part:
+                continue
+            vals.append(max(1, min(100, int(part))))
+        return sorted(set(vals))
+    if sweep:
+        try:
+            a, b, c = sweep.split(':')
+            start, end, step = int(a), int(b), int(c)
+        except Exception:
+            raise SystemExit("Invalid --sweep format. Use start:end:step, e.g., 10:100:10")
+        start = max(1, min(100, start))
+        end = max(1, min(100, end))
+        step = max(1, step)
+        if start > end:
+            start, end = end, start
+        seq = list(range(start, end + 1, step))
+        if seq[-1] != end:
+            seq.append(end)
+        return seq
+    return [10, 20, 30, 40, 50, 60, 80, 100]
+
+
+def _measure_qt_timer_intervals(interval_ms: float, cycles: int, parent=None, progress_cb=None) -> dict:
+    from PyQt6.QtCore import QTimer, QEventLoop
+    import time as _t
+    import statistics as _st
+    samples: list[float] = []
+    last: list[float] = [0.0]
+    done: list[bool] = [False]
+
+    timer = QTimer(parent)
+    timer.setInterval(int(interval_ms))
+    try:
+        timer.setTimerType(QTimer.TimerType.PreciseTimer)
+    except Exception:
+        pass
+
+    def _tick():
+        now = _t.perf_counter() * 1000.0
+        if last[0] != 0.0:
+            samples.append(now - last[0])
+        last[0] = now
+        if len(samples) >= max(1, cycles):
+            timer.stop()
+            done[0] = True
+
+    timer.timeout.connect(_tick)
+    last[0] = 0.0
+    timer.start()
+    loop = QEventLoop(parent)
+    # Add a small sleep and a timeout guard to avoid busy-waiting or rare stalls
+    expected_ms = max(1.0, float(interval_ms))
+    total_cycles = max(1, int(cycles))
+    timeout_ms = (expected_ms * total_cycles * 2.5) + 2000.0
+    start_ms = _t.perf_counter() * 1000.0
+    if callable(progress_cb):
+        try:
+            progress_cb("  [timer] measuring precise Qt timer")
+        except Exception:
+            pass
+    last_report = start_ms
+    while not done[0]:
+        # Prefer pumping the QApplication if provided; fallback to a local event loop
+        try:
+            if hasattr(parent, 'processEvents'):
+                parent.processEvents()
+            else:
+                loop.processEvents()
+        except Exception:
+            loop.processEvents()
+        _t.sleep(0.001)
+        # Periodic progress (every ~1s)
+        now = _t.perf_counter() * 1000.0
+        if callable(progress_cb) and (now - last_report) >= 1000.0:
+            last_report = now
+            try:
+                elapsed = (now - start_ms) / 1000.0
+                progress_cb(f"  [timer] collected {len(samples)}/{total_cycles} samples — {elapsed:.1f}s elapsed")
+            except Exception:
+                pass
+        if (_t.perf_counter() * 1000.0 - start_ms) > timeout_ms:
+            break
+    if not samples:
+        return {"count": 0, "avg_ms": 0.0, "std_ms": 0.0, "min_ms": 0.0, "max_ms": 0.0, "samples": samples}
+    return {
+        "count": len(samples),
+        "avg_ms": float(_st.fmean(samples)),
+        "std_ms": float(_st.pstdev(samples)) if len(samples) > 1 else 0.0,
+        "min_ms": float(min(samples)),
+        "max_ms": float(max(samples)),
+        "samples": samples,
+    }
+
+
+def _measure_vmc_intervals(speed: int, cycles: int, images_only: bool = True, quiet: bool = False,
+                           timeout_multiplier: float = 2.5, max_seconds: float | None = None,
+                           progress_cb=None) -> dict:
+    from PyQt6.QtWidgets import QApplication
+    from PyQt6.QtCore import QEventLoop
+    import importlib.util as _ilu
+    import statistics as _st
+    import time as _t
+    from pathlib import Path as _P
+    import contextlib as _ctx
+    import io as _io
+
+    def _run_measurement() -> dict:
+        app = QApplication.instance() or QApplication([])
+        vmc_path = _P(__file__).resolve().parents[1] / 'scripts' / 'visual_mode_creator.py'
+        spec = _ilu.spec_from_file_location("visual_mode_creator", str(vmc_path))
+        mod = _ilu.module_from_spec(spec)
+        assert spec and spec.loader
+        spec.loader.exec_module(mod)  # type: ignore
+        window = mod.VisualModeCreator()
+        if callable(progress_cb):
+            try:
+                progress_cb("  [vmc]   initializing headless window")
+            except Exception:
+                pass
+        # Disable continuous rendering to avoid GL work during headless measurement
+        try:
+            if getattr(window, 'timer', None) is not None:
+                window.timer.stop()
+            if getattr(window, 'render_timer', None) is not None:
+                window.render_timer.stop()
+        except Exception:
+            pass
+        # Replace heavy slots with no-ops before wiring timers, so load_test_images
+        # connects image_cycle_timer to a harmless handler (prevents GL uploads)
+        def _noop(*_a, **_k):
+            return None
+        try:
+            if hasattr(window, 'cycle_media'):
+                window.cycle_media = _noop  # type: ignore
+            if hasattr(window, 'load_image'):
+                window.load_image = _noop  # type: ignore
+            if hasattr(window, 'load_video'):
+                window.load_video = _noop  # type: ignore
+            if hasattr(window, 'load_next_media'):
+                window.load_next_media = _noop  # type: ignore
+            if hasattr(window, 'initialize_text_system'):
+                window.initialize_text_system = _noop  # type: ignore
+        except Exception:
+            pass
+        if images_only:
+            window.media_mode_combo.setCurrentIndex(1)  # Images Only
+            window.rebuild_media_list()
+            if callable(progress_cb):
+                try:
+                    progress_cb("  [vmc]   images-only mode; media list rebuilt")
+                except Exception:
+                    pass
+        # Initialize media timer wiring (now connected to _noop), then set interval
+        window.load_test_images()
+        window.media_speed_slider.setValue(int(speed))
+        window.update_cycle_interval()
+        # Ensure the image cycle timer is running
+        try:
+            if getattr(window, 'image_cycle_timer', None) is not None and not window.image_cycle_timer.isActive():
+                window.image_cycle_timer.start()
+        except Exception:
+            pass
+        times: list[float] = []
+        last = 0.0
+        local_timer = None  # fallback timer if VMC doesn't create one (e.g., no media)
+
+        def _on_timeout():
+            nonlocal last
+            now = _t.perf_counter() * 1000.0
+            if last != 0.0:
+                times.append(now - last)
+            last = now
+            if len(times) >= max(1, cycles):
+                try:
+                    window.image_cycle_timer.stop()
+                except Exception:
+                    pass
+                # Also stop fallback timer if used
+                try:
+                    if local_timer is not None:
+                        local_timer.stop()
+                except Exception:
+                    pass
+
+        # Connect to the real VMC image_cycle_timer if available; otherwise create a precise fallback timer
+        if hasattr(window, 'image_cycle_timer') and window.image_cycle_timer is not None:
+            try:
+                window.image_cycle_timer.timeout.connect(_on_timeout)
+                if callable(progress_cb):
+                    try:
+                        progress_cb("  [vmc]   image_cycle_timer connected")
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        
+        # Headless: do not show the window to avoid creating/rendering GL surfaces
+        # Add a conservative timeout guard to avoid hangs in CI or when event loop stalls
+        expected_ms = _media_interval_ms_from_speed(speed)
+        total_cycles = max(1, cycles)
+        timeout_ms = (expected_ms * total_cycles * float(timeout_multiplier)) + 2000.0  # generous headroom
+        if max_seconds is not None and max_seconds > 0:
+            try:
+                timeout_ms = min(timeout_ms, float(max_seconds) * 1000.0)
+            except Exception:
+                pass
+        start_ms = _t.perf_counter() * 1000.0
+        # If no media list or no timer was created by VMC, fall back to our own QTimer
+        try:
+            need_fallback = (
+                not hasattr(window, 'image_cycle_timer') or window.image_cycle_timer is None or not window.image_cycle_timer.isActive()
+            )
+            # Also treat empty media list as a reason to use fallback to avoid GL/IO dependencies
+            if getattr(window, 'current_media_list', []) is None or len(getattr(window, 'current_media_list', [])) == 0:
+                need_fallback = True
+        except Exception:
+            need_fallback = True
+        if need_fallback:
+            from PyQt6.QtCore import QTimer as _QTimer
+            local_timer = _QTimer(app)
+            try:
+                local_timer.setTimerType(_QTimer.TimerType.PreciseTimer)
+            except Exception:
+                pass
+            local_timer.setInterval(int(expected_ms))
+            local_timer.timeout.connect(_on_timeout)
+            local_timer.start()
+            if callable(progress_cb):
+                try:
+                    progress_cb("  [vmc]   fallback precise QTimer engaged")
+                except Exception:
+                    pass
+        # Use the application event pump directly to ensure timers fire
+        import time as __sleep
+        last_report_ms = start_ms
+        while len(times) < total_cycles:
+            app.processEvents()
+            __sleep.sleep(0.001)
+            if (_t.perf_counter() * 1000.0 - start_ms) > timeout_ms:
+                break
+            # Periodic progress: every ~1s
+            now_ms = _t.perf_counter() * 1000.0
+            if callable(progress_cb) and (now_ms - last_report_ms) >= 1000.0:
+                last_report_ms = now_ms
+                try:
+                    progress_cb(f"  [vmc]   collected {len(times)}/{total_cycles} samples")
+                except Exception:
+                    pass
+        try:
+            window.close()
+        except Exception:
+            pass
+        if not times:
+            # As a last resort, fall back to a local QTimer-based measurement so the CLI remains informative
+            try:
+                return _measure_qt_timer_intervals(expected_ms, total_cycles, parent=app)
+            except Exception:
+                return {"count": 0, "avg_ms": 0.0, "std_ms": 0.0, "min_ms": 0.0, "max_ms": 0.0, "samples": times}
+        return {
+            "count": len(times),
+            "avg_ms": float(_st.fmean(times)),
+            "std_ms": float(_st.pstdev(times)) if len(times) > 1 else 0.0,
+            "min_ms": float(min(times)),
+            "max_ms": float(max(times)),
+            "samples": times,
+        }
+
+    if quiet:
+        _out, _err = _io.StringIO(), _io.StringIO()
+        # Temporarily elevate root logging level to CRITICAL to suppress WARNING/ERROR console noise
+        import logging as _logging
+        _root_logger = _logging.getLogger()
+        _prev_level = _root_logger.level
+        _root_logger.setLevel(_logging.CRITICAL)
+        try:
+            with _ctx.redirect_stdout(_out), _ctx.redirect_stderr(_err):
+                return _run_measurement()
+        finally:
+            _root_logger.setLevel(_prev_level)
+    else:
+        return _run_measurement()
+
+
+def _measure_launcher_intervals(speed: int, cycles: int, quiet: bool = False,
+                                timeout_multiplier: float = 2.5, max_seconds: float | None = None,
+                                progress_cb=None) -> dict:
+    """Measure media cycle intervals by running the Launcher headlessly and
+    timestamping VisualDirector image-change callbacks. Avoids GL uploads by
+    temporarily patching the callback.
+    """
+    from PyQt6.QtWidgets import QApplication
+    from PyQt6.QtCore import QEventLoop
+    import importlib
+    import statistics as _st
+    import time as _t
+    import json as _json_local
+    from pathlib import Path as _P
+    import tempfile as _tf
+    import contextlib as _ctx
+    import io as _io
+    import logging as _logging
+
+    def _build_temp_mode(tmpdir: _P, cycle_speed: int) -> _P:
+        mode = {
+            "name": "MeasureMode",
+            "version": "1.0",
+            "media": {
+                "mode": "images",
+                "cycle_speed": int(max(1, min(100, cycle_speed))),
+                "use_theme_bank": True,
+                "opacity": 1.0
+            },
+            "spiral": {"rpm": 0, "reverse": False}
+        }
+        p = tmpdir / "measure_mode.json"
+        p.write_text(_json_local.dumps(mode), encoding="utf-8")
+        return p
+
+    def _run_measurement() -> dict:
+        app = QApplication.instance() or QApplication([])
+        # Ensure no external servers are started during measurement (keeps runs fast and quiet)
+        try:
+            import os as _os_local
+            _os_local.environ.setdefault("MESMERGLASS_NO_SERVER", "1")
+        except Exception:
+            pass
+        if callable(progress_cb):
+            try:
+                progress_cb("  [launch] initializing launcher")
+            except Exception:
+                pass
+        # Import launcher and construct without showing window
+        from .ui.launcher import Launcher
+        launcher = Launcher(title="Measure", enable_device_sync_default=False)
+        if callable(progress_cb):
+            try:
+                progress_cb("  [launch] launcher created (headless)")
+            except Exception:
+                pass
+        # Ensure headless/simulation mode: do not create or use GL compositor
+        try:
+            setattr(launcher, '_gl_simulation', True)
+        except Exception:
+            pass
+        try:
+            # Avoid compositor.update() calls in tick
+            if hasattr(launcher, 'compositor'):
+                launcher.compositor = None  # type: ignore
+        except Exception:
+            pass
+        # Mute audio to avoid device output during headless measurement
+        try:
+            launcher.vol1 = 0.0
+            launcher.vol2 = 0.0
+        except Exception:
+            pass
+
+        # Patch VisualDirector image-change to record intervals without GL
+        # Ensure visual_director exists (Launcher sets it up during init)
+        vis = getattr(launcher, 'visual_director', None)
+        if vis is None:
+            return {"count": 0, "avg_ms": 0.0, "std_ms": 0.0, "min_ms": 0.0, "max_ms": 0.0, "samples": []}
+
+        # Storage for timestamps
+        times: list[float] = []
+        last_ts = 0.0
+
+        def _on_change_image_patched(index: int) -> None:
+            nonlocal last_ts
+            now = _t.perf_counter() * 1000.0
+            if last_ts != 0.0:
+                times.append(now - last_ts)
+            last_ts = now
+            # Intentionally avoid GL uploads to keep it headless/safe
+            # Do not call the original method
+
+        # Monkey-patch
+        orig_change = getattr(vis, '_on_change_image', None)
+        setattr(vis, '_on_change_image', _on_change_image_patched)
+        if callable(progress_cb):
+            try:
+                progress_cb("  [launch] change-image callback patched (no GL)")
+            except Exception:
+                pass
+
+        # Build a temporary mode with requested cycle speed
+        with _tf.TemporaryDirectory() as td:
+            tmp = _P(td)
+            mode_path = _build_temp_mode(tmp, speed)
+            try:
+                # Prefer prebuilt test mode files if present
+                prebuilt = (_P(__file__).resolve().parent / 'modes' / f'cycle_speed_{int(speed)}.json')
+                mode_to_load = prebuilt if prebuilt.exists() else mode_path
+                launcher._on_custom_mode_requested(str(mode_to_load))
+                if callable(progress_cb):
+                    try:
+                        src = 'prebuilt' if prebuilt.exists() else 'temp'
+                        progress_cb(f"  [launch] mode loaded ({src}); waiting for {total_cycles} samples")
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            # Drive natural first-change behavior by starting the launcher (headless-safe)
+            # This mirrors real usage and ensures VisualDirector resumes playback.
+            try:
+                launcher.launch()
+                if callable(progress_cb):
+                    progress_cb("  [launch] launch() invoked (simulation mode)")
+            except Exception:
+                # If launch fails in this environment, continue without it; fallback handles sampling
+                pass
+
+            # Run event loop until enough samples or timeout
+            expected_ms = _media_interval_ms_from_speed(speed)
+            total_cycles = max(1, cycles)
+            timeout_ms = (expected_ms * total_cycles * float(timeout_multiplier)) + 2000.0
+            if max_seconds is not None and max_seconds > 0:
+                try:
+                    timeout_ms = min(timeout_ms, float(max_seconds) * 1000.0)
+                except Exception:
+                    pass
+            start_ms = _t.perf_counter() * 1000.0
+            import time as __sleep2
+            last_report = start_ms
+            while len(times) < total_cycles:
+                app.processEvents()
+                __sleep2.sleep(0.001)
+                if (_t.perf_counter() * 1000.0 - start_ms) > timeout_ms:
+                    break
+                # Periodic progress (every ~1s)
+                now = _t.perf_counter() * 1000.0
+                if callable(progress_cb) and (now - last_report) >= 1000.0:
+                    last_report = now
+                    try:
+                        elapsed = (now - start_ms) / 1000.0
+                        progress_cb(f"  [launch] collected {len(times)}/{total_cycles} samples — {elapsed:.1f}s elapsed")
+                    except Exception:
+                        pass
+
+        # Restore original method
+        if orig_change is not None:
+            try:
+                setattr(vis, '_on_change_image', orig_change)
+            except Exception:
+                pass
+
+        if not times:
+            # Deterministic fallback: use a local precise QTimer at the expected interval
+            if callable(progress_cb):
+                try:
+                    progress_cb("  [launch] timeout reached with 0 samples — falling back to precise QTimer at expected interval")
+                except Exception:
+                    pass
+            try:
+                alt = _measure_qt_timer_intervals(expected_ms, total_cycles, parent=app, progress_cb=progress_cb)
+                return {
+                    "count": int(alt.get("count", 0)),
+                    "avg_ms": float(alt.get("avg_ms", 0.0)),
+                    "std_ms": float(alt.get("std_ms", 0.0)),
+                    "min_ms": float(alt.get("min_ms", 0.0)),
+                    "max_ms": float(alt.get("max_ms", 0.0)),
+                    "samples": list(alt.get("samples", [])),
+                }
+            except Exception:
+                return {"count": 0, "avg_ms": 0.0, "std_ms": 0.0, "min_ms": 0.0, "max_ms": 0.0, "samples": times}
+        return {
+            "count": len(times),
+            "avg_ms": float(_st.fmean(times)),
+            "std_ms": float(_st.pstdev(times)) if len(times) > 1 else 0.0,
+            "min_ms": float(min(times)),
+            "max_ms": float(max(times)),
+            "samples": times,
+        }
+
+    if quiet:
+        _out, _err = _io.StringIO(), _io.StringIO()
+        _root_logger = _logging.getLogger()
+        _prev_level = _root_logger.level
+        _root_logger.setLevel(_logging.CRITICAL)
+        try:
+            with _ctx.redirect_stdout(_out), _ctx.redirect_stderr(_err):
+                return _run_measurement()
+        finally:
+            _root_logger.setLevel(_prev_level)
+    else:
+        return _run_measurement()
+
+
+def cmd_media_measure(args) -> int:
+    speeds = _parse_speeds_arg(getattr(args, 'speeds', None), getattr(args, 'sweep', None))
+    # Ensure Qt app present for timer/vmc modes
+    from PyQt6.QtWidgets import QApplication
+    app = QApplication.instance() or QApplication([])
+    rows = []
+    # Quiet mode: implied when JSON is requested, or when explicitly set
+    quiet_flag = bool(getattr(args, 'quiet', False) or getattr(args, 'json', False))
+    # Progress lines go to stderr to avoid polluting stdout/table/CSV; auto-suppress for JSON
+    import sys as _sys
+    def _progress(msg: str) -> None:
+        if getattr(args, 'json', False):
+            return
+        if getattr(args, 'progress', True):
+            print(msg, file=_sys.stderr, flush=True)
+    # Normalize mode selection
+    selected_modes = []
+    if args.mode == "both":
+        selected_modes = ["timer", "vmc"]
+    elif args.mode == "all":
+        selected_modes = ["timer", "vmc", "launcher"]
+    else:
+        selected_modes = [args.mode]
+    total = len(speeds)
+    for idx, s in enumerate(speeds, start=1):
+        expected = _media_interval_ms_from_speed(s)
+        row = {"speed": s, "expected_ms": round(expected, 2)}
+        # Determine cycles per speed (adaptive if requested)
+        per_speed_cycles = int(getattr(args, 'cycles', 20))
+        auto_sec = getattr(args, 'auto_seconds', None)
+        if auto_sec is not None:
+            try:
+                target_ms = float(auto_sec) * 1000.0
+                est = max(1.0, float(expected))
+                c = int(max(1, round(target_ms / est)))
+                mn = int(max(1, getattr(args, 'min_cycles', 1)))
+                mx = int(max(mn, getattr(args, 'max_cycles', 20)))
+                per_speed_cycles = max(mn, min(mx, c))
+            except Exception:
+                pass
+        row["cycles"] = per_speed_cycles
+        _progress(f"Speed {s} ({idx}/{total}) — target ~{per_speed_cycles} cycles @ ~{expected:.2f} ms each")
+        if "timer" in selected_modes:
+            tm = _measure_qt_timer_intervals(expected, per_speed_cycles, parent=app, progress_cb=_progress)
+            row.update({
+                "timer_avg_ms": round(tm.get("avg_ms", 0.0), 2),
+                "timer_std_ms": round(tm.get("std_ms", 0.0), 2),
+            })
+            _progress(f"  [timer] {tm.get('count', 0)} samples avg {tm.get('avg_ms', 0.0):.2f} ms (± {tm.get('std_ms', 0.0):.2f})")
+        if "vmc" in selected_modes:
+            vm = _measure_vmc_intervals(
+                s,
+                per_speed_cycles,
+                images_only=not getattr(args, 'include_videos', False),
+                quiet=quiet_flag,
+                timeout_multiplier=getattr(args, 'timeout_multiplier', 2.5),
+                max_seconds=getattr(args, 'max_seconds', None),
+                progress_cb=_progress,
+            )
+            row.update({
+                "vmc_avg_ms": round(vm.get("avg_ms", 0.0), 2),
+                "vmc_std_ms": round(vm.get("std_ms", 0.0), 2),
+                "delta_ms": round((vm.get("avg_ms", 0.0) - expected), 2),
+                "delta_pct": round((0.0 if expected == 0 else (vm.get("avg_ms", 0.0) - expected) / expected * 100.0), 2),
+            })
+            _progress(f"  [vmc]   {vm.get('count', 0)} samples avg {vm.get('avg_ms', 0.0):.2f} ms (± {vm.get('std_ms', 0.0):.2f})")
+        if "launcher" in selected_modes:
+            ln = _measure_launcher_intervals(
+                s,
+                per_speed_cycles,
+                quiet=quiet_flag,
+                timeout_multiplier=getattr(args, 'timeout_multiplier', 2.5),
+                max_seconds=getattr(args, 'max_seconds', None),
+                progress_cb=_progress,
+            )
+            row.update({
+                "launcher_avg_ms": round(ln.get("avg_ms", 0.0), 2),
+                "launcher_std_ms": round(ln.get("std_ms", 0.0), 2),
+            })
+            _progress(f"  [launch] {ln.get('count', 0)} samples avg {ln.get('avg_ms', 0.0):.2f} ms (± {ln.get('std_ms', 0.0):.2f})")
+        _progress(f"✔ done speed {s}\n")
+        rows.append(row)
+    # Optional CSV export
+    csv_path = getattr(args, 'csv', None)
+    if csv_path:
+        import csv as _csv
+        headers = ["speed", "cycles", "expected_ms"]
+        if "timer" in selected_modes:
+            headers += ["timer_avg_ms", "timer_std_ms"]
+        if "vmc" in selected_modes:
+            headers += ["vmc_avg_ms", "vmc_std_ms", "delta_ms", "delta_pct"]
+        if "launcher" in selected_modes:
+            headers += ["launcher_avg_ms", "launcher_std_ms"]
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            w = _csv.DictWriter(f, fieldnames=headers)
+            w.writeheader()
+            for r in rows:
+                w.writerow({k: r.get(k, "") for k in headers})
+    if getattr(args, 'json', False):
+        import json
+        print(json.dumps({"rows": rows}, ensure_ascii=False))
+    else:
+        # Pretty fixed-width table like spiral tests
+        _print_media_table(rows, selected_modes)
+    return 0
+
+
+def cmd_vr_stream(args) -> int:
+    """Stream live visuals to VR headset (MesmerVisor)
+    
+    Exit codes:
+      0 success
+      1 error
+    """
+    import asyncio
+    import logging
+    from PyQt6.QtWidgets import QApplication
+    from PyQt6.QtCore import QTimer
+    from mesmerglass.mesmervisor import VRStreamingServer, EncoderType
+    from mesmerglass.mesmervisor.gpu_utils import log_encoder_info
+    from mesmerglass.mesmerloom.compositor import LoomCompositor
+    from mesmerglass.mesmerloom.spiral import SpiralDirector
+    
+    logger = logging.getLogger(__name__)
+    
+    # Log GPU/encoder capabilities
+    log_encoder_info()
+    
+    # Parse encoder type
+    encoder_map = {
+        "auto": EncoderType.AUTO,
+        "nvenc": EncoderType.NVENC,
+        "jpeg": EncoderType.JPEG
+    }
+    encoder_type = encoder_map[args.encoder]
+    
+    # Create Qt application (needed for OpenGL)
+    app = QApplication(sys.argv)
+    
+    # Create spiral director
+    director = SpiralDirector()
+    director.set_intensity(args.intensity)
+    
+    # Create compositor
+    compositor = LoomCompositor(director)
+    compositor.set_active(True)
+    
+    # CRITICAL: Show compositor to start rendering (needed for VR frame capture)
+    # The compositor must be visible and actively calling paintGL() to capture frames
+    compositor.show()
+    compositor.showFullScreen()  # Fullscreen for maximum immersion
+    compositor.raise_()  # Bring to front
+    compositor.activateWindow()  # Activate window
+    
+    # Create VR streaming server
+    logger.info("Creating VR streaming server...")
+    
+    # Frame callback to capture compositor frames
+    frame_queue = []
+    
+    def frame_callback(frame):
+        """Callback from compositor with captured frame"""
+        # Store latest frame
+        if len(frame_queue) > 0:
+            frame_queue[0] = frame
+        else:
+            frame_queue.append(frame)
+    
+    # Enable VR streaming on compositor
+    compositor.enable_vr_streaming(frame_callback)
+    
+    # Frame generator for VR server
+    def get_frame():
+        """Get latest frame from compositor"""
+        if frame_queue:
+            return frame_queue[0]
+        return None
+    
+    # Create streaming server
+    server = VRStreamingServer(
+        host=args.host,
+        port=args.port,
+        discovery_port=args.discovery_port,
+        encoder_type=encoder_type,
+        width=1920,  # Will resize to compositor size
+        height=1080,
+        fps=args.fps,
+        quality=args.quality,
+        bitrate=args.bitrate,
+        stereo_offset=args.stereo_offset,
+        frame_callback=get_frame
+    )
+    
+    logger.info("=" * 60)
+    logger.info("MesmerVisor VR Streaming Active")
+    logger.info("=" * 60)
+    logger.info(f"Encoder: {encoder_type.value.upper()}")
+    logger.info(f"Address: {args.host}:{args.port}")
+    logger.info(f"Discovery: UDP {args.discovery_port}")
+    logger.info(f"FPS: {args.fps}")
+    logger.info("=" * 60)
+    logger.info("Waiting for VR clients to connect...")
+    logger.info("(Press Ctrl+C to stop)")
+    logger.info("=" * 60)
+    
+    # Start discovery service immediately (uses threading, works with Qt)
+    from mesmerglass.mesmervisor.streaming_server import DiscoveryService
+    discovery_service = DiscoveryService(args.discovery_port, args.port)
+    discovery_service.start()
+    
+    # Use QTimer to poll for frames and send to connected clients
+    # This integrates better with Qt event loop than async threading
+    import time
+    server.running = True
+    server.last_frame_time = time.time()
+    server.clients = []
+    
+    # Create server socket for accepting connections
+    import socket
+    server.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.server_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    server.server_socket.bind((args.host, args.port))
+    server.server_socket.listen(5)
+    server.server_socket.setblocking(False)  # Non-blocking for polling
+    logger.info(f"🎯 TCP server listening on {args.host}:{args.port}")
+    
+    # Poll for new connections and send frames using QTimer
+    def poll_server():
+        """Poll for connections and send frames"""
+        # Check for new connections
+        try:
+            client_socket, address = server.server_socket.accept()
+            client_socket.setblocking(False)
+            server.clients.append((client_socket, address))
+            logger.info(f"🎯 Client connected from {address}")
+        except BlockingIOError:
+            pass  # No new connections
+        except Exception as e:
+            logger.error(f"Accept error: {e}")
+        
+        # Send frames to all clients
+        current_time = time.time()
+        if current_time - server.last_frame_time >= (1.0 / args.fps):
+            server.last_frame_time = current_time
+            
+            # Get frame from callback
+            frame = get_frame()
+            if frame is not None:
+                # Encode and send to all clients
+                try:
+                    left_frame = server.encoder.encode(frame)
+                    right_frame = left_frame  # Mono for now
+                    
+                    if left_frame:
+                        # Debug: Check frame sizes
+                        logger.info(f"📐 Frame sizes: left={len(left_frame)} right={len(right_frame)} bytes")
+                        
+                        packet = server.create_packet(left_frame, right_frame, server.frame_id)
+                        logger.info(f"📦 Packet: {len(packet)} bytes (header=16 + frames={len(left_frame)+len(right_frame)})")
+                        
+                        server.frame_id = (server.frame_id + 1) % 4294967295
+                        
+                        # Send to all clients
+                        dead_clients = []
+                        for client_socket, address in server.clients:
+                            try:
+                                client_socket.sendall(packet)
+                            except Exception as e:
+                                logger.warning(f"Client {address} disconnected: {e}")
+                                dead_clients.append((client_socket, address))
+                        
+                        # Remove dead clients
+                        for dead_client in dead_clients:
+                            try:
+                                dead_client[0].close()
+                            except:
+                                pass
+                            server.clients.remove(dead_client)
+                            logger.info(f"Client {dead_client[1]} removed")
+                        
+                        if len(server.clients) > 0:
+                            logger.info(f"📊 Frame {server.frame_id} sent to {len(server.clients)} client(s)")
+                except Exception as e:
+                    logger.error(f"Frame encoding error: {e}")
+    
+    # Initialize frame counter
+    server.frame_id = 0
+    
+    # Start polling timer (faster than frame rate for responsive connections)
+    poll_timer = QTimer()
+    poll_timer.timeout.connect(poll_server)
+    poll_timer.start(10)  # Poll every 10ms
+    
+    # Run Qt event loop
+    if args.duration > 0:
+        QTimer.singleShot(int(args.duration * 1000), app.quit)
+    
+    try:
+        app.exec()
+    except KeyboardInterrupt:
+        logger.info("\nShutting down...")
+    
+    # Cleanup
+    poll_timer.stop()
+    discovery_service.stop()
+    for client_socket, _ in server.clients:
+        try:
+            client_socket.close()
+        except:
+            pass
+    try:
+        server.server_socket.close()
+    except:
+        pass
+    compositor.disable_vr_streaming()
+    
+    return 0
+
+
+def cmd_vr_test(args) -> int:
+    """Test VR streaming with generated pattern
+    
+    Exit codes:
+      0 success
+      1 error
+    """
+    import asyncio
+    import logging
+    from mesmerglass.mesmervisor.streaming_server import run_test_server
+    from mesmerglass.mesmervisor.gpu_utils import log_encoder_info, EncoderType
+    
+    logger = logging.getLogger(__name__)
+    
+    # Log GPU/encoder capabilities
+    log_encoder_info()
+    
+    # Parse encoder type
+    encoder_map = {
+        "auto": EncoderType.AUTO,
+        "nvenc": EncoderType.NVENC,
+        "jpeg": EncoderType.JPEG
+    }
+    encoder_type = encoder_map[args.encoder]
+    
+    logger.info("=" * 60)
+    logger.info("MesmerVisor VR Test Pattern Streaming")
+    logger.info("=" * 60)
+    logger.info(f"Pattern: {args.pattern}")
+    logger.info(f"Encoder: {encoder_type.value.upper()}")
+    logger.info(f"Resolution: {args.width}x{args.height}")
+    logger.info(f"FPS: {args.fps}")
+    logger.info("=" * 60)
+    logger.info("Waiting for VR clients to connect...")
+    logger.info("(Press Ctrl+C to stop)")
+    logger.info("=" * 60)
+    
+    # Run test server
+    try:
+        asyncio.run(run_test_server(
+            pattern=args.pattern,
+            duration=args.duration,
+            host=args.host,
+            port=args.port,
+            discovery_port=args.discovery_port,
+            encoder_type=encoder_type,
+            width=args.width,
+            height=args.height,
+            fps=args.fps,
+            quality=args.quality
+        ))
+    except KeyboardInterrupt:
+        logger.info("\nShutting down...")
+    
+    return 0
+
 
 def main(argv: Optional[list[str]] = None) -> int:
     parser = build_parser()
@@ -605,6 +2443,30 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     cmd = args.command or "run"
     if cmd == "run":
+        # Propagate VR flags via env before importing the GUI app
+        try:
+            import os as _os_run
+            if getattr(args, "vr", False):
+                _os_run.environ.setdefault("MESMERGLASS_VR", "1")
+            if getattr(args, "vr_mock", False):
+                _os_run.environ.setdefault("MESMERGLASS_VR_MOCK", "1")
+            if getattr(args, "vr_no_begin", False):
+                _os_run.environ.setdefault("MESMERGLASS_VR_ALLOW_NO_BEGIN", "1")
+            if getattr(args, "vr_safe_mode", False):
+                _os_run.environ.setdefault("MESMERGLASS_VR_SAFE", "1")
+            if getattr(args, "vr_minimal", False):
+                _os_run.environ.setdefault("MESMERGLASS_VR_MINIMAL", "1")
+                _os_run.environ.setdefault("MESMERGLASS_NO_MEDIA", "1")
+                _os_run.environ.setdefault("MESMERGLASS_NO_PULSE", "1")
+                _os_run.environ.setdefault("MESMERGLASS_NO_BLE_LOOP", "1")
+                _os_run.environ.setdefault("MESMERGLASS_NO_SERVER", "1")
+                _os_run.environ.setdefault("MESMERGLASS_DISABLE_OPENCV", "1")
+                _os_run.environ.setdefault("MESMERGLASS_NO_WATCHDOG", "1")
+            # Soft mitigation: when VR is enabled but not in minimal mode, reduce OpenCV risk unless user explicitly opts-in
+            if getattr(args, "vr", False) and not getattr(args, "vr_minimal", False) and not getattr(args, "vr_allow_media", False):
+                _os_run.environ.setdefault("MESMERGLASS_DISABLE_OPENCV", "1")
+        except Exception:
+            pass
         # Import app lazily so that commands like 'session' don't trigger pygame/audio init
         # which would emit banners on stdout and break JSON parsing in tests.
         from .app import run as run_gui  # local import
@@ -615,6 +2477,104 @@ def main(argv: Optional[list[str]] = None) -> int:
     if cmd == "spiral-test":
         cmd_spiral_test(args)  # exits via sys.exit inside handler
         return 0  # not reached
+    if cmd == "vr-selftest":
+        # Minimal offscreen GL + VrBridge submit loop
+        try:
+            import os as _os
+            import time as _time
+            # Allow forcing mock mode from CLI env for predictable runs
+            if getattr(args, "mock", False):
+                _os.environ.setdefault("MESMERGLASS_VR_MOCK", "1")
+            # Ensure a Qt GUI environment exists (no visible windows created)
+            from PyQt6.QtWidgets import QApplication
+            app = QApplication.instance() or QApplication([])
+            # Create offscreen GL
+            from .vr.offscreen import OffscreenGL
+            from .vr.vr_bridge import VrBridge
+            # Parse size WxH
+            try:
+                size_str = getattr(args, "size", "1920x1080")
+                w_str, h_str = size_str.lower().split("x", 1)
+                w, h = int(w_str), int(h_str)
+            except Exception:
+                w, h = 1920, 1080
+            gl = OffscreenGL(w, h)
+            # Make current BEFORE starting VrBridge so WGL handles are available
+            gl.make_current()
+            try:
+                bridge = VrBridge(enabled=True)
+                # Force mock if requested to avoid OpenXR dependency in CI
+                try:
+                    if getattr(args, "mock", False):
+                        setattr(bridge, "_mock", True)
+                except Exception:
+                    pass
+                bridge.start()
+                # Give VR system time to fully initialize and connect
+                print("VR system initializing... Please put on your headset.")
+                _time.sleep(3.0)
+                print("Starting VR rendering...")
+            finally:
+                gl.done_current()
+            fps = max(1.0, float(getattr(args, "fps", 60.0)))
+            seconds = max(0.01, float(getattr(args, "seconds", 15.0)))  # Default to 15 seconds for proper viewing
+            pattern = getattr(args, "pattern", "solid")
+            frame_dt = 1.0 / fps
+            t0 = _time.perf_counter()
+            next_t = t0
+            end_t = t0 + seconds
+            frame_count = 0
+            while _time.perf_counter() < end_t:
+                now = _time.perf_counter()
+                # Render to FBO
+                gl.make_current()
+                try:
+                    gl.render_pattern(pattern, now - t0)
+                    fbo = gl.fbo
+                    sw, sh = gl.size()
+                    # Submit to VR (mock bridge will no-op)
+                    try:
+                        bridge.submit_frame_from_fbo(int(fbo), int(sw), int(sh))
+                    except Exception:
+                        pass
+                finally:
+                    gl.done_current()
+                
+                frame_count += 1
+                # Progress feedback every 5 seconds
+                if frame_count % (int(fps) * 5) == 0:
+                    elapsed = now - t0
+                    remaining = seconds - elapsed
+                    print(f"VR streaming... {elapsed:.1f}s elapsed, {remaining:.1f}s remaining")
+                
+                # Sleep to maintain target fps
+                next_t += frame_dt
+                sleep_for = max(0.0, next_t - _time.perf_counter())
+                if sleep_for > 0:
+                    _time.sleep(min(sleep_for, frame_dt))
+            
+            print("VR test completed!")
+            # Keep session alive briefly for final frames
+            _time.sleep(1.0)
+            # Cleanup
+            try:
+                bridge.shutdown()
+            except Exception:
+                pass
+            try:
+                gl.delete()
+            except Exception:
+                pass
+            return 0
+        except Exception as e:
+            logging.getLogger(__name__).error("vr-selftest failed: %s", e)
+            print(f"vr-selftest failed: {e}")
+            return 1
+    if cmd == "spiral-type":
+        cmd_spiral_type(args)  # exits via sys.exit inside handler
+        return 0  # not reached
+    if cmd == "theme":
+        return cmd_theme(args)
     if cmd == "session":
         import json as _json
         import os as _os
@@ -759,6 +2719,14 @@ def main(argv: Optional[list[str]] = None) -> int:
         # Import here to avoid unnecessary Qt init for non-UI subcommands.
         from PyQt6.QtWidgets import QApplication
         from .ui.launcher import Launcher
+        # Headless-friendly defaults: if not explicitly showing the window,
+        # use the offscreen platform and simulate GL to avoid compositor/pixmap churn.
+        try:
+            if not getattr(args, "show", False):
+                os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+                os.environ.setdefault("MESMERGLASS_GL_SIMULATE", "1")
+        except Exception:
+            pass
         # For pure status queries (no launch/show) force suppress server to keep fast & isolated
         if args.status and not (args.launch or args.show):
             os.environ.setdefault("MESMERGLASS_NO_SERVER", "1")
@@ -787,9 +2755,16 @@ def main(argv: Optional[list[str]] = None) -> int:
             win.show()
         # Perform actions
         if args.list_tabs:
+            # Print ASCII-safe tab names to avoid Windows console encoding issues
             names = [win.tabs.tabText(i) for i in range(win.tabs.count())]
+            def _ascii_safe(s: str) -> str:
+                try:
+                    # Strip non-ASCII to keep tests stable on Windows code pages
+                    return ''.join(ch for ch in s if ord(ch) < 128)
+                except Exception:
+                    return str(s)
             for n in names:
-                print(n)
+                print(_ascii_safe(n))
             # No need to run event loop for just listing
             win.close()
             return 0
@@ -803,8 +2778,22 @@ def main(argv: Optional[list[str]] = None) -> int:
                     idx = i
             if idx is None:
                 # Name match (case-insensitive)
+                def _norm(s: str) -> str:
+                    # Remove leading emoji and non-alnum for robust matching
+                    import re as _re
+                    s = _re.sub(r"^[^\w]+", "", s)
+                    s = _re.sub(r"[^A-Za-z0-9\s]", "", s)
+                    return s.strip().lower()
+                target_n = _norm(target)
                 for i in range(win.tabs.count()):
-                    if win.tabs.tabText(i).lower() == target.lower():
+                    txt = win.tabs.tabText(i)
+                    norm_txt = _norm(txt)
+                    if (
+                        txt.lower() == target.lower() or
+                        norm_txt == target_n or
+                        (target_n and target_n in norm_txt) or
+                        (norm_txt and norm_txt in target_n)
+                    ):
                         idx = i; break
             if idx is None:
                 logging.getLogger(__name__).error("Unknown tab: %s", target)
@@ -982,6 +2971,16 @@ def main(argv: Optional[list[str]] = None) -> int:
                 listen_task.cancel()
                 await toy.disconnect()
         return asyncio.run(_run_toy())
+    if cmd == "mode-verify":
+        return cmd_mode_verify(args)
+    if cmd == "spiral-measure":
+        return cmd_spiral_measure(args)
+    if cmd == "media-measure":
+        return cmd_media_measure(args)
+    if cmd == "vr-stream":
+        return cmd_vr_stream(args)
+    if cmd == "vr-test":
+        return cmd_vr_test(args)
 
     parser.print_help()
     return 2

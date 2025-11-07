@@ -116,23 +116,46 @@ class ButtplugServer:
         asyncio.set_event_loop(loop)
         
         async def run_server():
-            logging.getLogger(__name__).info("Starting server on port %s", self.port)
-            # Create the server and record the actual bound port (support port=0 ephemeral binding)
-            ws_server = await websockets.serve(self._handle_client, "127.0.0.1", self.port)
+            logger = logging.getLogger(__name__)
+            # Try binding requested port; on failure, try next few ports, then ephemeral port 0
+            attempts = []
+            # Try the requested port and the next 4 ports
+            for offset in range(5):
+                attempts.append(self.port + offset)
+            # Finally try 0 (ephemeral)
+            attempts.append(0)
+            ws_server = None
+            last_err = None
+            for p in attempts:
+                try:
+                    logger.info("Starting server on port %s", p)
+                    ws_server = await websockets.serve(self._handle_client, "127.0.0.1", p)
+                    # Success -> record bound port
+                    if ws_server.sockets:
+                        bound_port = ws_server.sockets[0].getsockname()[1]
+                        self._actual_port = bound_port
+                        self.port = bound_port
+                    if p != attempts[0]:
+                        logger.info("Port in use earlier; server bound to available port %s", self.port)
+                    break
+                except OSError as e:
+                    last_err = e
+                    logger.warning("Port %s unavailable (%s); trying next...", p, getattr(e, 'errno', 'errno?'))
+                    continue
+            if ws_server is None:
+                # Exhausted attempts; re-raise last error
+                raise last_err or RuntimeError("Failed to bind server socket")
             try:
-                # websockets 11+: server.sockets provides bound sockets. Pick first.
-                if ws_server.sockets:
-                    bound_port = ws_server.sockets[0].getsockname()[1]
-                    self._actual_port = bound_port
-                    # Keep compatibility: update self.port so calling code sees the bound port
-                    self.port = bound_port
-                logging.getLogger(__name__).info("Ready for connections")
+                logger.info("Ready for connections")
                 # Keep running until stopped
                 while not self._stop:
                     await asyncio.sleep(1)
             finally:
-                ws_server.close()
-                await ws_server.wait_closed()
+                try:
+                    ws_server.close()
+                    await ws_server.wait_closed()
+                except Exception:
+                    pass
                     
         try:
             loop.run_until_complete(run_server())

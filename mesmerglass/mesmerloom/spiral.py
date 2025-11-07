@@ -50,7 +50,7 @@ class SpiralDirector:
     # Safety clamps
     SPEED_CAP = 0.18
     BAR_WIDTH_MIN = 0.36; BAR_WIDTH_MAX = 0.62
-    OPACITY_MIN = 0.55; OPACITY_MAX = 0.95
+    OPACITY_MIN = 0.0; OPACITY_MAX = 1.0  # Allow full range for custom modes
     CONTRAST_MIN = 0.85; CONTRAST_MAX = 1.25
     # Slew caps (per frame @60fps)
     DW_BAR_WIDTH = 0.0016
@@ -66,6 +66,11 @@ class SpiralDirector:
         self._flip_elapsed = 0.0
         self._next_flip_in = self._schedule_next_flip(0.0)
         self._intensity_slew_cooldown = 0.0  # while >0 use half slew caps
+        self._lock_opacity = False  # When True, prevent automatic opacity evolution (for custom modes)
+        
+        # High-precision phase accumulator (prevents drift over long runtime)
+        self._phase_accumulator = 0.0  # Double-precision accumulator for rotation
+        self._rotation_count = 0  # Track full rotations for diagnostics
         
         # Additional spiral parameters for shader
         self.arm_count = 8
@@ -76,6 +81,16 @@ class SpiralDirector:
         self.resolution = (1920, 1080)
         self.super_samples = 4  # Anti-aliasing samples: 1=none, 4=2x2, 9=3x3, 16=4x4
         self.precision_level = "high"  # low, medium, high
+        
+        # Trance spiral type and width (NEW)
+        self.spiral_type = 3  # 1-7: log, quad, linear, sqrt, inverse, power, modulated (default: linear)
+        self.spiral_width = 60  # Degrees per arm: 360, 180, 120, 90, 72, 60
+        self.rotation_speed = 4.0  # Rotation speed multiplier (4.0 = normal, up to 40.0 = very fast)
+        
+        # Trance rendering parameters (NEW)
+        self.near_plane = 1.0  # Distance to near plane (fixed, controls FoV)
+        self.far_plane = 5.0  # Distance to far plane (1.0 + far_plane_distance, controls zoom)
+        self.eye_offset = 0.0  # Eye offset for VR/stereoscopic rendering
 
     # ---------------- Intensity & scaling ----------------
     def set_intensity(self, v: float):
@@ -123,9 +138,11 @@ class SpiralDirector:
         self.blend_mode = max(0, min(2, int(mode)))
     
     def set_opacity(self, opacity: float):
-        """Set spiral opacity (0.0-1.0)."""
+        """Set spiral opacity (0.0-1.0). Locks opacity to prevent automatic evolution."""
         # Clamp to safe range and update state
         self.state.opacity = max(self.OPACITY_MIN, min(self.OPACITY_MAX, opacity))
+        # Lock opacity to prevent automatic intensity-based evolution
+        self._lock_opacity = True
     
     def set_resolution(self, width: int, height: int):
         """Set screen resolution for aspect ratio correction."""
@@ -140,6 +157,86 @@ class SpiralDirector:
         """Set floating-point precision level (low, medium, high)."""
         valid_levels = ["low", "medium", "high"]
         self.precision_level = level if level in valid_levels else "high"
+    
+    def set_spiral_type(self, spiral_type: int):
+        """Set spiral type (1-7): log, quad, linear, sqrt, inverse, power, modulated."""
+        self.spiral_type = max(1, min(7, int(spiral_type)))
+    
+    def set_spiral_width(self, width: int):
+        """Set spiral width in degrees (360, 180, 120, 90, 72, 60)."""
+        valid_widths = [360, 180, 120, 90, 72, 60]
+        if width in valid_widths:
+            self.spiral_width = width
+        else:
+            # Find closest valid width
+            self.spiral_width = min(valid_widths, key=lambda x: abs(x - width))
+    
+    def set_rotation_speed(self, speed: float):
+        """Set rotation speed in RPM (negative = reverse).
+
+        Unified model: value is RPM, not a legacy multiplier. To preserve the
+        legacy "feel" range from the UI (4..40x), the VMC maps x→RPM with a
+        gain (default 10x). Here we allow a wider RPM range to avoid unintended
+        clamping when higher perceived speeds are desired.
+        """
+        # Allow negative speeds for reverse rotation; clamp conservatively high
+        new_speed = max(-600.0, min(600.0, float(speed)))  # Clamp to ±600 RPM
+        
+        # Reset phase accumulator if direction changes to prevent direction lag
+        if hasattr(self, 'rotation_speed') and hasattr(self, '_phase_accumulator'):
+            old_sign = 1 if self.rotation_speed >= 0 else -1
+            new_sign = 1 if new_speed >= 0 else -1
+            if old_sign != new_sign:
+                # Direction changed - reset phase accumulator to prevent direction lag
+                self._phase_accumulator = 0.0
+        
+        self.rotation_speed = new_speed
+    
+    def change_spiral(self):
+        """Randomly change spiral type and width (Trance: visual_api.cpp line 91-99)."""
+        # 75% chance to skip change (random_chance(4) in Trance)
+        if self.rng.random() < 0.75:
+            return
+        
+        # Change spiral type (1-7)
+        self.spiral_type = self.rng.randint(1, 7)
+        
+        # Change spiral width (360 / (1 + random(6)))
+        divisor = 1 + self.rng.randint(0, 5)
+        self.spiral_width = 360 // divisor
+    
+    def rotate_spiral(self, amount: float):
+        """
+        Rotate spiral using direct RPM calculation instead of legacy Trance formula.
+        
+        NEW APPROACH: rotation_speed is treated as actual RPM (rotations per minute).
+        This bypasses the legacy formula and directly converts RPM to phase increment.
+        
+        Args:
+            amount: Legacy parameter (ignored in new RPM mode)
+                   To maintain compatibility with existing calls like rotate_spiral(4.0)
+        """
+        # NEW: Direct RPM to phase conversion
+        from mesmerglass.mesmerloom.spiral_speed import rpm_to_phase_increment
+        
+        # Calculate phase increment for 60 FPS (assuming this is called at 60 Hz)
+        phase_increment = rpm_to_phase_increment(self.rotation_speed, fps=60.0)
+        
+        # Use high-precision accumulator to prevent drift  
+        self._phase_accumulator += phase_increment
+        
+        # Normalize when crossing 1.0 boundary (prevents precision loss)
+        if self._phase_accumulator >= 1.0:
+            full_rotations = int(self._phase_accumulator)
+            self._rotation_count += full_rotations
+            self._phase_accumulator -= full_rotations
+        elif self._phase_accumulator < 0.0:
+            full_rotations = int(-self._phase_accumulator) + 1
+            self._rotation_count -= full_rotations
+            self._phase_accumulator += full_rotations
+        
+        # Note: state.phase is updated by update() method which reads from _phase_accumulator
+        # This separation ensures a single source of truth for the phase value
 
     # ---------------- Flip scheduling ----------------
     def _schedule_next_flip(self, intensity: float) -> float:
@@ -186,7 +283,9 @@ class SpiralDirector:
         scale = 0.5 if tight else 1.0
         st.base_speed = self._slew(st.base_speed, base_speed_target, self.DW_BASE_SPEED * scale)
         st.bar_width = self._slew(st.bar_width, bar_width_target, self.DW_BAR_WIDTH * scale)
-        st.opacity = self._slew(st.opacity, opacity_target, self.DW_OPACITY * scale)
+        # Skip opacity evolution if locked (custom mode has direct control)
+        if not self._lock_opacity:
+            st.opacity = self._slew(st.opacity, opacity_target, self.DW_OPACITY * scale)
         st.contrast = self._slew(st.contrast, contrast_target, self.DW_CONTRAST * scale)
         st.twist = self._lerp(st.twist, twist_target, min(1.0, dt * 0.5))  # slower blend
         st.vignette = self._lerp(st.vignette, vignette_target, min(1.0, dt * 0.5))
@@ -212,7 +311,11 @@ class SpiralDirector:
         wobble = math.sin(now * 2.0 * math.pi * 0.5) * wobble_amp  # 0.5 cps wobble
         flip_boost = 0.03 if st.flip_state == 1 else 0.0
         st.effective_speed = min(self.SPEED_CAP, st.base_speed + wobble + flip_boost)
-        st.phase = (st.phase + st.effective_speed * dt) % 10000.0
+        
+        # Phase is now managed by rotate_spiral() using rotation_speed multiplier.
+        # Update state.phase from the high-precision accumulator (don't advance it here).
+        # This allows rotate_spiral() to be the single source of truth for rotation.
+        st.phase = float(self._phase_accumulator)
 
         # Safety clamps (applied after updates)
         safety = False
@@ -244,6 +347,10 @@ class SpiralDirector:
     def export_uniforms(self) -> dict:
         s = self.state
         now = time.time()
+        
+        # Calculate aspect ratio
+        aspect_ratio = float(self.resolution[0]) / float(self.resolution[1]) if self.resolution[1] > 0 else 1.778
+        
         return {
             # Core SpiralDirector uniforms
             "uPhase": s.phase,
@@ -257,12 +364,12 @@ class SpiralDirector:
             "uChromaticShift": s.chromatic_shift,
             "uFlipWaveRadius": s.flip_radius,
             "uFlipState": s.flip_state,
-            "uIntensity": s.intensity,
+            "uIntensity": 1.0,  # Always 1.0 - intensity removed from system (spiral uses full color)
             "uSafetyClamped": 1 if s.safety_clamped else 0,
             
             # Time and resolution
             "uTime": now,
-            "uResolution": self.resolution,
+            # Note: uResolution is set by compositor from actual window size, don't override it
             
             # Visual parameters
             "uArms": self.arm_count,
@@ -271,6 +378,23 @@ class SpiralDirector:
             "uGapColor": self.gap_color,
             "uSuperSamples": self.super_samples,
             "uPrecisionLevel": {"low": 0, "medium": 1, "high": 2}.get(self.precision_level, 2),
+            # NOTE: uWindowOpacity is NOT exported here - it's managed by LoomCompositor
+            # directly via setWindowOpacity() to avoid conflicts with intensity (which is 0.0)
+            
+            # Trance spiral parameters (NEW)
+            "near_plane": self.near_plane,
+            "far_plane": self.far_plane,
+            "eye_offset": self.eye_offset,
+            "aspect_ratio": aspect_ratio,
+            "width": float(self.spiral_width),
+            "spiral_type": float(self.spiral_type),
+            # Use signed phase directly so reverse direction is preserved in the shader.
+            # Phase is accumulated from RPM (including sign), so the shader should not
+            # multiply by rotation speed again (avoids rpm^2 scaling).
+            "time": s.phase,
+            "rotation_speed": self.rotation_speed,  # Kept for diagnostics/zoom; ignored by shader rotation
+            "acolour": (*self.arm_color, 1.0),  # Convert RGB to RGBA
+            "bcolour": (*self.gap_color, 1.0),   # Convert RGB to RGBA
             
             # Legacy compatibility
             "u_time": now,

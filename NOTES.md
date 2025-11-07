@@ -1,1 +1,0 @@
-Selecting a virtual toy in device sync causing crash (Critical)

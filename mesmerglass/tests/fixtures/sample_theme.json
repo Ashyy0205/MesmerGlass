@@ -1,0 +1,49 @@
+{
+  "theme_map": {
+    "test_theme_1": {
+      "enabled": true,
+      "image_path": [
+        "images/sample1.jpg",
+        "images/sample2.png",
+        "images/sample3.jpg"
+      ],
+      "animation_path": [
+        "videos/sample.mp4"
+      ],
+      "font_path": [
+        "fonts/default.ttf"
+      ],
+      "text_line": [
+        "This is a test message",
+        "Another test message",
+        "Third test message"
+      ]
+    },
+    "test_theme_2": {
+      "enabled": false,
+      "image_path": [
+        "images/disabled1.jpg"
+      ],
+      "text_line": [
+        "Disabled theme message"
+      ]
+    },
+    "test_theme_3": {
+      "enabled": true,
+      "image_path": [
+        "images/another1.jpg",
+        "images/another2.jpg",
+        "images/another3.jpg",
+        "images/another4.jpg",
+        "images/another5.jpg"
+      ],
+      "text_line": [
+        "Message A",
+        "Message B",
+        "Message C",
+        "Message D",
+        "Message E"
+      ]
+    }
+  }
+}

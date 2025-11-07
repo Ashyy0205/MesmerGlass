@@ -1,0 +1,19 @@
+{
+  "applications": [
+    {
+      "app_key": "mesmerglass",
+      "launch_type": "binary",
+      "binary_path_windows": "C:\\Users\\Ash\\Desktop\\MesmerGlass\\.venv\\Scripts\\python.exe",
+      "arguments": "-m mesmerglass vr-selftest",
+      "is_dashboard_overlay": false,
+      "action_manifest_path": "C:\\Users\\Ash\\Desktop\\MesmerGlass\\mesmerglass\\vr\\registration\\actions.json",
+      "working_directory": "C:\\Users\\Ash\\Desktop\\MesmerGlass",
+      "strings": {
+        "en_us": {
+          "name": "MesmerGlass - OpenXR VR Hypnosis",
+          "description": "OpenXR-based VR hypnosis application with spiral visuals"
+        }
+      }
+    }
+  ]
+}

@@ -1,4 +1,154 @@
 # MesmerLoom Spiral Overlay
+
+## Trance 7-Type Spiral System
+
+MesmerLoom now implements the complete Trance spiral system with 7 distinct mathematical spiral types and cone-intersection depth effects.
+
+### Spiral Types (1-7)
+
+Each spiral type uses a different mathematical function to create unique visual patterns:
+
+| Type | Name | Function | Visual Effect |
+|------|------|----------|---------------|
+| 1 | Logarithmic | `f(r) = log(r)` | Tighter at center, rapidly expanding outward |
+| 2 | Quadratic | `f(r) = r²` | Accelerating expansion from center |
+| 3 | Linear | `f(r) = r` | **Default** - Uniform spacing (Archimedean spiral) |
+| 4 | Square Root | `f(r) = sqrt(r)` | Decelerating expansion, tighter at edges |
+| 5 | Inverse Spike | `f(r) = -|r - 1|` | Central spike at r=1, symmetric |
+| 6 | Power | Complex dual-zone | Dramatic power-law transition at r=1 |
+| 7 | Modulated | `f(r) = r + ripple(r)` | Adds periodic 0.2-unit ripples |
+
+**GLSL Implementation** (from `spiral.frag`):
+```glsl
+float spiral1(float r) { return log(r); }
+float spiral2(float r) { return r * r; }
+float spiral3(float r) { return r; }
+float spiral4(float r) { return sqrt(r); }
+float spiral5(float r) { return -abs(r - 1.0); }
+float spiral6(float r) {
+    float r1 = r * 1.2;
+    float r2 = (1.5 - 0.5 * r) * 1.2;
+    return r < 1.0 ? pow(r1, 6.0) : -pow(r2, 6.0);
+}
+float spiral7(float r) {
+    float m = mod(r, 0.2);
+    m = m < 0.1 ? m : 0.2 - m;
+    return r + m * 3.0;
+}
+```
+
+### Spiral Width (Arm Count)
+
+The spiral width parameter controls how many degrees each arm spans:
+
+| Width | Arms | Description |
+|-------|------|-------------|
+| 60° | 6 arms | **Default** - Dense, rapid rotation |
+| 72° | 5 arms | Pentagonal symmetry |
+| 90° | 4 arms | Quadrant divisions |
+| 120° | 3 arms | Triangular symmetry |
+| 180° | 2 arms | Binary division |
+| 360° | 1 arm | Single continuous spiral |
+
+### Rotation Formula
+
+The exact Trance rotation formula ensures consistent rotation speeds across different spiral widths:
+
+```python
+phase += amount / (32 * sqrt(spiral_width))
+```
+
+**Examples** (at 60fps):
+- `amount=1.0, width=60°` → ~4.1 seconds per rotation
+- `amount=2.0, width=60°` → ~2.1 seconds per rotation  
+- `amount=4.0, width=60°` → ~1.0 second per rotation
+
+**Typical rotation amounts**:
+- Visual programs: 1.0 - 4.0
+- Slow cycles: 2.0
+- Fast cycles: 4.0
+- Accelerating: 1.0 + (intensity × 2.75)
+
+### Cone Intersection (3D Depth Effect)
+
+The shader uses **ray-cone intersection** to create a tunnel depth effect where the spiral appears to recede into the distance:
+
+**How it works**:
+1. Cast ray from eye position through near plane
+2. Calculate intersection with cone defined by far plane
+3. Project intersection back to near plane
+4. Creates natural perspective distortion
+
+**Parameters**:
+- `near_plane = 1.0` (fixed, controls field of view)
+- `far_plane = 5.0` (controls zoom depth intensity)
+- `eye_offset = 0.0` (for VR/stereoscopic, normally zero)
+
+**Visual effect**:
+- Center of screen = closest point on spiral
+- Edges of screen = spiral receding into distance
+- Creates compelling "tunnel" illusion
+
+**GLSL Implementation** (simplified):
+```glsl
+vec2 cone_intersection(vec2 aspect_position) {
+    vec3 cone_origin = vec3(0.0, 0.0, far_plane);
+    vec3 cone_axis = vec3(0.0, 0.0, -1.0);
+    float cone_angle = atan(sqrt(max_width² + 1.0) / (far_plane - near_plane));
+    
+    vec3 ray_origin = vec3(eye_offset, 0.0, 0.0);
+    vec3 ray_vector = normalize(vec3(aspect_position, near_plane));
+    
+    // Solve quadratic for ray-cone intersection...
+    float t = solve_quadratic(a, b, c);
+    vec3 intersection = ray_origin + t * ray_vector;
+    
+    // Project back to near plane
+    return near_plane * intersection.xy / intersection.z;
+}
+```
+
+### UI Controls
+
+**MesmerLoom Tab** in launcher:
+- **Opacity**: Overall spiral visibility/intensity (0-100%)
+- **Blend Mode**: Multiply, Screen, or SoftLight blending
+- **Spiral Type**: Dropdown with 7 spiral types
+- **Spiral Width**: Dropdown with 6 width options (60-360°)
+- **Rotation Speed**: Slider to control rotation speed (0.0-2.0x) - [See details](rotation-speed-control.md)
+- **Arm Color**: Color picker for spiral arms
+- **Gap Color**: Color picker for gaps between arms
+
+**Programmatic Control**:
+```python
+from mesmerglass.mesmerloom.spiral import SpiralDirector
+
+director = SpiralDirector()
+director.set_spiral_type(3)         # Linear (default)
+director.set_spiral_width(60)       # 60 degrees per arm
+director.set_rotation_speed(0.5)    # 0.5x speed (default)
+director.rotate_spiral(2.0)         # Rotate using Trance formula
+director.change_spiral()            # Randomly change type/width
+```
+
+### CLI Testing
+
+Test specific spiral types:
+```bash
+python -m mesmerglass spiral-type --type 1 --width 60 --duration 5
+python -m mesmerglass spiral-type --type 7 --width 180 --duration 10
+```
+
+**Command options**:
+- `--type {1-7}`: Select spiral type (1=log, 2=quad, 3=linear, ...)
+- `--width {360,180,120,90,72,60}`: Spiral width in degrees
+- `--rotation FLOAT`: Rotation speed amount (default: 2.0)
+- `--duration FLOAT`: Test duration in seconds
+- `--intensity FLOAT`: Intensity 0-1
+- `--screen INT`: Target screen index
+
+---
+
 ## Troubleshooting: Secondary Screen Black
 
 If the spiral overlay is black or not rendering on a secondary display:

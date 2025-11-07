@@ -1,0 +1,21 @@
+{
+  "default_bindings": [],
+  "actions": [
+    {
+      "name": "/actions/default/in/head_pose",
+      "type": "pose"
+    }
+  ],
+  "action_sets": [
+    {
+      "name": "/actions/default",
+      "usage": "leftright"
+    }
+  ],
+  "localization": {
+    "en_US": {
+      "/actions/default": "Default",
+      "/actions/default/in/head_pose": "Head Pose"
+    }
+  }
+}

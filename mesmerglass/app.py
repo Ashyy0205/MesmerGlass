@@ -1,4 +1,4 @@
-import sys, threading, traceback, signal, time
+import sys, threading, traceback, signal, time, os
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtCore import qInstallMessageHandler
 from .ui.launcher import Launcher
@@ -12,6 +12,9 @@ _DIAG_INSTALLED = False
 def _install_diagnostics():
     global _DIAG_INSTALLED
     if _DIAG_INSTALLED:
+        return
+    # Allow disabling diagnostics entirely (useful for fragile VR runs)
+    if os.environ.get("MESMERGLASS_NO_DIAG", "0") in ("1", "true", "True", "yes"):
         return
     _DIAG_INSTALLED = True
     log = logging.getLogger("diag")
@@ -51,14 +54,28 @@ def _install_diagnostics():
         try: signal.signal(s, _sig_handler)
         except Exception: pass
     # Watchdog thread logging phases every 5s so we know if UI stalls
-    def _watchdog():
-        while True:
-            log.debug("DIAG heartbeat t=%s", int(time.time()))
-            time.sleep(5)
-    try:
-        threading.Thread(target=_watchdog, daemon=True).start()
-    except Exception:
-        pass
+    # Can be disabled via env or in VR mode by default
+    _disable_watchdog = (
+        os.environ.get("MESMERGLASS_NO_WATCHDOG", "0") in ("1", "true", "True", "yes")
+        or os.environ.get("MESMERGLASS_VR", "0") in ("1",)
+    )
+    if _disable_watchdog:
+        try:
+            log.info("DIAG watchdog disabled (env VR or NO_WATCHDOG)")
+        except Exception:
+            pass
+    else:
+        def _watchdog():
+            while True:
+                try:
+                    log.debug("DIAG heartbeat t=%s", int(time.time()))
+                except Exception:
+                    pass
+                time.sleep(5)
+        try:
+            threading.Thread(target=_watchdog, daemon=True).start()
+        except Exception:
+            pass
 
 
 def run():

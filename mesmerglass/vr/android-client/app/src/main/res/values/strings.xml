@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">MesmerVisor Client</string>
+    <string name="connecting">Connecting to server...</string>
+    <string name="connected">Connected</string>
+    <string name="disconnected">Disconnected</string>
+    <string name="enter_server_ip">Enter server IP address:</string>
+    <string name="default_server_ip">192.168.1.100</string>
+</resources>

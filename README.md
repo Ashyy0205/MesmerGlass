@@ -11,7 +11,8 @@
 - **🔧 Developer Tools** - Built-in debugging and testing tools
 - **🖥️ Multi-Display Support** - Span effects across multiple monitors
 - **🎯 Click-Through Interface** - Non-intrusive overlay that doesn't interfere with other applications
- - **🌀 Spiral Overlay** - GPU-driven animated spiral composited over video with live UI controls (intensity, blend, parameters)
+- **🌀 Spiral Overlay** - GPU-driven animated spiral composited over video with live UI controls (intensity, blend, parameters)
+- **🥽 VR Streaming** - Stream to Oculus Go/Quest with optimized JPEG encoding (quality 25, ~60 Mbps, stable 20 FPS)
 
 ## 🚀 Quick Start
 
@@ -86,8 +87,9 @@ MesmerGlass includes **MesmerIntiface** - a pure Python implementation for direc
 - [🎵 Audio Engine](docs/technical/audio-engine.md) - Audio processing system
 - [🎬 Video Engine](docs/technical/video-engine.md) - Video overlay architecture
 - [📡 Device Control](docs/technical/device-control.md) - Communication protocols
- - [🌀 Spiral Overlay](docs/technical/spiral-overlay.md) - MesmerLoom spiral parameters & rendering
- - [🛠 CLI Reference](docs/cli.md)
+- [🌀 Spiral Overlay](docs/technical/spiral-overlay.md) - MesmerLoom spiral parameters & rendering
+- [🥽 VR Streaming (MesmerVisor)](docs/technical/mesmervisor.md) - VR streaming system with JPEG encoding optimized for Oculus Go/Quest
+- [🛠 CLI Reference](docs/cli.md)
 
 ## 🧪 Testing
 
@@ -142,8 +144,16 @@ MesmerGlass/
 │   │   ├── audio.py               # Audio processing
 │   │   ├── video.py               # Video overlay
 │   │   └── pulse.py               # Device synchronization
+│   ├── mesmervisor/               # VR streaming server (JPEG encoding)
+│   ├── vr/                        # VR integration
+│   │   └── android-client/        # Android VR client source code
 │   ├── ui/                        # User interface
 │   └── tests/                     # Comprehensive test suite
+├── MEDIA/                         # Media assets
+│   ├── vr-client/                 # Built VR APK for distribution
+│   ├── Fonts/
+│   ├── Images/
+│   └── Videos/
 ├── docs/                          # Documentation
 │   ├── user-guide/               # User documentation
 │   ├── development/              # Developer guides  

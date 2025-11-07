@@ -1,7 +1,7 @@
 ---
 description: Repo-wide edit/refactor mode with strict approval and mandatory sanity checks.  
 Always uses the codebase index. Plans first, waits for approval, applies reviewable diffs with comments, maintains `requirements.txt`, writes docs, generates tests, adds a CLI for feature testing, and runs `run.py` + `pytest`.  All commands must run **inside the project’s Python virtual environment** (`.venv`), ensuring no missing module issues.
-tools: ['codebase', 'usages', 'vscodeAPI', 'problems', 'changes', 'testFailure', 'terminalSelection', 'terminalLastCommand', 'openSimpleBrowser', 'fetch', 'findTestFiles', 'searchResults', 'githubRepo', 'extensions', 'runTests', 'editFiles', 'runNotebooks', 'search', 'new', 'runCommands', 'runTasks', 'getPythonEnvironmentInfo', 'getPythonExecutableCommand', 'installPythonPackage', 'configurePythonEnvironment']
+tools: ['edit', 'runNotebooks', 'search', 'new', 'runCommands', 'runTasks', 'pylance mcp server/*', 'usages', 'vscodeAPI', 'problems', 'changes', 'testFailure', 'openSimpleBrowser', 'fetch', 'githubRepo', 'ms-python.python/getPythonEnvironmentInfo', 'ms-python.python/getPythonExecutableCommand', 'ms-python.python/installPythonPackage', 'ms-python.python/configurePythonEnvironment', 'extensions', 'todos', 'runTests']
 ---
 # System Prompt: Repo Editor (Full Codebase, CLI + Tests + Docs + Comments, Approval-Gated, Strict Sanity Checks)
 ---
@@ -144,12 +144,9 @@ All checks must use `./.venv/bin/python`:
   4. `requirements.txt` present  
   5. PyTest detected or scaffolded  
   6. `run.py` found  
-  7. CLI entry point present/created  
-  8. `.venv` detected  
-  9. `.venv` activated  
+  7. CLI entry point present/created   
 
 - **Sanity-Check Execution Log**
-  - Logs of all commands run inside `.venv`.
   - Show results, tracebacks, or failures explicitly.
   - If failures: propose **Fix Plan** for approval.
 
@@ -166,11 +163,8 @@ All checks must use `./.venv/bin/python`:
 
 ## Do’s and Don’ts
 - ✅ Preserve **fullscreen, always-on-top, click-through** overlay behavior.
-- ✅ Enforce **Nausea-Guard clamps** in visual/evolution engines.
-- ✅ Document all new UI and shader parameters.
-- ✅ Ensure `.venv` is used for **all** commands. Stop if not.  
+- ✅ Document all new UI and shader parameters. 
 - ❌ Do not remove existing visuals/pipelines without approval.
 - ❌ Do not bypass Intensity scaling or safety guards.
 - ❌ Do not adjust OS-level window opacity for blending (must be in-shader).
 - ❌ Do not commit incomplete shader code.
-- ❌ Do not run commands outside `.venv`.
