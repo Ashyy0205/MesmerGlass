@@ -1,0 +1,82 @@
+{
+  "name": "Short Demo Session",
+  "description": "15-minute demonstration session with induction, deepening, and wakener",
+  "version": "1.0",
+  "author": "MesmerGlass Examples",
+  "loop_mode": "once",
+  "cues": [
+    {
+      "name": "Induction",
+      "duration_seconds": 300,
+      "playback_pool": [
+        {
+          "playback": "playbacks/example_deep_red.json",
+          "weight": 1.0
+        }
+      ],
+      "selection_mode": "on_cue_start",
+      "transition_in": {
+        "type": "fade",
+        "duration_ms": 2000
+      },
+      "transition_out": {
+        "type": "fade",
+        "duration_ms": 1500
+      },
+      "audio_tracks": []
+    },
+    {
+      "name": "Deepener",
+      "duration_seconds": 600,
+      "playback_pool": [
+        {
+          "playback": "playbacks/example_deep_red.json",
+          "weight": 2.0,
+          "min_cycles": 3,
+          "max_cycles": 8
+        },
+        {
+          "playback": "playbacks/example_fast_blue.json",
+          "weight": 1.0,
+          "min_cycles": 2,
+          "max_cycles": 6
+        }
+      ],
+      "selection_mode": "on_media_cycle",
+      "transition_in": {
+        "type": "fade",
+        "duration_ms": 1000
+      },
+      "transition_out": {
+        "type": "fade",
+        "duration_ms": 1500
+      },
+      "audio_tracks": []
+    },
+    {
+      "name": "Wakener",
+      "duration_seconds": 180,
+      "playback_pool": [
+        {
+          "playback": "playbacks/example_wakener.json",
+          "weight": 1.0
+        }
+      ],
+      "selection_mode": "on_cue_start",
+      "transition_in": {
+        "type": "fade",
+        "duration_ms": 1500
+      },
+      "transition_out": {
+        "type": "fade",
+        "duration_ms": 3000
+      },
+      "audio_tracks": []
+    }
+  ],
+  "metadata": {
+    "difficulty": "beginner",
+    "tags": ["induction", "deepening", "demo"],
+    "total_minutes": 18
+  }
+}
