@@ -25,13 +25,14 @@ logger = logging.getLogger(__name__)
 class DiscoveryService:
     """UDP discovery service for automatic VR headset detection"""
     
-    def __init__(self, discovery_port: int = 5556, streaming_port: int = 5555):
+    def __init__(self, discovery_port: int = 5556, streaming_port: int = 5555, manual_devices: list = None):
         """
         Initialize discovery service
         
         Args:
             discovery_port: UDP port for discovery broadcasts (5556 - original working port)
             streaming_port: TCP port for streaming (5555 - original working port)
+            manual_devices: List of manually configured devices [{"ip": str, "name": str}]
         """
         self.discovery_port = discovery_port
         self.streaming_port = streaming_port
@@ -39,19 +40,57 @@ class DiscoveryService:
         self.running = False
         self.thread: Optional[threading.Thread] = None
         self.discovered_devices: dict = {}  # {ip: {"name": str, "ip": str, "last_seen": float}}
+        self.manual_device_ips: set = set()  # Track which devices are manual (never expire)
+        self._devices_lock = threading.Lock()  # CRITICAL: Protect discovered_devices from race conditions
+        
+        # Add manually configured devices (for when broadcast discovery fails)
+        if manual_devices:
+            with self._devices_lock:
+                for device in manual_devices:
+                    ip = device.get("ip")
+                    name = device.get("name", "Manual Device")
+                    self.discovered_devices[ip] = {
+                        "name": name,
+                        "ip": ip,
+                        "last_seen": time.time(),
+                        "manual": True,  # Flag to prevent expiration
+                        "type": "vr"  # Add type field
+                    }
+                    self.manual_device_ips.add(ip)
+                    logger.info(f"📱 Manually added VR device: {name} at {ip}")
     
     @property
     def discovered_clients(self):
         """Get list of discovered clients in launcher-compatible format"""
-        # Remove stale devices (not seen in last 10 seconds)
-        current_time = time.time()
-        stale_ips = [ip for ip, info in self.discovered_devices.items() 
-                     if current_time - info.get("last_seen", 0) > 10]
-        for ip in stale_ips:
-            del self.discovered_devices[ip]
-        
-        # Return list of client info dicts
-        return list(self.discovered_devices.values())
+        with self._devices_lock:
+            # Remove stale devices (not seen in last 30 seconds), but NEVER remove manual devices
+            current_time = time.time()
+            
+            # DEBUG: Log state before filtering
+            logger.info(f"🔍 discovered_clients property called:")
+            logger.info(f"   Current time: {current_time}")
+            logger.info(f"   discovered_devices dict: {len(self.discovered_devices)} entries")
+            for ip, info in self.discovered_devices.items():
+                age = current_time - info.get("last_seen", 0)
+                logger.info(f"     → {ip}: name={info.get('name')}, last_seen={info.get('last_seen')}, age={age:.1f}s, manual={info.get('manual', False)}")
+            
+            stale_ips = [ip for ip, info in self.discovered_devices.items() 
+                         if not info.get("manual", False) and current_time - info.get("last_seen", 0) > 30]
+            
+            logger.info(f"   Stale IPs to remove: {stale_ips}")
+            
+            for ip in stale_ips:
+                del self.discovered_devices[ip]
+            
+            # Update last_seen for manual devices to keep them fresh
+            for ip in self.manual_device_ips:
+                if ip in self.discovered_devices:
+                    self.discovered_devices[ip]["last_seen"] = current_time
+            
+            # Return list of client info dicts
+            result = list(self.discovered_devices.values())
+            logger.info(f"   Returning {len(result)} clients")
+            return result
     
     def start(self):
         """Start discovery service"""
@@ -79,10 +118,15 @@ class DiscoveryService:
             # Create UDP socket
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            
+            # Enable broadcast reception
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            
             self.socket.bind(('', self.discovery_port))
             self.socket.settimeout(1.0)
             
-            logger.info("📡 Listening for VR headsets...")
+            logger.info(f"📡 Listening for VR headsets on 0.0.0.0:{self.discovery_port}...")
+            logger.info(f"📡 Broadcast reception enabled, ready for VR_HEADSET_HELLO packets")
             
             # Heartbeat counter for debugging
             heartbeat_counter = 0
@@ -92,11 +136,12 @@ class DiscoveryService:
                     # Log heartbeat every 30 iterations (~30 seconds with 1s timeout)
                     heartbeat_counter += 1
                     if heartbeat_counter % 30 == 0:
-                        logger.info(f"💓 Discovery service alive, {len(self.discovered_devices)} devices known")
+                        with self._devices_lock:
+                            logger.info(f"💓 Discovery service alive, {len(self.discovered_devices)} devices known")
                     
                     data, addr = self.socket.recvfrom(1024)
                     message = data.decode('utf-8')
-                    logger.debug(f"[Discovery] Received: {message[:50]} from {addr}")
+                    logger.info(f"📥 Received UDP packet: {message[:80]} from {addr[0]}:{addr[1]}")
                     
                     if message.startswith("VR_HEADSET_HELLO"):
                         # Parse message: "VR_HEADSET_HELLO:device_name"
@@ -104,20 +149,26 @@ class DiscoveryService:
                         device_name = parts[1] if len(parts) > 1 else "Unknown Device"
                         client_ip = addr[0]
                         
-                        # Store or update device info
-                        if client_ip not in self.discovered_devices:
-                            logger.info(f"✅ Discovered VR headset: {device_name} at {client_ip}")
-                        
-                        self.discovered_devices[client_ip] = {
-                            "name": device_name,
-                            "ip": client_ip,
-                            "last_seen": time.time()
-                        }
+                        # Store or update device info (THREAD-SAFE)
+                        with self._devices_lock:
+                            if client_ip not in self.discovered_devices:
+                                logger.info(f"✅ NEW VR headset discovered: {device_name} at {client_ip}")
+                            else:
+                                logger.info(f"🔄 VR headset refresh: {device_name} at {client_ip}")
+                            
+                            self.discovered_devices[client_ip] = {
+                                "name": device_name,
+                                "ip": client_ip,
+                                "last_seen": time.time(),
+                                "type": "vr"  # CRITICAL: Add type field for display filtering
+                            }
                         
                         # Send back server info
                         response = f"VR_SERVER_INFO:{self.streaming_port}"
                         self.socket.sendto(response.encode('utf-8'), addr)
-                        logger.debug(f"   → Sent connection info to {client_ip}")
+                        logger.info(f"📤 Sent VR_SERVER_INFO:{self.streaming_port} to {client_ip}:{addr[1]}")
+                    else:
+                        logger.warning(f"❓ Unknown UDP message: {message[:80]} from {addr[0]}")
                 
                 except socket.timeout:
                     continue

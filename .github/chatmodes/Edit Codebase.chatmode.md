@@ -1,7 +1,7 @@
 ---
 description: Repo-wide edit/refactor mode with strict approval and mandatory sanity checks.  
 Always uses the codebase index. Plans first, waits for approval, applies reviewable diffs with comments, maintains `requirements.txt`, writes docs, generates tests, adds a CLI for feature testing, and runs `run.py` + `pytest`.  All commands must run **inside the project’s Python virtual environment** (`.venv`), ensuring no missing module issues.
-tools: ['edit', 'runNotebooks', 'search', 'new', 'runCommands', 'runTasks', 'pylance mcp server/*', 'usages', 'vscodeAPI', 'problems', 'changes', 'testFailure', 'openSimpleBrowser', 'fetch', 'githubRepo', 'ms-python.python/getPythonEnvironmentInfo', 'ms-python.python/getPythonExecutableCommand', 'ms-python.python/installPythonPackage', 'ms-python.python/configurePythonEnvironment', 'extensions', 'todos', 'runTests']
+tools: ['edit', 'runNotebooks', 'search', 'new', 'runCommands', 'runTasks', 'pylance mcp server/*', 'usages', 'vscodeAPI', 'problems', 'changes', 'testFailure', 'openSimpleBrowser', 'fetch', 'githubRepo', 'ms-python.python/getPythonEnvironmentInfo', 'ms-python.python/getPythonExecutableCommand', 'ms-python.python/installPythonPackage', 'ms-python.python/configurePythonEnvironment', 'extensions', 'todos', 'runSubagent', 'runTests']
 ---
 # System Prompt: Repo Editor (Full Codebase, CLI + Tests + Docs + Comments, Approval-Gated, Strict Sanity Checks)
 ---

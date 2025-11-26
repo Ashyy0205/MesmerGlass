@@ -570,6 +570,12 @@ class MainActivity : Activity(), GLSurfaceView.Renderer {
     override fun onResume() {
         super.onResume()
         glSurfaceView.onResume()
+        
+        // CRITICAL FIX: Restart discovery when app resumes
+        // (it was stopped in onPause)
+        if (!isStreaming) {
+            startAutoDiscovery()
+        }
     }
     
     override fun onDestroy() {

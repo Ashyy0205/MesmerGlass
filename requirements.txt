@@ -5,6 +5,7 @@ websockets
 numpy
 Pillow
 av>=10.0.0             # PyAV for GPU-accelerated video encoding (NVENC)
+mutagen>=1.47.0         # Audio metadata helper for duration estimates
 
 # Real device control dependencies
 bleak>=0.21.0          # Bluetooth Low Energy support
@@ -18,4 +19,5 @@ pytest-qt
 
 PyOpenGL>=3.1.6
 PyOpenGL_accelerate>=3.1.6
+psutil>=5.9
 

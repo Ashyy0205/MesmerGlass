@@ -1,137 +1,118 @@
-"""Performance metrics UI page.
+"""Performance monitoring page used by the Qt UI and tests.
 
-Shows FPS / frame timing, I/O stall stats, and per-audio track memory usage.
-If no frames have been recorded yet (e.g. video not started) we still display
-0.0 for FPS and show a status hint so the user understands why averages are
-blank.
+The page is intentionally lightweight so unit tests can instantiate it with
+an Audio2 stub without launching the full application window stack.
 """
 from __future__ import annotations
 
-from PyQt6.QtCore import QTimer
-from PyQt6.QtWidgets import QWidget, QVBoxLayout, QLabel, QGroupBox, QFormLayout
+from typing import Optional, Protocol
 
-from ...engine.perf import perf_metrics
+from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtWidgets import QLabel, QVBoxLayout, QWidget
 
-
-def _group(title: str) -> QGroupBox:
-    g = QGroupBox(title)
-    g.setContentsMargins(8, 6, 8, 6)
-    return g
+from mesmerglass.engine.audio import Audio2
+from mesmerglass.engine.perf import PerformanceSnapshot, perf_metrics
 
 
-def _fmt_bytes(n: int | None) -> str:
-    if n is None:
-        return "(none)"
-    if n < 1024:
-        return f"{n} B"
-    kb = n / 1024.0
-    if kb < 1024:
-        return f"{kb:.1f} KB"
-    mb = kb / 1024.0
-    return f"{mb:.2f} MB"
+class _AudioLike(Protocol):
+    def memory_usage_bytes(self) -> dict:
+        ...
 
 
 class PerformancePage(QWidget):
-    TARGET_FPS = 30.0          # Hard-coded thresholds (per request)
-    WARN_FRAME_MS = 60.0
-    WARN_STALL_MS = 120.0
+    """Compact widget that surfaces perf + audio memory stats."""
 
-    def __init__(self, audio_engine, parent=None):
+    def __init__(
+        self,
+        audio: Optional[_AudioLike] = None,
+        *,
+        parent: Optional[QWidget] = None,
+        refresh_interval_ms: int = 250,
+    ) -> None:
         super().__init__(parent)
-        self.audio = audio_engine
-        # Apply thresholds to shared metrics backend
-        perf_metrics.target_fps = self.TARGET_FPS
-        perf_metrics.warn_frame_ms = self.WARN_FRAME_MS
-        perf_metrics.warn_stall_ms = self.WARN_STALL_MS
-        self._build()
+        self._audio: _AudioLike = audio or Audio2()
         self._timer = QTimer(self)
-        self._timer.timeout.connect(self._refresh)
-        self._timer.start(250)  # 4 Hz refresh
+        self._timer.setInterval(refresh_interval_ms)
+        self._timer.timeout.connect(self._refresh_all)
+        self.destroyed.connect(lambda *_: self._timer.stop())
 
-    def _build(self):
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(10)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
 
-        # Frame statistics
-        grp_stats = _group("Frame Stats")
-        stats_form = QFormLayout(grp_stats)
-        stats_form.setContentsMargins(10, 6, 10, 6)
-        stats_form.setSpacing(4)
-        self.lab_fps = QLabel("0.0")
-        self.lab_avg = QLabel("0.0")
-        self.lab_max = QLabel("0.0")
-        self.lab_stalls = QLabel("0")
-        self.lab_last_stall = QLabel("—")
-        self.lab_frame_hint = QLabel("No frames yet (video idle)")
-        self.lab_frame_hint.setStyleSheet("color:#888;")
-        stats_form.addRow("FPS", self.lab_fps)
-        stats_form.addRow("Avg frame (ms)", self.lab_avg)
-        stats_form.addRow("Max frame (ms)", self.lab_max)
-        stats_form.addRow("Stall count", self.lab_stalls)
-        stats_form.addRow("Last stall (ms)", self.lab_last_stall)
-        stats_form.addRow("Status", self.lab_frame_hint)
-        layout.addWidget(grp_stats)
+        self.lab_heading = QLabel("📊 Performance Snapshot")
+        self.lab_heading.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        layout.addWidget(self.lab_heading)
 
-        # Threshold summary (fixed values)
-        grp_thr = _group("Thresholds (Fixed)")
-        thr_form = QFormLayout(grp_thr)
-        thr_form.setContentsMargins(10, 6, 10, 6)
-        thr_form.setSpacing(4)
-        thr_form.addRow("Target FPS", QLabel(f"{self.TARGET_FPS:.0f}"))
-        thr_form.addRow("Frame warn (ms)", QLabel(f"{self.WARN_FRAME_MS:.0f}"))
-        thr_form.addRow("Stall warn (ms)", QLabel(f"{self.WARN_STALL_MS:.0f}"))
-        layout.addWidget(grp_thr)
+        self.lab_fps = QLabel("FPS: --")
+        self.lab_frame = QLabel("Frame avg: -- ms | max: -- ms")
+        self.lab_stall = QLabel("I/O stalls: --")
+        self.lab_warn = QLabel("Warnings: none")
 
-        # Audio memory section
-        grp_mem = _group("Audio Memory")
-        mem_form = QFormLayout(grp_mem)
-        mem_form.setContentsMargins(10, 6, 10, 6)
-        mem_form.setSpacing(4)
-        self.lab_a1 = QLabel("(none)")
-        self.lab_a2 = QLabel("(none)")
-        mem_form.addRow("Primary", self.lab_a1)
-        mem_form.addRow("Secondary", self.lab_a2)
-        layout.addWidget(grp_mem)
+        self.lab_a1 = QLabel("Audio 1: --")
+        self.lab_a2 = QLabel("Audio 2: --")
 
-        # Warnings list
-        grp_warn = _group("Warnings")
-        warn_form = QFormLayout(grp_warn)
-        warn_form.setContentsMargins(10, 6, 10, 6)
-        warn_form.setSpacing(4)
-        self.lab_warn = QLabel("(none)")
-        self.lab_warn.setWordWrap(True)
-        warn_form.addRow("Active", self.lab_warn)
-        layout.addWidget(grp_warn)
+        for lab in (
+            self.lab_fps,
+            self.lab_frame,
+            self.lab_stall,
+            self.lab_warn,
+            self.lab_a1,
+            self.lab_a2,
+        ):
+            lab.setAlignment(Qt.AlignmentFlag.AlignLeft)
+            layout.addWidget(lab)
 
-        layout.addStretch(1)
+        self._timer.start()
+        self._refresh_all()
 
-    def _refresh(self):
-        snap = perf_metrics.snapshot()
-        # Always show numeric values (0.0) even if no frames yet for clarity
-        self.lab_fps.setText(f"{snap.fps:.1f}")
-        if snap.avg_frame_ms is None:
-            self.lab_avg.setText("0.0")
-            self.lab_max.setText("0.0")
+    # ------------------------------------------------------------------
+    def _refresh_all(self) -> None:
+        self._refresh_perf_section(perf_metrics.snapshot())
+        self._refresh_audio_section()
+
+    def _refresh_perf_section(self, snap: PerformanceSnapshot) -> None:
+        self.lab_fps.setText(f"FPS: {snap.fps:.1f}" if snap.fps else "FPS: --")
+        if snap.avg_frame_ms is not None and snap.max_frame_ms is not None:
+            self.lab_frame.setText(
+                f"Frame avg: {snap.avg_frame_ms:.1f} ms | max: {snap.max_frame_ms:.1f} ms"
+            )
         else:
-            self.lab_avg.setText(f"{snap.avg_frame_ms:.1f}")
-            self.lab_max.setText(f"{snap.max_frame_ms:.1f}" if snap.max_frame_ms is not None else "0.0")
-        self.lab_stalls.setText(str(snap.stall_count))
-        self.lab_last_stall.setText("—" if snap.last_stall_ms is None else f"{snap.last_stall_ms:.0f}")
-        self.lab_warn.setText("(none)" if not snap.warnings else "\n".join(snap.warnings))
+            self.lab_frame.setText("Frame avg: -- ms | max: -- ms")
 
-        # Hide frame hint after first real frame (avg becomes non-None)
-        if snap.avg_frame_ms is not None and self.lab_frame_hint.isVisible():
-            self.lab_frame_hint.hide()
+        stall_text = "I/O stalls: --"
+        if snap.stall_count:
+            last = f", last {snap.last_stall_ms:.0f} ms" if snap.last_stall_ms else ""
+            stall_text = f"I/O stalls: {snap.stall_count}{last}"
+        self.lab_stall.setText(stall_text)
 
-        # Audio memory (best-effort; handle early init gracefully)
+        self.lab_warn.setText(
+            "Warnings: " + ("; ".join(snap.warnings) if snap.warnings else "none")
+        )
+
+    def _refresh_audio_section(self) -> None:
+        stats = None
         try:
-            mem = self.audio.memory_usage_bytes()
+            stats = self._audio.memory_usage_bytes()
         except Exception:
-            mem = {"audio1_bytes": None, "audio2_bytes": None, "audio1_streaming": False}
-        a1 = "(streaming)" if mem.get("audio1_streaming") else _fmt_bytes(mem.get("audio1_bytes"))
-        a2 = _fmt_bytes(mem.get("audio2_bytes"))
-        self.lab_a1.setText(a1)
-        self.lab_a2.setText(a2)
+            stats = None
 
-__all__ = ["PerformancePage"]
+        if not stats:
+            self.lab_a1.setText("Audio 1: unavailable")
+            self.lab_a2.setText("Audio 2: unavailable")
+            return
+
+        audio1 = self._format_bytes(stats.get("audio1_bytes"))
+        audio2 = self._format_bytes(stats.get("audio2_bytes"))
+        streaming = " (streaming)" if stats.get("audio1_streaming") else ""
+        self.lab_a1.setText(f"Audio 1: {audio1}{streaming}")
+        self.lab_a2.setText(f"Audio 2: {audio2}")
+
+    @staticmethod
+    def _format_bytes(value: Optional[int]) -> str:
+        if value is None:
+            return "--"
+        kb = value / 1024.0
+        if kb >= 1024.0:
+            return f"{kb / 1024.0:.1f} MB"
+        return f"{kb:.1f} KB"

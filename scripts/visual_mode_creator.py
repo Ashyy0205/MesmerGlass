@@ -1,14 +1,14 @@
 """
-Visual Mode Creator
+Visual Playback Creator
 
-Create and save custom visual modes with all settings:
+Create and save custom visual playbacks with all settings:
 - Spiral parameters (type, speed, opacity, colors)
 - Media settings (images/videos/both, cycling times)
 - Text settings (enabled, effects, opacity)
 - Zoom settings (rate, mode)
 - Background opacity
 
-Modes are saved to text files and can be loaded into the main application.
+Playbacks are saved to text files and can be loaded into the main application.
 """
 
 import sys
@@ -67,7 +67,7 @@ import numpy as np
 
 
 class VisualModeCreator(QMainWindow):
-    """Visual Mode Creator - design and save custom visual modes."""
+    """Visual Playback Creator - design and save custom visual playbacks."""
     
     def __init__(self):
         super().__init__()
@@ -408,12 +408,12 @@ class VisualModeCreator(QMainWindow):
         # Start animation timer
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_spiral)
-        self.timer.start(16)  # ~60 FPS
+        self.timer.start(33)  # 30 FPS (matches editor & launcher)
         
         # Force compositor rendering and text updates
         self.render_timer = QTimer()
         self.render_timer.timeout.connect(self.update_render)
-        self.render_timer.start(16)
+        self.render_timer.start(33)
         
         # Load test images and initialize text system after compositor initialized
         QTimer.singleShot(500, self.initialize_text_system)
@@ -810,11 +810,11 @@ class VisualModeCreator(QMainWindow):
 
     def update_spiral(self):
         """Update spiral animation using standard rotation method."""
-        # Use standard spiral rotation - the method now handles RPM calculation internally
-        self.director.rotate_spiral(4.0)  # amount is ignored in new RPM mode
+        # Update spiral parameters (rotation handled internally by update())
+        self.director.update(1/30.0)
         
-        # Update other spiral parameters (opacity, bar width, etc.)
-        self.director.update(1/60.0)
+        # Cache uniforms to prevent compositor from calling update() again
+        self.compositor._uniforms_cache = self.director.export_uniforms()
         
         # Debug log rotation values every 120 frames
         if not hasattr(self, '_debug_frame_count'):
@@ -822,7 +822,7 @@ class VisualModeCreator(QMainWindow):
         self._debug_frame_count += 1
         
         if self._debug_frame_count % 120 == 0:
-            uniforms = self.director.export_uniforms()
+            uniforms = self.compositor._uniforms_cache
             print(f"[VMC rotation_debug] time={uniforms.get('time', 0):.6f}")
             print(f"[VMC rotation_debug] rotation_speed={uniforms.get('rotation_speed', 0)}")
             print(f"[VMC rotation_debug] uEffectiveSpeed={uniforms.get('uEffectiveSpeed', 0)}")
@@ -1039,7 +1039,7 @@ class VisualModeCreator(QMainWindow):
             return
         
         # Open file dialog to choose save location
-        default_dir = Path(__file__).parent.parent / "mesmerglass" / "modes"
+        default_dir = Path(__file__).parent.parent / "mesmerglass" / "playbacks"
         default_dir.mkdir(parents=True, exist_ok=True)
         
         default_filename = f"{mode_name.replace(' ', '_').lower()}.json"
@@ -1088,8 +1088,9 @@ class VisualModeCreator(QMainWindow):
                 # Store RPM (not UI x-value) so Launcher applies exactly the same speed
                 "rotation_speed": export_rpm,
                 "opacity": self.opacity_slider.value() / 100.0,
-                "reverse": self.spiral_reverse_check.isChecked()
-                # NOTE: arm_color and gap_color NOT exported - controlled globally in launcher
+                "reverse": self.spiral_reverse_check.isChecked(),
+                "arm_color": [round(c, 4) for c in self.arm_color],
+                "gap_color": [round(c, 4) for c in self.gap_color]
             },
             
             "media": {
@@ -1108,7 +1109,8 @@ class VisualModeCreator(QMainWindow):
                 "opacity": self.text_opacity_slider.value() / 100.0,
                 "use_theme_bank": True,  # Always use ThemeBank for now
                 "library": [],  # Empty - using ThemeBank
-                "sync_with_media": True  # CENTERED_SYNC always syncs with media
+                "sync_with_media": True,  # CENTERED_SYNC always syncs with media
+                "manual_cycle_speed": self.media_speed_slider.value()
             },
             
             "zoom": {

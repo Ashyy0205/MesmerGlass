@@ -1,0 +1,29 @@
+{
+  "name": "Test Cuelist",
+  "description": "Simple test cuelist for CLI testing",
+  "version": "1.0",
+  "author": "MesmerGlass Test Suite",
+  "loop_mode": "once",
+  "cues": [
+    {
+      "name": "Test Cue 1",
+      "duration_seconds": 5.0,
+      "playback_pool": [
+        {
+          "playback": "test_playback.json",
+          "weight": 1.0
+        }
+      ],
+      "selection_mode": "on_cue_start",
+      "transition_in": {
+        "type": "none",
+        "duration_ms": 0
+      },
+      "transition_out": {
+        "type": "none",
+        "duration_ms": 0
+      },
+      "audio_tracks": []
+    }
+  ]
+}

@@ -173,6 +173,20 @@ Tests verify:
 - Auto-reset at 5.0x threshold
 - Sync with rotation speed
 
+### Text Carousel Timing Guardrails
+
+Spiral overlays feel wrong if the wallpaper carousel scrolls at the exact same cadence as the background media. Users described the effect as "flickering". To keep the hypnotic drift smooth we now force the wallpaper carousel (aka **SplitMode.SUBTEXT**) to always run on manual timing:
+
+1. Switching to the carousel mode automatically unchecks and disables the "Sync text with media" checkbox.
+2. The manual speed slider always stays enabled so operators can choose a cadence that complements the current cue.
+3. Returning to centered text restores the operator's previous sync preference (stored in `_preferred_text_sync`).
+
+Manual QA checklist (Playback Editor → Text Settings):
+- Start in "Centered" mode, toggle **Sync** on, and confirm the manual slider is disabled.
+- Switch to "Scrolling Carousel"; **Sync** becomes disabled/unchecked and the slider turns back on.
+- Drag the slider and verify that `TextDirector.configure_sync(sync=False, frames=X)` fires (use the `--log-level DEBUG` CLI flag to observe `TextDirector`).
+- Switch back to centered; the **Sync** box re-enables using the stored preference and the slider disables again.
+
 ## Future Enhancements
 
 ### Configurable Reset Threshold

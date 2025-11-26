@@ -1,41 +1,39 @@
-# Deprecation: `run.py`
+# `run.py` Status (Updated November 2025)
 
-`run.py` has been replaced by the unified argparse CLI exposed via:
+We originally planned to remove `run.py` after finishing the argparse CLI. That plan changed once the Phase 7 MainApplication replaced the legacy launcher: the simplest way to launch the new UI is again `python run.py`.
+
+## Current Behavior
+
+- `python run.py` imports `mesmerglass.app.run()` and launches the MainApplication window.
+- `python -m mesmerglass run` uses the same code path but keeps the CLI parser available for additional flags.
+- Both entry points share logging, diagnostics, and environment flags (e.g., `MESMERGLASS_VR`).
+
+## When to Use Which
+
+| Scenario | Recommended command |
+|----------|---------------------|
+| End-user shortcut / double-click | `python run.py` |
+| Need CLI flags (`--vr`, logging) | `python -m mesmerglass run --vr --log-level DEBUG` |
+| Automation / CI tasks | `python -m mesmerglass <subcommand>` |
+
+## Relationship to Other Subcommands
+
+The argparse CLI remains the home for automation-friendly tasks (`selftest`, `pulse`, `server`, `test-run`, `state`, `spiral-measure`, etc.). `run.py` is deliberately tiny so packaged builds and Windows shortcuts can launch MesmerGlass without remembering CLI syntax.
+
+## Migration Guidance
+
+- Scripts that already use `python -m mesmerglass run` can stay that way—no change needed.
+- Shell shortcuts or `.lnk` files that pointed to `python run.py` can keep doing so; there is no longer a deprecation warning.
+- If you previously removed `run.py` from documentation, reintroduce it as “GUI shortcut” while keeping the CLI reference for advanced scenarios.
+
+## Testing
+
+To verify the shim:
 
 ```
-python -m mesmerglass <subcommand>
+python run.py            # Opens the GUI
+python -m mesmerglass run
+python -m mesmerglass selftest
 ```
 
-## Timeline
-- Current release: `python run.py` still works but emits a `DeprecationWarning`.
-- Future minor release: the shim will be removed.
-
-## Mapping
-| Old Command                       | New Command                                      |
-|----------------------------------|--------------------------------------------------|
-| `python run.py`                  | `python -m mesmerglass run`                      |
-| `python run.py gui`              | `python -m mesmerglass run`                      |
-| `python run.py server -p 12345`  | `python -m mesmerglass server --port 12345`      |
-| `python run.py test -i .5 -d 500`| `python -m mesmerglass pulse --level .5 --duration 500` |
-| *(tests)* `python run_tests.py`  | `python -m mesmerglass test-run`                 |
-
-## Rationale
-Maintaining two parallel CLIs (`run.py` and the package CLI) led to duplicated code and documentation drift. Consolidating on a single entry point:
-- Removes redundant argument parsing & logging init
-- Simplifies docs and onboarding
-- Enables new subcommands (`test-run`) without legacy coupling
-
-## What to Change
-- Update scripts / shortcuts to call `python -m mesmerglass run`.
-- Replace any CI references to `run_tests.py` with `python -m mesmerglass test-run`.
-
-## Testing the Shim
-Running `python run.py` now logs a deprecation warning and delegates to the new CLI. Behavior should remain identical aside from the warning.
-
-If you experience issues with the CLI transition, open an issue with:
-- Exact command used
-- Python version / OS
-- Log output (with `--log-level DEBUG` if possible)
-
----
-Thanks for migrating! This cleanup keeps the project lean and easier to maintain.
+All three should share the same version banner and logging format. If something diverges, capture the command, platform, and logs (use `--log-level DEBUG`) and open an issue.

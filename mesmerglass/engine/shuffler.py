@@ -169,6 +169,63 @@ class Shuffler:
         self.total_weight = self.initial_weight * self.item_count
         self.history = []
     
+    def peek_next(self, count: int = 15) -> List[int]:
+        """
+        Predict next N items WITHOUT modifying shuffler state.
+        
+        Simulates the next 'count' selections by copying internal state,
+        running selections on the copy, then returning the indices.
+        
+        Args:
+            count: Number of items to peek ahead
+            
+        Returns:
+            List of predicted indices (may contain duplicates if count > item_count)
+        """
+        import copy
+        
+        # Create temporary copy of shuffler state
+        temp_weights = self.weights.copy()
+        temp_total = self.total_weight
+        temp_history = self.history.copy()
+        
+        predicted = []
+        
+        for _ in range(count):
+            if temp_total <= 0:
+                break  # No more items to select
+            
+            # Weighted random selection (same logic as next())
+            value = random.randint(0, temp_total - 1)
+            selected_index = None
+            
+            for i in range(self.item_count):
+                if value < temp_weights[i]:
+                    selected_index = i
+                    break
+                value -= temp_weights[i]
+            
+            if selected_index is None:
+                break  # Fallback
+            
+            predicted.append(selected_index)
+            
+            # Update temporary state (same logic as _track_selection)
+            temp_history.append(selected_index)
+            
+            # Decrease weight
+            if temp_weights[selected_index] > 0:
+                temp_weights[selected_index] -= 1
+                temp_total -= 1
+            
+            # If history too long, restore oldest
+            if len(temp_history) > self.history_size:
+                oldest = temp_history.pop(0)
+                temp_weights[oldest] += 1
+                temp_total += 1
+        
+        return predicted
+    
     def __repr__(self) -> str:
         return (
             f"Shuffler(item_count={self.item_count}, "

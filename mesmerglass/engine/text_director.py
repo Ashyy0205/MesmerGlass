@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import logging
 import random
-from typing import Optional, Callable, List
+import math
+import time
+from typing import Optional, Callable, List, Any
 from dataclasses import dataclass
 
 try:
@@ -49,7 +51,8 @@ class TextDirector:
         self,
         text_renderer=None,
         compositor=None,
-        on_text_change: Optional[Callable[[str, Optional['SplitMode']], None]] = None
+        on_text_change: Optional[Callable[[str, Optional['SplitMode']], None]] = None,
+        time_provider: Optional[Callable[[], float]] = None,
     ):
         """Initialize text director.
         
@@ -62,6 +65,9 @@ class TextDirector:
         self.compositor = compositor
         self._on_text_change = on_text_change
         
+        # Multi-display support: Track secondary compositors for text broadcasting
+        self._secondary_compositors: List[Any] = []
+        
         # Text library
         self._text_entries: List[TextEntry] = []
         self._current_text = ""
@@ -72,6 +78,10 @@ class TextDirector:
         self._enabled = False  # Whether to render text
         self._frame_counter = 0
         self._frames_per_text = 120  # 2 seconds at 60fps (how long to show each text)
+        self._manual_frames_per_text = self._frames_per_text
+        self._sync_with_media = True
+        self._default_target_seconds = self._frames_per_text / 60.0
+        self._manual_target_seconds = self._manual_frames_per_text / 60.0
         
         # Scrolling animation state (for SUBTEXT mode)
         self._scroll_offset = 0.0
@@ -79,8 +89,144 @@ class TextDirector:
         
         self.logger = logging.getLogger(__name__)
         self.logger.info("[TextDirector] Initialized (independent text system)")
+
+        # Global opacity multiplier (matches compositor default)
+        self._text_opacity = 1.0
+        if self.compositor:
+            self._apply_opacity_to_compositor(self.compositor)
+
+        # Timing helpers use a monotonic clock so slider timing is framerate independent
+        self._time_provider: Callable[[], float] = time_provider or time.monotonic
+        self._last_update_time: Optional[float] = None
+        self._elapsed_time_s: float = 0.0
+        self._recompute_target_seconds()
+        self._render_log_interval = 5.0
+        self._last_render_log_ts = 0.0
+        self._last_render_log_mode: Optional['SplitMode'] = None
+    
+    # ===== Multi-Display Support =====
+    
+    def set_secondary_compositors(self, compositors: List[Any]) -> None:
+        """Set secondary compositors and immediately mirror current text state."""
+        self._secondary_compositors = [comp for comp in (compositors or []) if comp]
+
+        for comp in self._secondary_compositors:
+            try:
+                if hasattr(comp, "text_director"):
+                    comp.text_director = self
+                if hasattr(comp, "clear_text_textures"):
+                    comp.clear_text_textures()
+                # Ensure opacity matches when mirroring text to new outputs
+                self._apply_opacity_to_compositor(comp)
+            except Exception as exc:
+                self.logger.warning(f"[TextDirector] Failed to prime secondary compositor: {exc}")
+
+        self.logger.debug(f"[TextDirector] Set {len(self._secondary_compositors)} secondary compositors")
+
+        # Re-render current text so secondaries immediately mirror the primary output
+        if self._enabled and self._current_text:
+            self._render_current_text()
+    
+    def _get_all_compositors(self) -> List[Any]:
+        """Get list of all compositors (primary + secondaries)."""
+        compositors = []
+        if self.compositor:
+            compositors.append(self.compositor)
+        compositors.extend(self._secondary_compositors)
+        return compositors
+
+    def _apply_opacity_to_compositor(self, compositor: Any) -> None:
+        """Apply stored opacity to a compositor when capability exists."""
+        if compositor and hasattr(compositor, "set_text_opacity"):
+            try:
+                compositor.set_text_opacity(self._text_opacity)
+            except Exception as exc:
+                self.logger.debug(f"[TextDirector] Failed to apply text opacity to compositor: {exc}")
+
+    def _get_layout_dimensions(self, comp: Optional[Any] = None) -> tuple[int, int]:
+        """Determine the logical resolution to use for text layout math."""
+
+        def _measure(candidate: Any) -> tuple[int, int]:
+            width = height = 0
+            if not candidate:
+                return (0, 0)
+            if hasattr(candidate, "get_target_screen_size"):
+                try:
+                    width, height = candidate.get_target_screen_size()
+                except Exception:
+                    width = height = 0
+            if (width <= 0 or height <= 0) and hasattr(candidate, "width") and hasattr(candidate, "height"):
+                try:
+                    width = int(candidate.width())
+                    height = int(candidate.height())
+                except Exception:
+                    width = height = 0
+            return (width, height)
+
+        # When an explicit compositor is provided, only read from that source
+        if comp is not None:
+            width, height = _measure(comp)
+            if width <= 0 or height <= 0:
+                width, height = 1920, 1080
+            return (int(width), int(height))
+
+        # Aggregate across all compositors so multi-display layouts stay in sync
+        aggregate_width = 0
+        aggregate_height = 0
+        for candidate in self._get_all_compositors():
+            width, height = _measure(candidate)
+            aggregate_width = max(aggregate_width, width)
+            aggregate_height = max(aggregate_height, height)
+
+        if aggregate_width <= 0 or aggregate_height <= 0:
+            aggregate_width, aggregate_height = 1920, 1080
+
+        # Always enforce a minimum canvas so small preview windows still emulate live spacing
+        min_width, min_height = 1920, 1080
+        aggregate_width = max(aggregate_width, min_width)
+        aggregate_height = max(aggregate_height, min_height)
+
+        return (int(aggregate_width), int(aggregate_height))
+
+    def _recompute_target_seconds(self) -> None:
+        """Cache frame-based timings as seconds for stable comparisons."""
+        self._default_target_seconds = max(1, self._frames_per_text) / 60.0
+        self._manual_target_seconds = max(1, self._manual_frames_per_text) / 60.0
+
+    def _reset_elapsed_time(self) -> None:
+        """Reset accumulated time so next update measures from scratch."""
+        self._elapsed_time_s = 0.0
+        self._last_update_time = None
+
+    def _should_log_render(self, mode: Optional['SplitMode']) -> bool:
+        """Return True if we should emit an INFO render log (mode change or interval)."""
+
+        now = self._time_provider()
+        mode_changed = mode != self._last_render_log_mode
+        if mode_changed:
+            self._last_render_log_mode = mode
+            self._last_render_log_ts = now
+            return True
+        if now - self._last_render_log_ts >= self._render_log_interval:
+            self._last_render_log_ts = now
+            return True
+        return False
     
     # ===== Configuration =====
+    
+    def reset(self) -> None:
+        """Reset text director state (clear scroll offset and frame counter).
+        
+        Should be called when starting a new playback/cue to prevent state carryover.
+        """
+        old_offset = self._scroll_offset
+        old_mode = self._current_split_mode
+        
+        self._scroll_offset = 0.0
+        self._frame_counter = 0
+        self._reset_elapsed_time()
+        
+        self.logger.info(f"[TextDirector] RESET: offset {old_offset:.2f}→0.0, mode={old_mode} (preserved)")
     
     def set_enabled(self, enabled: bool) -> None:
         """Enable/disable text rendering.
@@ -95,6 +241,22 @@ class TextDirector:
             except Exception:
                 pass
         self.logger.info(f"[TextDirector] Text rendering: {'enabled' if enabled else 'disabled'}")
+        if enabled:
+            self._reset_elapsed_time()
+
+    def set_opacity(self, opacity: float) -> None:
+        """Set global text opacity (0.0-1.0) for all compositors."""
+        clamped = max(0.0, min(1.0, float(opacity)))
+        if math.isclose(clamped, self._text_opacity, rel_tol=1e-4, abs_tol=1e-4):
+            return
+        self._text_opacity = clamped
+        for comp in self._get_all_compositors():
+            self._apply_opacity_to_compositor(comp)
+        self.logger.info(f"[TextDirector] Text opacity set to {self._text_opacity:.2f}")
+
+    def get_opacity(self) -> float:
+        """Return current text opacity multiplier."""
+        return self._text_opacity
     
     def set_timing(self, frames_per_text: int) -> None:
         """Set how long to show each text.
@@ -103,6 +265,9 @@ class TextDirector:
             frames_per_text: Frames to display each text (60 = 1 second)
         """
         self._frames_per_text = max(1, frames_per_text)
+        if not self._sync_with_media:
+            self._manual_frames_per_text = self._frames_per_text
+        self._recompute_target_seconds()
     
     def is_enabled(self) -> bool:
         """Check if text rendering is enabled.
@@ -111,6 +276,26 @@ class TextDirector:
             True if text will be rendered
         """
         return self._enabled
+
+    def configure_sync(self, sync_with_media: bool, frames_per_text: Optional[int] = None) -> None:
+        """Configure whether text follows media changes or independent timing.
+
+        Args:
+            sync_with_media: True to trigger on media events, False for manual cadence.
+            frames_per_text: Optional manual duration in frames (60fps basis).
+        """
+        self._sync_with_media = bool(sync_with_media)
+        if frames_per_text is not None:
+            self._manual_frames_per_text = max(1, int(frames_per_text))
+        else:
+            self._manual_frames_per_text = self._frames_per_text
+        self._recompute_target_seconds()
+        self._reset_elapsed_time()
+        if not self._sync_with_media:
+            self._frame_counter = 0
+
+    def is_sync_with_media(self) -> bool:
+        return self._sync_with_media
     
     # ===== Configuration =====
     
@@ -131,7 +316,15 @@ class TextDirector:
             for t in texts
         ]
         self._user_text_library = user_set
-        self.logger.info(f"[TextDirector] Loaded {len(texts)} texts (user_set={user_set})")
+        
+        # CRITICAL: Set current split mode immediately when library is loaded
+        # This ensures reset() (called after set_text_library) preserves the CORRECT mode
+        # Previously, _current_split_mode was only updated on first render, causing
+        # reset to preserve the OLD mode from the previous playback
+        self._current_split_mode = default_split_mode
+        
+        self.logger.info(f"[TextDirector] Loaded {len(texts)} texts (user_set={user_set}), mode={default_split_mode}")
+        self._reset_elapsed_time()
     
     def has_user_text_library(self) -> bool:
         """Check if text library was set by user (Text tab).
@@ -243,6 +436,8 @@ class TextDirector:
         # Only change text if enabled and in CENTERED_SYNC mode
         if not self._enabled:
             return
+        if not self._sync_with_media:
+            return
         
         if self._current_split_mode and SplitMode and self._current_split_mode == SplitMode.CENTERED_SYNC:
             text, split_mode = self.get_random_text()
@@ -251,6 +446,7 @@ class TextDirector:
                 self._current_split_mode = split_mode
                 self._render_current_text()
                 self._frame_counter = 0  # Reset counter
+                self._reset_elapsed_time()
                 self.logger.debug(f"[TextDirector] Text synced with media change: {text[:30]}...")
     
     # ===== Update Loop =====
@@ -266,33 +462,44 @@ class TextDirector:
         """
         if not self._enabled:
             return
-        
+
         if not self.text_renderer or not self.compositor:
             return
-        
+
         if not self._text_entries:
             return
-        
-        # Update scrolling animation (pixels per frame at 60fps)
-        dt = 1.0 / 60.0  # Assume 60fps
+
+        now = self._time_provider()
+        if self._last_update_time is None:
+            self._last_update_time = now
+        dt = max(0.0, now - self._last_update_time)
+        self._last_update_time = now
+        self._elapsed_time_s += dt
+
+        # Update scrolling animation (pixels per frame at 60fps equivalent)
         self._scroll_offset += self._scroll_speed * dt
         # No wrapping - let it grow and wrap in rendering logic
-        
+
         self._frame_counter += 1
         
         # Determine timing based on mode
-        # SUBTEXT: 10 seconds (600 frames at 60fps)
-        # CENTERED_SYNC: synced with media (handled via on_media_change), but use long default
-        if self._current_split_mode and SplitMode:
-            if self._current_split_mode == SplitMode.SUBTEXT:
-                frames_per_text = 600  # 10 seconds
+        # SUBTEXT: 10 seconds (hard-coded)
+        # CENTERED_SYNC: synced with media (handled via on_media_change)
+        if self._sync_with_media:
+            if self._current_split_mode and SplitMode:
+                if self._current_split_mode == SplitMode.SUBTEXT:
+                    target_seconds = 10.0  # 10 seconds regardless of FPS
+                elif self._current_split_mode == SplitMode.CENTERED_SYNC:
+                    target_seconds = float("inf")  # Media change drives update
+                else:
+                    target_seconds = self._default_target_seconds
             else:
-                frames_per_text = 99999999  # Effectively infinite - media change will trigger update
+                target_seconds = self._default_target_seconds
         else:
-            frames_per_text = self._frames_per_text  # Fallback to default
+            target_seconds = self._manual_target_seconds
         
         # Change text at interval (only for SUBTEXT mode in practice)
-        if self._frame_counter >= frames_per_text:
+        if not math.isinf(target_seconds) and self._elapsed_time_s >= target_seconds:
             # Get new random text
             text, split_mode = self.get_random_text()
             if text:
@@ -300,6 +507,7 @@ class TextDirector:
                 self._current_split_mode = split_mode
                 self._render_current_text()
             self._frame_counter = 0
+            self._elapsed_time_s = 0.0
         elif self._frame_counter == 1:
             # First frame - render initial text
             if not self._current_text:
@@ -308,6 +516,10 @@ class TextDirector:
                     self._current_text = text
                     self._current_split_mode = split_mode
                     self._render_current_text()
+
+        # If a long target is infinite (media sync) keep elapsed time bounded so floats do not grow unbounded
+        if math.isinf(target_seconds):
+            self._elapsed_time_s = min(self._elapsed_time_s, 60.0)
         
         # Re-render SUBTEXT mode every frame for scrolling animation
         if self._current_split_mode and SplitMode and self._current_split_mode == SplitMode.SUBTEXT:
@@ -315,33 +527,68 @@ class TextDirector:
     
     def _render_current_text(self) -> None:
         """Render current text to compositor using split mode."""
-        if not self._current_text or not self.text_renderer or not self.compositor:
+        if not self._current_text or not self.text_renderer:
+            return
+        
+        # Get all compositors (primary + secondaries)
+        all_compositors = self._get_all_compositors()
+        if not all_compositors:
             return
         
         try:
-            # Clear existing text
-            self.compositor.clear_text_textures()
+            # Clear existing text on ALL compositors
+            for comp in all_compositors:
+                try:
+                    comp.clear_text_textures()
+                except Exception as e:
+                    self.logger.error(f"[TextDirector] Failed to clear text on compositor: {e}")
             
             # Render based on split mode
+            log_at_info = self._should_log_render(self._current_split_mode)
+            log_fn = self.logger.info if log_at_info else self.logger.debug
+            log_fn(
+                f"[TextDirector] RENDER: mode={self._current_split_mode}, scroll_offset={self._scroll_offset:.2f}"
+            )
+            
             if self._current_split_mode and SplitMode:
                 if self._current_split_mode == SplitMode.SUBTEXT:
                     # Scrolling horizontal bands (carousel effect)
+                    if log_at_info:
+                        self.logger.info("[TextDirector] Rendering CAROUSEL (subtext)")
+                    else:
+                        self.logger.debug("[TextDirector] Rendering CAROUSEL (subtext)")
                     self._render_subtext()
                 elif self._current_split_mode == SplitMode.CENTERED_SYNC:
                     # Centered text (default mode)
+                    if log_at_info:
+                        self.logger.info("[TextDirector] Rendering CENTERED")
+                    else:
+                        self.logger.debug("[TextDirector] Rendering CENTERED")
                     self._render_centered()
                 else:
                     # Fallback: render as centered text
+                    if log_at_info:
+                        self.logger.info(
+                            f"[TextDirector] Rendering FALLBACK (unknown mode: {self._current_split_mode})"
+                        )
+                    else:
+                        self.logger.debug(
+                            f"[TextDirector] Rendering FALLBACK (unknown mode: {self._current_split_mode})"
+                        )
                     self._render_centered()
             else:
                 # No split mode: render as centered text
+                if log_at_info:
+                    self.logger.info("[TextDirector] Rendering DEFAULT CENTERED (no mode set)")
+                else:
+                    self.logger.debug("[TextDirector] Rendering DEFAULT CENTERED (no mode set)")
                 self._render_centered()
                 
         except Exception as e:
             self.logger.error(f"[TextDirector] Failed to render text: {e}", exc_info=True)
     
     def _render_centered(self) -> None:
-        """Render text as single centered element."""
+        """Render text as single centered element on all compositors."""
         rendered = self.text_renderer.render_main_text(
             self._current_text,
             large=True,
@@ -349,13 +596,18 @@ class TextDirector:
         )
         
         if rendered and hasattr(rendered, 'texture_data'):
-            self.compositor.add_text_texture(
-                rendered.texture_data,
-                x=0.5,
-                y=0.5,
-                alpha=1.0,
-                scale=1.5
-            )
+            # Add text to ALL compositors (primary + secondaries)
+            for comp in self._get_all_compositors():
+                try:
+                    comp.add_text_texture(
+                        rendered.texture_data,
+                        x=0.5,
+                        y=0.5,
+                        alpha=1.0,
+                        scale=1.5
+                    )
+                except Exception as e:
+                    self.logger.error(f"[TextDirector] Failed to add text to compositor: {e}")
     
     
     def _render_subtext(self) -> None:
@@ -383,14 +635,16 @@ class TextDirector:
         if not rendered or not hasattr(rendered, 'texture_data'):
             return
         
-        # Get actual screen dimensions from compositor (critical for correct spacing!)
-        # Fallback to 1920x1080 if compositor not available
-        if self.compositor and hasattr(self.compositor, 'width') and hasattr(self.compositor, 'height'):
-            screen_width = max(1, self.compositor.width())
-            screen_height = max(1, self.compositor.height())
-        else:
-            screen_width = 1920
-            screen_height = 1080
+        # Get logical layout dimensions (respects virtual overrides for preview/live parity)
+        screen_width, screen_height = self._get_layout_dimensions()
+
+        # Ensure every compositor renders using the same virtual canvas so spacing stays identical
+        for comp in self._get_all_compositors():
+            if hasattr(comp, "set_virtual_screen_size"):
+                try:
+                    comp.set_virtual_screen_size(screen_width, screen_height)
+                except Exception:
+                    self.logger.debug("[TextDirector] Failed to set virtual screen size on compositor", exc_info=True)
         
         # Text dimensions with scale
         text_scale = 1.5  # Larger for better coverage
@@ -453,15 +707,18 @@ class TextDirector:
                 x = (x_ndc + 1.0) / 2.0
                 y = (y_ndc + 1.0) / 2.0
                 
-                # Add text texture at this position
-                # Use alpha=1.0 so the opacity slider has full control
-                self.compositor.add_text_texture(
-                    rendered.texture_data,
-                    x=x,
-                    y=y,
-                    alpha=1.0,
-                    scale=text_scale
-                )
+                # Add text texture at this position on ALL compositors
+                for comp in self._get_all_compositors():
+                    try:
+                        comp.add_text_texture(
+                            rendered.texture_data,
+                            x=x,
+                            y=y,
+                            alpha=1.0,
+                            scale=text_scale
+                        )
+                    except Exception as e:
+                        self.logger.error(f"[TextDirector] Failed to add subtext to compositor: {e}")
     
     # ===== Status =====
     

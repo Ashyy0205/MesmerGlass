@@ -4,6 +4,34 @@
 
 MesmerGlass implements an independent text rendering system with multiple display modes, based on Trance's text overlay architecture. Text rendering is completely decoupled from Visual Programs, allowing text to display independently with various effects.
 
+## Virtual Screen Targeting (Preview Parity)
+
+MesmerGlass now treats text layout math and GL placement as two halves of the same pipeline. Every compositor exposes `set_virtual_screen_size()` / `get_target_screen_size()` so text can be scaled against a _live_ resolution even when rendered inside a small preview widget.
+
+- **LoomCompositor / LoomWindowCompositor**: Convert texture quads to normalized device coordinates using the virtual size when present (defaults to widget/window dimensions, then 1920×1080 fallback).
+- **TextDirector**: Queries `get_target_screen_size()` before computing centered placement, carousel spacing, and scroll offsets. When no compositor is ready it falls back to 1920×1080 to keep math deterministic.
+- **Playback Editor**: Pushes the active monitor's resolution into the preview compositor on startup so the preview text exactly matches live/fullscreen output.
+
+### Manual QA
+1. Launch the Playback Editor and drag the window between monitors with different resolutions.
+2. Each time, run `Tools → Reset Preview` (or close/reopen) so `_apply_preview_virtual_size()` re-samples the new monitor.
+3. Confirm the preview text occupies the same relative area as the fullscreen MesmerGlass session (use a centered cue for easy comparison).
+4. Toggle SUBTEXT mode; the wallpaper grid density should remain unchanged between preview and live windows because both share the same logical resolution.
+
+## Multi-Display Mirroring (Phase 7 Refresh)
+
+The Phase 7 text stack now mirrors overlays to every active compositor—primary window, duplicate monitors, and VR-safe mirrors—without forcing a manual refresh.
+
+- `TextDirector.set_secondary_compositors()` immediately binds new LoomWindowCompositor instances, clears any stale textures, and **re-renders the current text payload** so carousel/SUBTEXT effects show up everywhere within a frame.
+- Secondary compositors keep their own GL texture lists but never advance TextDirector state; only the primary window calls `text_director.update()` each frame, preserving deterministic timing.
+- Carousel/SUBTEXT grids re-render continuously on the primary window; secondaries receive the same textures via `_render_current_text()` and remain visually in sync even if they come online mid-session.
+
+### Manual QA (Dual Display)
+1. Launch a session with two monitors selected (Display tab) and enable a cue that uses SUBTEXT / carousel text.
+2. While the cue is active, toggle the secondary display on/off in the UI (or plug in a new monitor). Each secondary window should instantly show scrolling text without waiting for the next cue.
+3. Watch both displays for 15+ seconds. The wallpaper grid should stay phase-matched (no drift between monitors) because only the primary compositor advances scroll offsets.
+4. Stop the session and relaunch—there should be no residual textures stuck on the secondaries after cleanup.
+
 ## Text Display Modes (SplitMode)
 
 ### Core Text Modes

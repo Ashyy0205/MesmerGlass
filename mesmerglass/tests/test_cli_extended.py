@@ -22,5 +22,5 @@ def test_pulse_subcommand_short_run():
 
 
 def test_logging_flags_parse():
-    r = run_cli("--log-level", "DEBUG", "--log-format", "plain", "selftest")
+    r = run_cli("--log-level", "DEBUG", "--log-format", "plain", "--log-mode", "quiet", "selftest")
     assert r.returncode == 0

@@ -1,10 +1,10 @@
 import sys, threading, traceback, signal, time, os
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtCore import qInstallMessageHandler
-from .ui.launcher import Launcher
+from .ui.main_application import MainApplication
 from .qss import QSS
 from . import __app_name__, __version__
-from .logging_utils import setup_logging  # add logging setup
+from .logging_utils import setup_logging
 import logging, faulthandler
 
 _DIAG_INSTALLED = False
@@ -80,11 +80,13 @@ def _install_diagnostics():
 
 def run():
     # Ensure logging is configured when launching GUI directly
-    setup_logging(add_console=True)
+    log_mode_env = os.environ.get("MESMERGLASS_LOG_MODE")
+    if not logging.getLogger().handlers:
+        setup_logging(add_console=True, log_mode=log_mode_env)
     _install_diagnostics()
     app = QApplication(sys.argv)
-    app.setStyleSheet(QSS)
-    win = Launcher(f"{__app_name__} — {__version__}")
+    # app.setStyleSheet(QSS)  # Temporarily disabled for easier testing
+    win = MainApplication()
     try:
         app.aboutToQuit.connect(lambda: logging.getLogger("diag").info("DIAG aboutToQuit"))
     except Exception:

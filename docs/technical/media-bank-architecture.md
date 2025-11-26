@@ -180,6 +180,36 @@ def load_mode(self, mode_path: Path):
     self._rebuild_media_library_from_selections(bank_selections)
 ```
 
+### ThemeBank Runtime Fallbacks
+
+- `ThemeBank.get_video()` now automatically searches every active theme slot (primary, alternate, queued) for animations.
+- If the currently selected theme has no videos, the request transparently falls back to another theme that does, so "video" playbacks never regress to still images when mixed banks are enabled.
+- Fallback selections are logged (`[ThemeBank] Video fallback ...`) to aid debugging and can be correlated with the launcher’s bank configuration when curating media.
+
+### Runtime Integration (Phase 7)
+
+- **SimpleVideoStreamer wiring** – MainApplication now instantiates `SimpleVideoStreamer` during engine bring-up and feeds it into `VisualDirector`. ThemeBank video callbacks (`on_change_video`) therefore load real file paths immediately instead of falling back to still imagery when the GUI forgets to initialize a streamer. The window’s `closeEvent` shuts the streamer down so OpenCV/decoder threads do not linger between test runs.
+- **VisualDirector diagnostics** – When visuals request a video but the compositor or streamer is missing, the director logs a one-time warning (`[visual] Video requested but ...`) so QA can spot wiring problems in field logs without reproducing under a debugger.
+- **SessionRunner duration guard** – Cue transitions still prefer media-cycle boundaries, but we now timestamp every pending transition request. If two seconds pass without a cycle boundary (for example because a ThemeBank video never loaded), SessionRunner logs a warning and forces the transition so cues honor their configured `duration_seconds`. This matches the legacy “15 s cue” expectation and prevents sessions from overrunning indefinitely when the media pipeline stalls.
+
+### Case-insensitive scanning
+
+- The launcher now relies on `mesmerglass.content.media_scan.scan_media_directory()` when loading `media_bank.json`. The helper walks each directory once and compares suffixes using a lowercase set, so files such as `PHOTO.JPG` or `Loop.MP4` are picked up automatically.
+- Returned paths are absolute strings to keep ThemeBank rebuilds deterministic even when users mix drive letters or mount points.
+- Custom scan lists can still be provided (for example adding `*.tiff`) by passing overrides to `scan_media_directory()`, and tests cover the mixed-case behavior to guard against regressions.
+
+---
+
+### ThemeBank readiness & diagnostics
+
+- `ThemeBank.get_status()` exposes aggregate counts, pending async load depth, and the last decoded image/video paths so SessionRunner and diagnostics can explain exactly why visuals are missing.
+- `ThemeBank.ensure_ready()` is invoked by `SessionRunner`, `SessionRunnerTab`, and the `themebank selftest` CLI to block or warn until at least one decoded image or video is available. Logs surface the `ThemeBankStatus` snapshot to aid support tickets.
+- CLI tooling (`python -m mesmerglass themebank ...`) calls the same readiness helpers, providing `stats`, `selftest`, and `pull-*` commands for CI and field troubleshooting. Exit code `3` uniformly means “media missing/not ready”.
+- `mesmerglass/tests/test_themebank_diagnostics.py` covers status generation, CLI plumbing, and readiness gates so regressions surface before shipping.
+- VisualDirector logs the first video/image paths that reach the compositor, letting you correlate ThemeBank readiness with actual uploads when diagnosing “spiral only” reports.
+
+When media paths are misconfigured or inaccessible, ThemeBank remains in a “not ready” state that surfaces through the CLI, SessionRunner UI warnings, and VisualDirector logs. This layered approach prevents silent failures where sessions display only the fallback spiral/text overlays.
+
 ---
 
 ## Example Workflow

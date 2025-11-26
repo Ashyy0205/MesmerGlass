@@ -35,6 +35,8 @@ pip install -r requirements.txt
 pip install -r requirements-dev.txt
 ```
 
+> **Note:** `psutil` now ships with the main requirements list. If you see `ModuleNotFoundError: psutil` when launching the CLI, rerun `pip install -r requirements.txt` inside the active virtual environment to pull the new dependency.
+
 ### 4. IDE Setup
 
 #### VS Code

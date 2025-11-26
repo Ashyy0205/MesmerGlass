@@ -1,0 +1,17 @@
+{
+  "name": "Test Playback",
+  "version": "1.0",
+  "spiral": {
+    "type": 3,
+    "rotation_speed": 30.0,
+    "reverse": false,
+    "intensity": 0.8
+  },
+  "media": {
+    "mode": "none",
+    "cycle_speed": 50
+  },
+  "text": {
+    "enabled": false
+  }
+}

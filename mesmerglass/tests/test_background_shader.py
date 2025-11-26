@@ -10,3 +10,12 @@ def test_background_shader_no_duplicate_aspect_decls():
     img_decl = len(re.findall(r"\bfloat\s+imageAspect\s*=", src))
     assert win_decl == 1, f"windowAspect declared {win_decl} times"
     assert img_decl == 1, f"imageAspect declared {img_decl} times"
+
+
+def test_background_shader_applies_opacity_to_rgb():
+    from mesmerglass.mesmerloom.window_compositor import LoomWindowCompositor
+
+    src = LoomWindowCompositor._background_fs_source()
+    assert "uniform float uOpacity" in src
+    assert "color.rgb *= uOpacity" in src
+    assert "color.a = uOpacity" in src

@@ -31,6 +31,7 @@ uniform float uContrast;
 uniform float uVignette;
 uniform float uChromaticShift;
 uniform float uFlipWaveRadius;
+uniform float uFlipWaveWidth;
 uniform int uFlipState;
 uniform float uIntensity;
 uniform int uSafetyClamped;
@@ -209,14 +210,13 @@ void main(void) {
         vec2 p = screen_uv * 2.0 - 1.0;
         p.x *= aspect_ratio;
         float r = length(p);
-        
-        float flipWidth = 0.02;
-        float flipEffect = smoothstep(uFlipWaveRadius - flipWidth, 
-                                     uFlipWaveRadius + flipWidth, r);
+
+        float band = max(0.001, uFlipWaveWidth);
+        float band_dist = abs(r - uFlipWaveRadius);
+        float flipEffect = smoothstep(1.5 * band, 0.5 * band, band_dist);
         float arm_v = finalColor.a > 0.5 ? 1.0 : 0.0;
         arm_v = mix(arm_v, 1.0 - arm_v, flipEffect);
-        
-        // Re-blend colors based on flipped value
+
         finalColor = mix(
             (acolour + bcolour) / 2.0,
             mix(acolour, bcolour, arm_v),

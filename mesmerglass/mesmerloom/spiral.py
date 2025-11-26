@@ -15,8 +15,13 @@ The implementation aims for determinism in tests by allowing a seed and acceptin
 """
 from __future__ import annotations
 from dataclasses import dataclass
-import math, random, time
+import math, os, random, time
 from typing import Optional
+
+ROTATION_TRACE_ENABLED = bool(
+    os.environ.get("MESMERGLASS_SPIRAL_ROTATE_TRACE")
+    or os.environ.get("MESMERGLASS_SPIRAL_TRACE")
+)
 
 @dataclass
 class SpiralState:
@@ -46,7 +51,8 @@ class SpiralDirector:
     # Flip ranges
     FLIP_PERIOD_MIN = 120.0; FLIP_PERIOD_MAX = 240.0  # intensity 0→1 maps 240→120 (invert later)
     FLIP_WAVE_MIN = 22.0; FLIP_WAVE_MAX = 40.0
-    FLIP_RADIUS_START = -0.2; FLIP_RADIUS_END = 1.2
+    FLIP_RADIUS_START = 0.0; FLIP_RADIUS_END = 1.2
+    FLIP_WIDTH_MIN = 0.02; FLIP_WIDTH_MAX = 0.05
     # Safety clamps
     SPEED_CAP = 0.18
     BAR_WIDTH_MIN = 0.36; BAR_WIDTH_MAX = 0.62
@@ -74,8 +80,8 @@ class SpiralDirector:
         
         # Additional spiral parameters for shader
         self.arm_count = 8
-        self.arm_color = (1.0, 1.0, 1.0)
-        self.gap_color = (0.0, 0.0, 0.0)  # Black (transparent gaps)
+        self.arm_color = (1.0, 1.0, 1.0)  # White arms
+        self.gap_color = (0.0, 0.0, 0.0)  # Black gaps (for contrast on black background)
         self.blend_mode = 1  # 0=multiply, 1=screen, 2=softlight - screen mode to avoid darkening
         self.color = (1.0, 1.0, 1.0)
         self.resolution = (1920, 1080)
@@ -205,7 +211,7 @@ class SpiralDirector:
         divisor = 1 + self.rng.randint(0, 5)
         self.spiral_width = 360 // divisor
     
-    def rotate_spiral(self, amount: float):
+    def rotate_spiral(self, amount: float, dt: float | None = None):
         """
         Rotate spiral using direct RPM calculation instead of legacy Trance formula.
         
@@ -215,12 +221,31 @@ class SpiralDirector:
         Args:
             amount: Legacy parameter (ignored in new RPM mode)
                    To maintain compatibility with existing calls like rotate_spiral(4.0)
+            dt: Delta time in seconds. If None, uses 1/30.0 as fallback (for compatibility)
         """
-        # NEW: Direct RPM to phase conversion
-        from mesmerglass.mesmerloom.spiral_speed import rpm_to_phase_increment
+        # Use provided dt, or fallback to 1/30.0 for compatibility
+        if dt is None:
+            dt = 1/30.0
         
-        # Calculate phase increment for 60 FPS (assuming this is called at 60 Hz)
-        phase_increment = rpm_to_phase_increment(self.rotation_speed, fps=60.0)
+        # Calculate phase increment: (rotations/minute) / (60 seconds/minute) * (seconds/frame)
+        phase_per_second = self.rotation_speed / 60.0
+        phase_increment = phase_per_second * dt
+        
+        if ROTATION_TRACE_ENABLED:
+            if not hasattr(self, '_rotate_call_count'):
+                self._rotate_call_count = 0
+            self._rotate_call_count += 1
+            if self._rotate_call_count <= 10:
+                import traceback
+
+                stack_lines = traceback.format_stack()
+                # Get last few relevant frames (skip this function's frame)
+                relevant_stack = ''.join(stack_lines[-4:-1])
+                print(
+                    f"[rotate_spiral_DEBUG] Call #{self._rotate_call_count}: RPM={self.rotation_speed}, dt={dt:.6f}, phase_increment={phase_increment:.6f}",
+                    flush=True,
+                )
+                print(f"  Caller stack:\n{relevant_stack}", flush=True)
         
         # Use high-precision accumulator to prevent drift  
         self._phase_accumulator += phase_increment
@@ -256,8 +281,11 @@ class SpiralDirector:
         now = time.time()
         if dt is None:
             dt = now - self._last_update
-        if dt <= 0:
-            dt = 1/60
+        # CRITICAL: If dt is too small or negative, something is calling update() too frequently
+        # In that case, skip the update entirely to prevent double-updates
+        if dt <= 0.001:  # Less than 1ms suggests double-call
+            logging.getLogger(__name__).warning(f"[spiral.update] dt={dt:.6f}s is too small - skipping update to prevent double-updates")
+            return self.state  # Return current state without updating
         self._last_update = now
         intensity = self._pending_intensity
         st = self.state
@@ -300,6 +328,8 @@ class SpiralDirector:
                 self._next_flip_in = self._schedule_next_flip(intensity)
         if st.flip_state == 1:
             wave_duration = self.FLIP_WAVE_MAX - (self.FLIP_WAVE_MAX - self.FLIP_WAVE_MIN) * intensity
+            flip_width_target = self.FLIP_WIDTH_MIN + (self.FLIP_WIDTH_MAX - self.FLIP_WIDTH_MIN) * (1.0 - intensity)
+            st.flip_width = self._slew(st.flip_width, flip_width_target, 0.01)
             self._flip_elapsed += dt
             prog = min(1.0, self._flip_elapsed / wave_duration)
             st.flip_radius = self.FLIP_RADIUS_START + (self.FLIP_RADIUS_END - self.FLIP_RADIUS_START) * prog
@@ -307,14 +337,17 @@ class SpiralDirector:
                 st.flip_state = 0
                 st.flip_radius = self.FLIP_RADIUS_START
                 self._flip_elapsed = 0.0
+        else:
+            st.flip_width = self._slew(st.flip_width, self.FLIP_WIDTH_MIN, 0.01)
         # Speed wobble + flip local boost (simplified: uniform boost while active)
         wobble = math.sin(now * 2.0 * math.pi * 0.5) * wobble_amp  # 0.5 cps wobble
         flip_boost = 0.03 if st.flip_state == 1 else 0.0
         st.effective_speed = min(self.SPEED_CAP, st.base_speed + wobble + flip_boost)
         
-        # Phase is now managed by rotate_spiral() using rotation_speed multiplier.
-        # Update state.phase from the high-precision accumulator (don't advance it here).
-        # This allows rotate_spiral() to be the single source of truth for rotation.
+        # Rotate spiral using rotation_speed (RPM) and actual dt
+        self.rotate_spiral(0.0, dt=dt)  # Pass dt to use measured frame time
+        
+        # Update state.phase from the high-precision accumulator (set by rotate_spiral)
         st.phase = float(self._phase_accumulator)
 
         # Safety clamps (applied after updates)
@@ -363,6 +396,7 @@ class SpiralDirector:
             "uVignette": s.vignette,
             "uChromaticShift": s.chromatic_shift,
             "uFlipWaveRadius": s.flip_radius,
+            "uFlipWaveWidth": s.flip_width,
             "uFlipState": s.flip_state,
             "uIntensity": 1.0,  # Always 1.0 - intensity removed from system (spiral uses full color)
             "uSafetyClamped": 1 if s.safety_clamped else 0,

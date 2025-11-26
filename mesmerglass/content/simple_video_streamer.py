@@ -36,17 +36,22 @@ class SimpleVideoStreamer:
             upload_to_gpu(frame.data)
     """
     
-    def __init__(self, buffer_size: int = 120):
+    def __init__(self, buffer_size: int = 120, prefill_frames: Optional[int] = None):
         """Initialize simple streamer.
         
         Args:
             buffer_size: Number of frames to buffer (default 120)
         """
         self._streamer = VideoStreamer(buffer_size=buffer_size)
+        self._prefill_frames = prefill_frames
         self._current_video_path: Optional[Path] = None
         self._frame_counter = 0.0
         
-        logger.info("[SimpleVideoStreamer] Initialized (forward-only mode)")
+        logger.info(
+            "[SimpleVideoStreamer] Initialized (forward-only mode, buffer=%d, prefill=%s)",
+            buffer_size,
+            "auto" if prefill_frames is None else prefill_frames,
+        )
     
     def load_video(self, path: str | Path) -> bool:
         """Load video for playback.
@@ -58,7 +63,7 @@ class SimpleVideoStreamer:
             True if successful
         """
         path = Path(path)
-        result = self._streamer.load_video(path, preload=False)
+        result = self._streamer.load_video(path, preload=False, prefill_frames=self._prefill_frames)
         
         if result:
             self._current_video_path = path

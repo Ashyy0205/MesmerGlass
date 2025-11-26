@@ -35,14 +35,23 @@ class TestSubtextRendering:
         compositor = Mock()
         compositor.add_text_texture = Mock()
         compositor.clear_text_textures = Mock()
+        compositor.set_virtual_screen_size = Mock()
+        compositor.get_target_screen_size = Mock(return_value=(1280, 720))
         return compositor
     
     @pytest.fixture
     def director(self, mock_renderer, mock_compositor):
         """Create TextDirector with mocks."""
+        clock = {"t": 0.0}
+
+        def fake_time():
+            clock["t"] += 0.016  # simulate ~60fps progression
+            return clock["t"]
+
         director = TextDirector(
             text_renderer=mock_renderer,
-            compositor=mock_compositor
+            compositor=mock_compositor,
+            time_provider=fake_time
         )
         director.set_text_library(["Test Text 1", "Test Text 2", "Test Text 3"])
         return director
@@ -143,30 +152,27 @@ class TestSubtextRendering:
         assert len(unique_x) >= 3, \
             f"Expected multiple x-coordinates for grid, got: {unique_x}"
     
-    def test_subtext_vs_fillscreen(self, director, mock_compositor):
-        """Verify SUBTEXT and FILL_SCREEN produce different outputs."""
-        # Test FILL_SCREEN mode
-        director.set_all_split_mode(SplitMode.FILL_SCREEN)
+    def test_subtext_vs_centered(self, director, mock_compositor):
+        """Verify SUBTEXT and centered text produce different outputs."""
+        # Test centered mode
+        director.set_all_split_mode(SplitMode.CENTERED_SYNC)
         director.set_enabled(True)
         director.update()
-        fillscreen_calls = mock_compositor.add_text_texture.call_count
+        centered_calls = mock_compositor.add_text_texture.call_count
         mock_compositor.reset_mock()
         
         # Test SUBTEXT mode
         director.set_all_split_mode(SplitMode.SUBTEXT)
-        director._current_text = "Test Text 1"  # Reset text
+        director._current_text = ""  # Force fresh selection/render
+        director._current_split_mode = SplitMode.SUBTEXT
         director._frame_counter = 0
         director.update()
         subtext_calls = mock_compositor.add_text_texture.call_count
         
-        # FILL_SCREEN creates 8x6 = 48 instances
-        # SUBTEXT creates ~9 bands
-        assert fillscreen_calls != subtext_calls, \
-            f"FILL_SCREEN ({fillscreen_calls}) and SUBTEXT ({subtext_calls}) should differ"
-        
-        # FILL_SCREEN should have more calls (48 vs ~9)
-        assert fillscreen_calls > subtext_calls, \
-            f"FILL_SCREEN should create more instances than SUBTEXT"
+        assert centered_calls != subtext_calls, \
+            f"Centered ({centered_calls}) and SUBTEXT ({subtext_calls}) should differ"
+        assert subtext_calls > centered_calls, \
+            "SUBTEXT should render more tiles than centered mode"
     
     def test_subtext_transparency(self, director, mock_compositor):
         """Verify SUBTEXT uses semi-transparent alpha."""
@@ -181,9 +187,9 @@ class TestSubtextRendering:
             if 'alpha' in kwargs:
                 alpha_values.append(kwargs['alpha'])
         
-        # All bands should have alpha < 1.0 (semi-transparent)
-        assert all(0 < alpha < 1.0 for alpha in alpha_values), \
-            f"SUBTEXT bands should be semi-transparent, got alphas: {alpha_values}"
+        # Bands render opaque so they blend with spiral shader; ensure >0 alpha
+        assert all(alpha >= 1.0 for alpha in alpha_values), \
+            f"SUBTEXT bands should be fully opaque, got alphas: {alpha_values}"
     
     def test_subtext_scale(self, director, mock_compositor):
         """Verify SUBTEXT uses smaller scale than centered text."""
@@ -197,12 +203,43 @@ class TestSubtextRendering:
             kwargs = call[1] if len(call) > 1 else {}
             if 'scale' in kwargs:
                 scale_values.append(kwargs['scale'])
-        
-        # All bands should use reduced scale (0.8 for wallpaper)
-        assert all(scale < 1.0 for scale in scale_values), \
-            f"SUBTEXT bands should use smaller scale, got: {scale_values}"
-        assert all(abs(scale - 0.8) < 0.1 for scale in scale_values), \
-            f"SUBTEXT scale should be ~0.8, got: {list(set(scale_values))}"
+        # SUBTEXT upsizes glyphs to cover more area
+        assert all(scale >= 1.0 for scale in scale_values), \
+            f"SUBTEXT bands should use larger scale, got: {scale_values}"
+
+    def test_secondary_compositors_receive_existing_text(self, director, mock_compositor):
+        """New secondary compositors immediately mirror current text output."""
+        director.set_all_split_mode(SplitMode.SUBTEXT)
+        director.set_enabled(True)
+        director.update()
+
+        secondary = Mock()
+        secondary.add_text_texture = Mock()
+        secondary.clear_text_textures = Mock()
+        secondary.set_virtual_screen_size = Mock()
+        secondary.get_target_screen_size = Mock(return_value=(1920, 1080))
+
+        director.set_secondary_compositors([secondary])
+
+        secondary.clear_text_textures.assert_called()
+        assert secondary.add_text_texture.call_count > 0
+
+    def test_subtext_sets_virtual_screen_size_for_all_compositors(self, director, mock_compositor):
+        """SUBTEXT layout should apply a shared virtual canvas to every compositor."""
+        secondary = Mock()
+        secondary.add_text_texture = Mock()
+        secondary.clear_text_textures = Mock()
+        secondary.set_virtual_screen_size = Mock()
+        secondary.get_target_screen_size = Mock(return_value=(1920, 1080))
+
+        director.set_secondary_compositors([secondary])
+        director.set_all_split_mode(SplitMode.SUBTEXT)
+        director.set_enabled(True)
+        director.update()
+
+        # Layout uses max(1920, primary 1280) = 1920 width
+        mock_compositor.set_virtual_screen_size.assert_called_with(1920, 1080)
+        secondary.set_virtual_screen_size.assert_called_with(1920, 1080)
 
 
 class TestSubtextTiming:
@@ -219,7 +256,17 @@ class TestSubtextTiming:
         renderer.render_main_text.return_value = rendered
         
         compositor = Mock()
-        director = TextDirector(text_renderer=renderer, compositor=compositor)
+        clock = {"t": 0.0}
+
+        def fake_time():
+            clock["t"] += 0.05
+            return clock["t"]
+
+        director = TextDirector(
+            text_renderer=renderer,
+            compositor=compositor,
+            time_provider=fake_time
+        )
         director.set_text_library(["A", "B", "C"])
         return director
     
@@ -242,7 +289,7 @@ class TestSubtextTiming:
     
     def test_other_modes_no_continuous_render(self, director_with_timing):
         """Verify non-SUBTEXT modes don't re-render every frame."""
-        director_with_timing.set_all_split_mode(SplitMode.NONE)
+        director_with_timing.set_all_split_mode(SplitMode.CENTERED_SYNC)
         director_with_timing.set_enabled(True)
         director_with_timing.set_timing(1000)  # Very long duration
         
@@ -257,3 +304,119 @@ class TestSubtextTiming:
         # Should NOT have re-rendered (static mode)
         assert second_count == initial_count, \
             "Non-SUBTEXT modes should not re-render every frame"
+
+
+class TestTextSyncSettings:
+    """Verify manual text timing vs media-synced behavior."""
+
+    @pytest.fixture
+    def base_director(self):
+        renderer = Mock()
+        rendered = Mock()
+        rendered.texture_data = b"fake"
+        rendered.width = 100
+        rendered.height = 50
+        renderer.render_main_text.return_value = rendered
+        compositor = Mock()
+        director = TextDirector(text_renderer=renderer, compositor=compositor)
+        director.set_text_library(["Alpha", "Beta", "Gamma"])
+        director.set_enabled(True)
+        return director, compositor
+
+    def test_manual_mode_advances_without_media(self, base_director):
+        director, compositor = base_director
+        director.configure_sync(sync_with_media=False, frames_per_text=2)
+        director.update()  # Initial render
+        first_count = compositor.add_text_texture.call_count
+        director._elapsed_time_s = director._manual_target_seconds
+        director.update()
+        director._elapsed_time_s = director._manual_target_seconds
+        director.update()
+        assert compositor.add_text_texture.call_count > first_count, \
+            "Manual mode should advance text via update timing"
+
+    def test_media_change_ignored_when_manual(self, base_director):
+        director, compositor = base_director
+        director.configure_sync(sync_with_media=False, frames_per_text=60)
+        director.on_media_change()
+        assert compositor.add_text_texture.call_count == 0, \
+            "Manual mode should not react to media change callbacks"
+
+    def test_manual_mode_applies_to_subtext(self, base_director):
+        director, _ = base_director
+        director.set_text_library(["One", "Two"])
+        director.set_all_split_mode(SplitMode.SUBTEXT)
+        director.configure_sync(sync_with_media=False, frames_per_text=1)
+        with patch("mesmerglass.engine.text_director.random.random", side_effect=[0.1, 0.9]):
+            director.update()
+            first = director._current_text
+            director._elapsed_time_s = director._manual_target_seconds
+            director.update()
+            second = director._current_text
+        assert first != second, "Manual cadence should rotate carousel text independently of media"
+
+
+class TestLayoutDimensions:
+    """Verify TextDirector derives layout sizes from target overrides."""
+
+    def _make_director(self, compositor: Mock) -> TextDirector:
+        renderer = Mock()
+        rendered = Mock()
+        rendered.texture_data = b"texture"
+        rendered.width = 200
+        rendered.height = 80
+        renderer.render_main_text.return_value = rendered
+        director = TextDirector(text_renderer=renderer, compositor=compositor)
+        director.set_text_library(["Alpha", "Beta"])
+        return director
+
+    def test_prefers_virtual_screen_size(self):
+        comp = Mock()
+        comp.get_target_screen_size.return_value = (2560, 1440)
+        director = self._make_director(comp)
+
+        width, height = director._get_layout_dimensions()
+
+        comp.get_target_screen_size.assert_called_once()
+        assert (width, height) == (2560, 1440)
+
+    def test_fallbacks_to_widget_dimensions(self):
+        comp = Mock()
+        comp.get_target_screen_size.side_effect = Exception("bad state")
+        comp.width.return_value = 800
+        comp.height.return_value = 600
+        director = self._make_director(comp)
+
+        width, height = director._get_layout_dimensions()
+
+        # Layout enforces a minimum 1920x1080 canvas so smaller preview windows still match live output
+        assert (width, height) == (1920, 1080)
+
+    def test_default_resolution_when_no_compositor(self):
+        director = TextDirector(text_renderer=Mock(), compositor=None)
+        director.set_text_library(["Solo"])
+
+        width, height = director._get_layout_dimensions()
+
+        assert (width, height) == (1920, 1080)
+
+    def test_aggregates_primary_and_secondary_dimensions(self):
+        primary = Mock()
+        primary.get_target_screen_size.return_value = (1280, 720)
+        secondary = Mock()
+        secondary.get_target_screen_size.return_value = (1920, 1080)
+
+        renderer = Mock()
+        rendered = Mock()
+        rendered.texture_data = b"texture"
+        rendered.width = 200
+        rendered.height = 80
+        renderer.render_main_text.return_value = rendered
+
+        director = TextDirector(text_renderer=renderer, compositor=primary)
+        director.set_text_library(["Alpha"])
+        director.set_secondary_compositors([secondary])
+
+        width, height = director._get_layout_dimensions()
+
+        assert (width, height) == (1920, 1080)

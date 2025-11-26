@@ -9,7 +9,10 @@ QSS = r"""
   color: #E8ECF5;
 }
 QWidget     { background: #0B0F14; }
-QMainWindow { background: #0B0F14; }
+QMainWindow { 
+  background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+    stop:0 #0B0F14, stop:0.5 #0D1118, stop:1 #0F1319);
+}
 QScrollArea { 
     background: transparent; 
     border: none; 
@@ -148,6 +151,7 @@ QTabWidget::tab-bar {
   left: 12px;
 }
 
+/* Horizontal tabs (legacy) */
 QTabBar::tab {
   padding: 8px 16px;
   margin-right: 4px;
@@ -164,6 +168,32 @@ QTabBar::tab:selected {
   background: rgba(255,168,76,0.18);
   color: #FFE6C7;
   border: 1px solid rgba(255,168,76,0.35);
+}
+
+/* Vertical tabs (Phase 7 GUI) */
+QTabBar[tabPosition="0"]::tab {
+  /* West position = vertical */
+  padding: 12px 20px;
+  margin-bottom: 4px;
+  margin-right: 0;
+  border-radius: 10px;
+  background: rgba(255,255,255,0.06);
+  border: 1px solid transparent;
+  min-width: 140px;
+  font-size: 11pt;
+  text-align: left;
+}
+
+QTabBar[tabPosition="0"]::tab:hover {
+  background: rgba(255,255,255,0.10);
+  border: 1px solid rgba(255,255,255,0.08);
+}
+
+QTabBar[tabPosition="0"]::tab:selected {
+  background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 rgba(255,138,0,0.20), stop:1 rgba(255,211,107,0.15));
+  color: #FFE6C7;
+  border: 1px solid rgba(255,168,76,0.40);
+  font-weight: 600;
 }
 
 /* -------- Footer -------- */

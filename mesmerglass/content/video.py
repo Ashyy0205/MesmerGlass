@@ -328,12 +328,14 @@ class VideoStreamer:
         
         logger.info(f"[VideoStreamer] Initialized with buffer_size={buffer_size}")
     
-    def load_video(self, path: str | Path, preload: bool = False) -> bool:
+    def load_video(self, path: str | Path, preload: bool = False, *, prefill_frames: Optional[int] = None) -> bool:
         """Load video into streamer.
         
         Args:
             path: Path to video file
             preload: If True, load into next buffer (background). If False, load into current.
+            prefill_frames: Maximum number of frames to decode synchronously before returning.
+                Defaults to ``buffer_size`` (legacy behavior).
         
         Returns:
             True if load successful
@@ -347,6 +349,8 @@ class VideoStreamer:
             
             target_buffer = self._next if preload else self._current
             
+            max_prefill = self.buffer_size if prefill_frames is None else max(1, min(prefill_frames, self.buffer_size))
+
             with self._lock:
                 # Store old decoder for cleanup
                 if target_buffer.decoder is not None:
@@ -358,8 +362,8 @@ class VideoStreamer:
                 target_buffer.size = 0
                 target_buffer.end = False
                 
-                # Pre-fill buffer (Trance does this in constructor)
-                while not target_buffer.end and target_buffer.size < self.buffer_size:
+                # Pre-fill limited number of frames on caller thread to avoid UI stalls
+                while not target_buffer.end and target_buffer.size < max_prefill:
                     frame = decoder.next_frame()
                     if frame is not None:
                         target_buffer.frames.append(frame)
@@ -368,7 +372,7 @@ class VideoStreamer:
                         target_buffer.end = True
                 
                 logger.info(f"[VideoStreamer] Loaded {path.name if isinstance(path, Path) else Path(path).name} - "
-                           f"buffered {target_buffer.size} frames, end={target_buffer.end}")
+                           f"buffered {target_buffer.size} frames (prefill cap={max_prefill}), end={target_buffer.end}")
             
             # Start async loader thread if not running
             if not self._loader_running:

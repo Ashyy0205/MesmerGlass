@@ -17,6 +17,7 @@ from typing import Any, Optional, Dict, Union
 import logging, time, pathlib, os
 from PyQt6.QtWidgets import QWidget
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import QOpenGLContext
 try:  # Set a conservative default surface format early (can be disabled via env)
     from PyQt6.QtGui import QSurfaceFormat  # type: ignore
     if not os.environ.get("MESMERGLASS_NO_SURFACE_FMT"):
@@ -275,6 +276,7 @@ class LoomCompositor(QOpenGLWidget):  # type: ignore[misc]
         self._uniforms_cache = None  # type: Optional[Dict[str, Union[float, int]]]
         self._active = False
         self._window_opacity = 1.0  # Window-level opacity control (separate from spiral opacity)
+        self._virtual_screen_size = None  # Optional override for preview-to-live scaling
         
         # Background image support
         self._background_texture = None  # OpenGL texture ID for background image
@@ -922,24 +924,27 @@ class LoomCompositor(QOpenGLWidget):  # type: ignore[misc]
         self.makeCurrent()
         
         if not (_HAS_QT_GL and self._initialized and self._program):
-            # Use fixed dt=1/60 to match Visual Mode Creator's timing (ensures 1:1 parity)
-            try: self.director.update(dt=1/60.0)
-            except Exception: pass
+            # CRITICAL: Never call director.update() here - causes double-updates
+            # Caller is responsible for calling director.update() and caching uniforms
             if self._trace:
-                logging.getLogger(__name__).debug(f"[spiral.trace] paintGL skipped not-initialized avail={self.available} active={self._active}")
+                logging.getLogger(__name__).debug(f"[spiral.trace] paintGL not-initialized path: skipped (cache={'set' if self._uniforms_cache else 'None'})")
             return
         if not self._active:
             if self._trace:
                 logging.getLogger(__name__).debug("[spiral.trace] paintGL inactive draw suppressed")
             return  # active gate
         from OpenGL import GL
-        # If caller provided a pre-evolved uniform cache, use that; else evolve now
+        # If caller provided a pre-evolved uniform cache, use that
+        # CRITICAL: Never call director.update() here - it causes double-updates when Qt
+        # repaints at display refresh rate (60 Hz) while app ticks at 30 Hz
         if self._uniforms_cache is None:
-            # Use fixed dt=1/60 to match Visual Mode Creator's timing (ensures 1:1 parity)
-            try: self.director.update(dt=1/60.0)
-            except Exception: pass
+            # No cache - use the last exported uniforms (director state unchanged)
+            if self._trace:
+                logging.getLogger(__name__).debug("[spiral.trace] paintGL: cache None, using last uniforms")
             uniforms = self.director.export_uniforms()
         else:
+            if self._trace:
+                logging.getLogger(__name__).debug(f"[spiral.trace] paintGL: USING cached uniforms (phase={self._uniforms_cache.get('phase', 'N/A')})")
             uniforms = self._uniforms_cache
             # clear after use to avoid stale reuse if ticking stops
             self._uniforms_cache = None
@@ -1639,8 +1644,19 @@ class LoomCompositor(QOpenGLWidget):  # type: ignore[misc]
                     GL.glEnable(GL.GL_BLEND)
                     GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA)
                 
-                GL.glActiveTexture(GL.GL_TEXTURE0)
-                GL.glBindTexture(GL.GL_TEXTURE_2D, item['texture'])
+                # Validate texture before binding (with error handling)
+                tex_id = item['texture']
+                try:
+                    if not GL.glIsTexture(tex_id):
+                        # Texture has been deleted, skip this item
+                        continue
+                    
+                    GL.glActiveTexture(GL.GL_TEXTURE0)
+                    GL.glBindTexture(GL.GL_TEXTURE_2D, tex_id)
+                except GL.GLError as e:
+                    # Texture binding failed, skip this item
+                    self.logger.debug(f"Failed to bind texture {tex_id}: {e}")
+                    continue
                 
                 loc = GL.glGetUniformLocation(self._background_program, 'uTexture')
                 if loc >= 0:
@@ -1672,6 +1688,13 @@ class LoomCompositor(QOpenGLWidget):  # type: ignore[misc]
                 GL.glBindVertexArray(0)
                 
                 first_layer = False
+            
+            # Clean up expired or invalid textures from fade queue
+            self._fade_queue = [
+                item for item in self._fade_queue
+                if GL.glIsTexture(item['texture']) and 
+                   (current_frame - item['start_frame']) < fade_duration_frames
+            ]
             
             # Enable blending for current texture (blend on top of all fading textures)
             GL.glEnable(GL.GL_BLEND)
@@ -1836,6 +1859,22 @@ class LoomCompositor(QOpenGLWidget):  # type: ignore[misc]
             self._zoom_target = 1.0
             self._background_zoom = 1.0
         logging.getLogger(__name__).info(f"[compositor] Zoom animations {'enabled' if enabled else 'disabled'}")
+    
+    def reset_zoom(self) -> None:
+        """Reset zoom animation to initial state (zoom=1.0, no animation).
+        
+        Used when switching playbacks to prevent zoom and zoom rate carryover from previous playback.
+        """
+        self._zoom_animating = False
+        self._zoom_current = 1.0
+        self._zoom_target = 1.5
+        self._zoom_start = 1.0
+        self._zoom_elapsed_frames = 0
+        self._zoom_duration_frames = 0
+        self._background_zoom = 1.0
+        self._zoom_rate = 0.0  # CRITICAL: Reset zoom rate to prevent carryover
+        self._zoom_start_time = 0.0
+        logging.getLogger(__name__).debug(f"[compositor] Zoom animation reset to 1.0 (stopped, rate cleared)")
     
     def set_zoom_mode(self, mode: str) -> None:
         """Set zoom animation mode.
@@ -2040,6 +2079,18 @@ void main() {
     
     # ===== TEXT OVERLAY RENDERING (Phase 3) =====
     
+    def _restore_previous_context(self, previous_ctx: Optional[QOpenGLContext], previous_surface) -> None:
+        """Restore whichever GL context was current before this widget took over."""
+        try:
+            if previous_ctx and previous_surface:
+                previous_ctx.makeCurrent(previous_surface)
+            else:
+                current_ctx = self.context()
+                if current_ctx:
+                    current_ctx.doneCurrent()
+        except Exception as exc:
+            logging.getLogger(__name__).debug(f"[Text] Context restore skipped: {exc}")
+
     def add_text_texture(self, texture_data: 'np.ndarray', x: float = 0.5, y: float = 0.5, 
                         alpha: float = 1.0, scale: float = 1.0):
         """Add a text overlay texture.
@@ -2061,30 +2112,61 @@ void main() {
             logging.getLogger(__name__).warning("[Text] Cannot add text texture: compositor not initialized")
             return -1
         
-        # Ensure context is current
+        previous_ctx = QOpenGLContext.currentContext()
+        previous_surface = previous_ctx.surface() if previous_ctx else None
         self.makeCurrent()
-        
-        height, width = texture_data.shape[:2]
-        
-        # Generate texture
-        tex_id = GL.glGenTextures(1)
-        GL.glBindTexture(GL.GL_TEXTURE_2D, tex_id)
-        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MIN_FILTER, GL.GL_LINEAR)
-        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MAG_FILTER, GL.GL_LINEAR)
-        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_S, GL.GL_CLAMP_TO_EDGE)
-        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_T, GL.GL_CLAMP_TO_EDGE)
-        
-        # Upload RGBA texture
-        GL.glTexImage2D(GL.GL_TEXTURE_2D, 0, GL.GL_RGBA, width, height, 0,
-                       GL.GL_RGBA, GL.GL_UNSIGNED_BYTE, texture_data)
-        
-        # Store texture info
-        text_info = (tex_id, width, height, x, y, alpha, scale)
-        self._text_textures.append(text_info)
-        
-        logging.getLogger(__name__).debug(f"[Text] Added texture {tex_id} ({width}x{height}) at ({x}, {y})")
-        
-        return len(self._text_textures) - 1
+        try:
+            height, width = texture_data.shape[:2]
+
+            tex_id = GL.glGenTextures(1)
+            GL.glBindTexture(GL.GL_TEXTURE_2D, tex_id)
+            GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MIN_FILTER, GL.GL_LINEAR)
+            GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MAG_FILTER, GL.GL_LINEAR)
+            GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_S, GL.GL_CLAMP_TO_EDGE)
+            GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_T, GL.GL_CLAMP_TO_EDGE)
+
+            GL.glTexImage2D(
+                GL.GL_TEXTURE_2D,
+                0,
+                GL.GL_RGBA,
+                width,
+                height,
+                0,
+                GL.GL_RGBA,
+                GL.GL_UNSIGNED_BYTE,
+                texture_data,
+            )
+
+            text_info = (tex_id, width, height, x, y, alpha, scale)
+            self._text_textures.append(text_info)
+
+            logging.getLogger(__name__).debug(f"[Text] Added texture {tex_id} ({width}x{height}) at ({x}, {y})")
+
+            return len(self._text_textures) - 1
+        finally:
+            self._restore_previous_context(previous_ctx, previous_surface)
+
+    def set_virtual_screen_size(self, width: Optional[int], height: Optional[int]) -> None:
+        """Override the screen size used for text scaling/logging.
+
+        Args:
+            width: Target width in pixels (None or <=0 resets to widget size)
+            height: Target height in pixels (None or <=0 resets to widget size)
+        """
+        if width and height and width > 0 and height > 0:
+            self._virtual_screen_size = (int(width), int(height))
+        else:
+            self._virtual_screen_size = None
+
+    def get_target_screen_size(self) -> tuple[int, int]:
+        """Return the virtual screen size when set, otherwise the widget size."""
+        if self._virtual_screen_size:
+            return self._virtual_screen_size
+        width = int(self.width()) if self.width() else 0
+        height = int(self.height()) if self.height() else 0
+        if width <= 0 or height <= 0:
+            return (1920, 1080)
+        return (width, height)
     
     def update_text_transform(self, index: int, x: float = None, y: float = None, 
                              alpha: float = None, scale: float = None):
@@ -2119,18 +2201,18 @@ void main() {
         if index < 0 or index >= len(self._text_textures):
             return
         
-        # Ensure context is current
+        previous_ctx = QOpenGLContext.currentContext()
+        previous_surface = previous_ctx.surface() if previous_ctx else None
         self.makeCurrent()
-        
-        # Delete texture
-        tex_id = self._text_textures[index][0]
-        if GL.glIsTexture(tex_id):
-            GL.glDeleteTextures([tex_id])
-        
-        # Remove from list
-        self._text_textures.pop(index)
-        
-        logging.getLogger(__name__).debug(f"[Text] Removed texture {tex_id}")
+        try:
+            tex_id = self._text_textures[index][0]
+            if GL.glIsTexture(tex_id):
+                GL.glDeleteTextures([tex_id])
+
+            self._text_textures.pop(index)
+            logging.getLogger(__name__).debug(f"[Text] Removed texture {tex_id}")
+        finally:
+            self._restore_previous_context(previous_ctx, previous_surface)
     
     def clear_text_textures(self):
         """Remove all text textures."""
@@ -2139,16 +2221,18 @@ void main() {
         if not self._initialized:
             return
         
-        # Ensure context is current
+        previous_ctx = QOpenGLContext.currentContext()
+        previous_surface = previous_ctx.surface() if previous_ctx else None
         self.makeCurrent()
-        
-        # Delete all textures
-        for tex_id, _, _, _, _, _, _ in self._text_textures:
-            if GL.glIsTexture(tex_id):
-                GL.glDeleteTextures([tex_id])
-        
-        self._text_textures.clear()
-        logging.getLogger(__name__).debug("[Text] Cleared all text textures")
+        try:
+            for tex_id, _, _, _, _, _, _ in self._text_textures:
+                if GL.glIsTexture(tex_id):
+                    GL.glDeleteTextures([tex_id])
+
+            self._text_textures.clear()
+            logging.getLogger(__name__).debug("[Text] Cleared all text textures")
+        finally:
+            self._restore_previous_context(previous_ctx, previous_surface)
     
     def _render_text_overlays(self, screen_width: int, screen_height: int):
         """Render all text overlays on top of everything.
@@ -2160,6 +2244,8 @@ void main() {
             screen_height: Screen height in pixels
         """
         from OpenGL import GL
+
+        target_width, target_height = self.get_target_screen_size()
         
         # Log only occasionally (every 120 frames = ~2 seconds at 60fps)
         if not hasattr(self, '_text_log_counter'):
@@ -2208,7 +2294,9 @@ void main() {
         
         # DEBUG: Log text rendering (throttled to every 300 frames = ~5 seconds at 60fps)
         if len(self._text_textures) > 0 and self._frame_counter % 300 == 0:
-            logging.getLogger(__name__).info(f"[Text] Rendering {len(self._text_textures)} text textures (screen: {screen_width}x{screen_height})")
+            logging.getLogger(__name__).info(
+                f"[Text] Rendering {len(self._text_textures)} text textures (screen: {screen_width}x{screen_height}, target: {target_width}x{target_height})"
+            )
         
         # Render each text texture
         logged_count = 0
@@ -2228,8 +2316,8 @@ void main() {
             text_display_height = tex_height * scale
             
             # Convert to normalized device coordinates (-1 to 1)
-            quad_width = (text_display_width / screen_width) * 2.0
-            quad_height = (text_display_height / screen_height) * 2.0
+            quad_width = (text_display_width / target_width) * 2.0
+            quad_height = (text_display_height / target_height) * 2.0
             
             # Convert position from (0-1) to NDC (-1 to 1)
             # Input x,y is the CENTER of the quad, but shader expects TOP-LEFT

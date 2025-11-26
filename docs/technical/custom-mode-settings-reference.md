@@ -146,23 +146,21 @@ Custom modes use a JSON format to store all visual settings. This document clari
 
 ### `spiral.arm_color` & `spiral.gap_color`
 
-**JSON Values:** ❌ **NOT STORED IN JSON**
+**JSON Values:** Arrays of three floats in range `[0.0, 1.0]`, e.g. `[1.0, 0.2, 0.2]`
 
-**Visual Mode Creator:**
-- UI Control: Buttons "Arm Color" and "Gap Color"
-- Uses color picker dialog
-- Default: Arm = white (1, 1, 1), Gap = black (0, 0, 0)
-- **Applies immediately to preview spiral**
+**Visual Mode Creator / Playback Editor:**
+- UI Controls: "Arm Color" and "Gap Color" pickers now persist selections.
+- Defaults: Arm = white `(1, 1, 1)`, Gap = black `(0, 0, 0)`.
+- Values are stored both in exported playback files and in embedded session playbacks.
 
 **Launcher Interpretation:**
-- ❌ **NOT READ FROM JSON**
-- Uses global spiral color settings from launcher UI
-- Colors are session-wide, not per-mode
+- `CustomVisual` applies the stored colors via `SpiralDirector.set_arm_color()` / `set_gap_color()`.
+- Missing fields fall back to whatever global color the launcher already configured, preserving legacy files.
 
-**⚠️ DESIGN DECISION:**
-- Colors excluded from modes to keep them as global "theme" settings
-- User can change spiral colors in launcher and they apply to ALL custom modes
-- **RECOMMENDATION**: Document this clearly in UI (tooltip/label)
+**Usage Notes:**
+- Color arrays are clamped to `[0,1]` to guard against malformed data.
+- Editing a legacy playback will automatically populate these fields on save.
+- Document cues/cuelists inherit the colors defined on each playback without additional wiring.
 
 ---
 
@@ -421,15 +419,37 @@ Custom modes use a JSON format to store all visual settings. This document clari
 **JSON Values:** Boolean `true` or `false`
 
 **Visual Mode Creator:**
-- Always exports: `true` (hardcoded)
-- No UI control
+- UI Control: Checkbox **"Sync text with media cycle"**
+- Default: Checked → `true`
+- When unchecked, enables the "Manual Text Speed" slider
 
 **Launcher Interpretation:**
-- When `true` and mode is `"centered_sync"`, text changes with media
-- When `false`, text changes on its own timer
-- Default: `true`
+- `true`: TextDirector listens to `on_media_change()` events (CENTERED text changes on every media cycle)
+- `false`: TextDirector ignores media triggers and advances on its own timer (see `manual_cycle_speed`)
+- Works for both Centered and Carousel modes
 
-**✅ ALIGNED** - Always synced for now
+**✅ ALIGNED** - Manual toggle exposed and saved per playback
+
+---
+
+### `text.manual_cycle_speed`
+
+**JSON Values:** Integer 1-100 (same curve as `media.cycle_speed`)
+
+**Visual Mode Creator:**
+- UI Control: Slider **"Manual Text Speed"** (enabled when sync toggle is OFF)
+- Default: 50 (≈1s cadence)
+- Shares exact exponential curve with media slider so matching values keep both in lockstep
+- Preview now measures *real* elapsed seconds using a monotonic clock, so even if the editor render loop drops below 60 FPS the text cadence remains faithful to the slider value (fix from 2025-11-20)
+- When **Scrolling Carousel** mode is selected the "Sync" checkbox is greyed out and this slider is always active so wallpaper text never waits on media changes
+
+**Launcher Interpretation:**
+- Converted to frames at 60 FPS using the same formula as media cycling
+- Passed to `TextDirector.configure_sync(sync_with_media=False, frames_per_text=…)`
+- Applies to both Centered and Subtext modes so carousel timing can be slowed/speed up without affecting media
+- Runtime already used frame-based intervals; with the preview fix above, both environments now stay synchronized without requiring manual slider offsets
+
+**✅ ALIGNED** - Provides deterministic cadence for manual text cycling
 
 ---
 
@@ -538,7 +558,8 @@ Custom modes use a JSON format to store all visual settings. This document clari
 | **Text Opacity** | `text.opacity` | Slider (0-100%) | `set_text_opacity(float)` | ✅ Aligned |
 | **Text ThemeBank** | `text.use_theme_bank` | Hardcoded true | Uses global library | ✅ Aligned |
 | **Text Library** | `text.library` | ❌ Not exposed | Custom text list | ✅ Aligned (unused) |
-| **Text Sync** | `text.sync_with_media` | Hardcoded true | Change with media | ✅ Aligned |
+| **Text Sync** | `text.sync_with_media` | Checkbox | Change with media | ✅ Aligned |
+| **Manual Text Speed** | `text.manual_cycle_speed` | Slider (1-100) | `configure_sync(frames)` | ✅ Aligned |
 | **Zoom Mode** | `zoom.mode` | Combo box | `start_zoom_animation()` | ✅ Aligned |
 | **Zoom Rate** | `zoom.rate` | Slider (0-500) | `_zoom_rate` | ✅ Aligned |
 | ~~**Zoom Duration**~~ | ~~`zoom.duration_frames`~~ | ~~Hardcoded 180~~ | ❌ **REMOVED** | ⛔ Redundant |

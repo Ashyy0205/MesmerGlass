@@ -1,7 +1,6 @@
 """Tests for Trance 7-type spiral system implementation."""
 
 import pytest
-import math
 from mesmerglass.mesmerloom.spiral import SpiralDirector
 
 
@@ -59,22 +58,17 @@ class TestSpiralTypes:
         assert director.spiral_width in [60, 72]
     
     def test_rotation_formula(self):
-        """Verify Trance rotation formula: phase += amount / (32 * sqrt(width))."""
+        """Verify RPM-based rotation uses dt instead of legacy amount parameter."""
         director = SpiralDirector()
-        director.spiral_width = 60
-        
-        initial_phase = director.state.phase
-        amount = 2.0
-        
-        # Calculate expected increment using Trance formula
-        expected_increment = amount / (32.0 * math.sqrt(60.0))
-        
-        # Rotate spiral
-        director.rotate_spiral(amount)
-        
-        # Verify phase changed by expected amount (with floating point tolerance)
-        actual_increment = director.state.phase - initial_phase
-        assert abs(actual_increment - expected_increment) < 1e-6
+        director.set_rotation_speed(30.0)  # 30 RPM = 0.5 rps
+        dt = 1.0 / 60.0  # 60 FPS frame
+
+        initial_phase = director._phase_accumulator
+        director.rotate_spiral(0.0, dt=dt)
+
+        expected_increment = (director.rotation_speed / 60.0) * dt
+        actual_increment = director._phase_accumulator - initial_phase
+        assert pytest.approx(expected_increment, rel=1e-6) == actual_increment
     
     def test_rotation_wrapping(self):
         """Verify phase wraps at 1.0."""
@@ -121,40 +115,51 @@ class TestSpiralTypes:
         assert 'time' in uniforms  # Should be same as phase
         assert 'acolour' in uniforms
         assert 'bcolour' in uniforms
-        assert 'uWindowOpacity' in uniforms  # Critical for visibility
-        
         # Verify default values
         assert uniforms['near_plane'] == 1.0
         assert uniforms['far_plane'] == 5.0
         assert uniforms['eye_offset'] == 0.0
-        assert uniforms['uWindowOpacity'] == 1.0  # Should be fully opaque by default
         assert isinstance(uniforms['aspect_ratio'], float)
         
         # Verify colors are RGBA tuples
         assert len(uniforms['acolour']) == 4
         assert len(uniforms['bcolour']) == 4
 
+    def test_flip_wave_uniforms(self):
+        """Flip wave exports radius and width within expected ranges."""
+        director = SpiralDirector()
+        director.state.flip_state = 1
+        director.state.flip_radius = 0.5
+        director.state.flip_width = 0.03
+
+        uniforms = director.export_uniforms()
+        assert uniforms['uFlipWaveRadius'] == pytest.approx(0.5)
+        assert uniforms['uFlipWaveWidth'] == pytest.approx(0.03)
+
 
 class TestRotationFormula:
-    """Detailed tests for the Trance rotation formula."""
-    
-    @pytest.mark.parametrize("width,amount,expected_increment", [
-        (60, 1.0, 1.0 / (32 * math.sqrt(60))),
-        (60, 2.0, 2.0 / (32 * math.sqrt(60))),
-        (60, 4.0, 4.0 / (32 * math.sqrt(60))),
-        (180, 2.0, 2.0 / (32 * math.sqrt(180))),
-        (360, 2.0, 2.0 / (32 * math.sqrt(360))),
+    """Detailed tests for the RPM-based rotation integrator."""
+
+    @pytest.mark.parametrize("rpm,dt", [
+        (4.0, 1 / 30.0),
+        (15.0, 1 / 60.0),
+        (-20.0, 1 / 90.0),
     ])
-    def test_rotation_increments(self, width, amount, expected_increment):
-        """Test rotation increments match Trance formula for various widths and amounts."""
+    def test_rotation_increments(self, rpm, dt):
+        """Phase increment should follow rpm/60 * dt regardless of legacy amount parameter."""
         director = SpiralDirector()
-        director.spiral_width = width
-        initial_phase = director.state.phase
-        
-        director.rotate_spiral(amount)
-        
-        actual_increment = (director.state.phase - initial_phase) % 1.0
-        assert abs(actual_increment - expected_increment) < 1e-6
+        director.set_rotation_speed(rpm)
+        initial = director._phase_accumulator
+
+        director.rotate_spiral(0.0, dt=dt)
+
+        expected = (rpm / 60.0) * dt
+        actual = director._phase_accumulator - initial
+        if actual > 0.5:
+            actual -= 1.0
+        if actual < -0.5:
+            actual += 1.0
+        assert pytest.approx(expected, rel=1e-6) == actual
 
 
 class TestSpiralDefaults:

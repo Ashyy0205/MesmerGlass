@@ -128,3 +128,55 @@ def test_theme_no_action():
     
     assert result.returncode == 1
     assert "Must specify --load or --test-cache" in result.stderr
+
+
+def test_theme_diag_json(sample_theme_path):
+    """Diagnostics should emit JSON when requested."""
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "mesmerglass",
+            "theme",
+            "--load",
+            str(sample_theme_path),
+            "--diag",
+            "--diag-json",
+            "--diag-lookups",
+            "1",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 0, result.stderr
+    data = json.loads(result.stdout)
+    assert "spans" in data
+    assert data.get("label") == "theme-cli"
+
+
+def test_theme_diag_fail_threshold(sample_theme_path):
+    """Diagnostics should honor --diag-fail exit behavior."""
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "mesmerglass",
+            "theme",
+            "--load",
+            str(sample_theme_path),
+            "--diag",
+            "--diag-threshold",
+            "0",
+            "--diag-fail",
+            "--diag-lookups",
+            "1",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 3
+    assert "[theme-diag]" in result.stdout

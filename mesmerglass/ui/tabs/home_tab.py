@@ -10,7 +10,6 @@ Main features:
 from __future__ import annotations
 
 import logging
-import json
 from pathlib import Path
 from typing import Optional, Dict, Any
 from PyQt6.QtWidgets import (
@@ -38,6 +37,7 @@ class HomeTab(BaseTab):
         """Set session data reference and update display."""
         self.session_data = session_data
         self._update_session_display()
+        self._refresh_media_bank_list()
         
         # Pass session data to SessionRunnerTab for session mode
         if hasattr(self, 'session_runner_tab'):
@@ -214,7 +214,7 @@ class HomeTab(BaseTab):
         info_label.setStyleSheet("color: #888; font-style: italic; font-size: 10pt;")
         layout.addWidget(info_label)
         
-        # Media bank list (shows entries from media_bank.json)
+        # Media bank list (session-scoped entries)
         self.media_bank_list = QListWidget()
         self.media_bank_list.setMaximumHeight(150)
         layout.addWidget(self.media_bank_list)
@@ -237,35 +237,28 @@ class HomeTab(BaseTab):
         layout.addLayout(btn_layout)
         
         # Load media bank on init
-        self._load_media_bank()
+        self._refresh_media_bank_list()
         
         return group
     
-    def _load_media_bank(self):
-        """Load media bank from media_bank.json."""
-        try:
-            media_bank_path = Path("media_bank.json")
-            if media_bank_path.exists():
-                with open(media_bank_path, 'r') as f:
-                    media_bank = json.load(f)
-                
-                self.media_bank_list.clear()
-                for entry in media_bank:
-                    name = entry.get("name", "Unnamed")
-                    path = entry.get("path", "")
-                    type_icon = "🖼️" if entry.get("type") == "images" else "🎬"
-                    item = QListWidgetItem(f"{type_icon} {name} ({path})")
-                    self.media_bank_list.addItem(item)
-                
-                self.logger.info(f"Loaded {len(media_bank)} media bank entries")
-            else:
-                self.logger.warning("media_bank.json not found")
-        except Exception as e:
-            self.logger.error(f"Failed to load media bank: {e}", exc_info=True)
+    def _refresh_media_bank_list(self):
+        """Refresh media bank list from the active session."""
+        entries = self.session_data.get("media_bank", []) if self.session_data else []
+        
+        self.media_bank_list.clear()
+        for entry in entries:
+            name = entry.get("name", "Unnamed")
+            path = entry.get("path", "")
+            media_type = entry.get("type", "images")
+            type_icon = "🖼️" if media_type == "images" else "🎬"
+            item = QListWidgetItem(f"{type_icon} {name} ({path})")
+            self.media_bank_list.addItem(item)
+
+        self.logger.info(f"Loaded {len(entries)} media bank entries")
     
     def _on_refresh_media_bank(self):
         """Refresh media bank list."""
-        self._load_media_bank()
+        self._refresh_media_bank_list()
     
     def _on_add_media_directory(self):
         """Add a new media directory to the bank."""
@@ -276,31 +269,50 @@ class HomeTab(BaseTab):
         if not directory:
             return
         
-        try:
-            # Load existing media bank
-            media_bank_path = Path("media_bank.json")
-            media_bank = []
-            if media_bank_path.exists():
-                with open(media_bank_path, 'r') as f:
-                    media_bank = json.load(f)
-            
-            # Add new entry
-            dir_path = Path(directory)
-            media_bank.append({
-                "name": dir_path.name,
-                "path": str(dir_path),
-                "type": "images"  # Default to images (can be changed in MesmerLoom tab)
-            })
-            
-            # Save
-            with open(media_bank_path, 'w') as f:
-                json.dump(media_bank, f, indent=2)
-            
-            self._load_media_bank()
-            self.mark_dirty()
-            self.logger.info(f"Added media directory: {directory}")
-        except Exception as e:
-            self.logger.error(f"Failed to add media directory: {e}", exc_info=True)
+        if self.session_data is None:
+            self.logger.warning("Cannot add media directory without an active session")
+            return
+
+        media_bank = self.session_data.setdefault("media_bank", [])
+        dir_path = Path(directory)
+
+        # Prompt for friendly name
+        default_name = dir_path.name
+        name, ok = QInputDialog.getText(
+            self,
+            "Media Bank Name",
+            "Enter a label for this directory:",
+            text=default_name
+        )
+        if not ok:
+            return
+        name = name.strip() or default_name
+
+        # Prompt for media type
+        type_options = ["images", "videos", "both"]
+        type_labels = ["🖼️ Images", "🎬 Videos", "🌀 Both"]
+        selection, ok = QInputDialog.getItem(
+            self,
+            "Media Bank Type",
+            "What media does this directory contain?",
+            type_labels,
+            0,
+            False
+        )
+        if not ok or not selection:
+            return
+        selected_index = type_labels.index(selection)
+        selected_type = type_options[selected_index]
+
+        media_bank.append({
+            "name": name,
+            "path": str(dir_path),
+            "type": selected_type
+        })
+
+        self._refresh_media_bank_list()
+        self.mark_dirty()
+        self.logger.info(f"Added media directory: {directory}")
     
     def _on_remove_media_directory(self):
         """Remove selected media directory from the bank."""
@@ -309,68 +321,53 @@ class HomeTab(BaseTab):
             self.logger.warning("No media bank entry selected")
             return
         
-        try:
-            # Load existing media bank
-            media_bank_path = Path("media_bank.json")
-            if not media_bank_path.exists():
-                return
-            
-            with open(media_bank_path, 'r') as f:
-                media_bank = json.load(f)
-            
-            # Remove the selected entry
-            if current_item < len(media_bank):
-                removed_entry = media_bank.pop(current_item)
-                
-                # Save updated media bank
-                with open(media_bank_path, 'w') as f:
-                    json.dump(media_bank, f, indent=2)
-                
-                self.logger.info(f"Removed media directory: {removed_entry.get('name', 'Unknown')}")
-                self._load_media_bank()
-                self.mark_dirty()
-        
-        except Exception as e:
-            self.logger.error(f"Failed to remove media directory: {e}", exc_info=True)
+        if self.session_data is None:
+            self.logger.warning("Cannot remove media directory without an active session")
+            return
+
+        media_bank = self.session_data.get("media_bank", [])
+        if current_item >= len(media_bank):
+            self.logger.warning("Selected media bank entry out of range")
+            return
+
+        removed = media_bank.pop(current_item)
+        self._refresh_media_bank_list()
+        self.mark_dirty()
+        self.logger.info(f"Removed media directory: {removed.get('name', 'Unnamed')}")
     
     def _on_recent_sessions(self):
         """Show recent sessions dialog."""
         recent_entries = self.main_window.get_recent_sessions()
-        valid_entries = []
-        labels = []
+        valid_entries: list[Path] = []
+        labels: list[str] = []
+
         for entry in recent_entries:
             path = Path(entry)
-            if not path.exists():
-                continue
-            valid_entries.append(path)
-            labels.append(f"{path.stem} — {path}")
+            if path.exists():
+                valid_entries.append(path)
+                labels.append(f"{path.name} — {path}")
 
         if not valid_entries:
-            QMessageBox.information(
-                self,
-                "No Recent Sessions",
-                "Open a session at least once to populate this list."
-            )
+            QMessageBox.information(self, "Recent Sessions", "No recent sessions found.")
             return
 
         selection, ok = QInputDialog.getItem(
             self,
             "Recent Sessions",
-            "Select a session to load:",
+            "Select a session to open:",
             labels,
             0,
             False
         )
-
         if not ok or not selection:
             return
 
         selected_index = labels.index(selection)
         chosen_path = valid_entries[selected_index]
         if self.main_window.open_session_from_path(chosen_path):
-            # Refresh local reference and UI since session_data gets replaced
             self.session_data = self.main_window.session_data
             self._update_session_display()
+            self._refresh_media_bank_list()
     
     def _on_new_cuelist(self):
         """Create a new cuelist."""
@@ -420,7 +417,7 @@ class HomeTab(BaseTab):
         """Called when tab becomes visible."""
         self.logger.debug("HomeTab shown")
         # Refresh media bank when tab is shown
-        self._load_media_bank()
+        self._refresh_media_bank_list()
         
         # Update SessionRunner dependencies if available
         if self.visual_director:

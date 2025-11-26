@@ -39,6 +39,8 @@ The Visual Mode Creator provides real-time preview with these controls:
 - Enabled/Disabled
 - Mode: CENTERED_SYNC (changes with media), SUBTEXT (scrolling carousel)
 - Opacity: 0.0 to 1.0
+- Sync Toggle: When enabled, text follows the media cycle; when disabled you can set a manual cadence
+- Manual Text Speed: 1-100 slider that uses the same curve as media speed so matching values keep them aligned
 
 **Zoom Settings:**
 - Mode: No Zoom, Zoom In, Zoom Out, Zoom Pulse
@@ -101,7 +103,8 @@ Custom modes are JSON files with this structure:
     "opacity": 1.0,
     "use_theme_bank": true,
     "library": [],
-    "sync_with_media": true
+    "sync_with_media": true,
+    "manual_cycle_speed": 50
   },
   
   "zoom": {
@@ -141,6 +144,7 @@ Custom modes are JSON files with this structure:
 - `use_theme_bank` (boolean): If true, uses launcher's text library; if false, uses `library`
 - `library` (array of strings): Custom text phrases (only used if `use_theme_bank` is false)
 - `sync_with_media` (boolean): For `centered_sync` mode, triggers text change with media
+- `manual_cycle_speed` (integer): 1-100 slider that controls manual cadence when sync is disabled (matches media speed curve)
 
 **`zoom`** (object):
 - `mode` (string): `"none"`, `"in"`, `"out"`, `"pulse"`

@@ -5,8 +5,9 @@ Replaces the legacy Launcher with a cleaner, session-focused design.
 """
 from __future__ import annotations
 
-import json
 import logging
+import threading
+import time
 from pathlib import Path
 from typing import Optional, List
 
@@ -24,6 +25,8 @@ from .tabs.playbacks_tab import PlaybacksTab
 from .tabs.display_tab import DisplayTab
 from ..content.simple_video_streamer import SimpleVideoStreamer
 from ..content.media_scan import scan_media_directory
+from ..content.themebank import ThemeBank
+from ..content.theme import ThemeConfig
 
 
 class MainApplication(QMainWindow):
@@ -48,6 +51,7 @@ class MainApplication(QMainWindow):
         # Session management
         self.session_manager = SessionManager()
         self.session_data: Optional[dict] = None
+        self._media_scan_thread: Optional[threading.Thread] = None
         
         # Auto-save timer (debounce saves to avoid excessive file I/O)
         self.auto_save_timer = QTimer()
@@ -131,14 +135,6 @@ class MainApplication(QMainWindow):
                 self.logger.error(f"Video streamer initialization failed: {streamer_exc}")
             
             # 3.5. Create ThemeBank for media management
-            from ..content.themebank import ThemeBank
-            from ..content.theme import ThemeConfig
-            from pathlib import Path
-            import json
-            import threading
-            
-            # Create EMPTY ThemeBank immediately to prevent UI blocking
-            # Media will be loaded asynchronously after UI appears
             root_path = Path("MEDIA") if Path("MEDIA").exists() else Path(".")
             empty_theme = ThemeConfig(
                 name="Loading...",
@@ -156,81 +152,7 @@ class MainApplication(QMainWindow):
             )
             self.theme_bank.set_active_themes(primary_index=1)
             self.logger.info("ThemeBank created (empty, media will load in background)")
-            
-            # Load media asynchronously AFTER UI appears
-            def load_media_async():
-                try:
-                    self.logger.info("🔄 Starting background media scan...")
-                    
-                    # Load media bank configuration
-                    media_bank_path = Path("media_bank.json")
-                    media_entries = []
-                    if media_bank_path.exists():
-                        with open(media_bank_path, 'r', encoding='utf-8') as f:
-                            media_entries = json.load(f)
-                    
-                    # Build themes from media bank entries
-                    themes = []
-                    for idx, entry in enumerate(media_entries):
-                        theme_name = entry.get('name', 'Unnamed')
-                        media_dir = Path(entry.get('path', ''))
-                        media_type = entry.get('type', 'images')
-                        
-                        # SKIP NETWORK DRIVES automatically to prevent lag
-                        if media_dir.drive and media_dir.drive.upper() in ['U:', 'Z:', 'Y:', 'X:', 'W:', 'V:']:
-                            self.logger.warning(f"⚠️  Skipping network drive '{theme_name}': {media_dir} (use local drives for performance)")
-                            continue
-                        
-                        if not media_dir.exists():
-                            self.logger.warning(f"⚠️  Skipping '{theme_name}': {media_dir} doesn't exist")
-                            continue
-                        
-                        all_images, all_videos = scan_media_directory(media_dir)
-
-                        if media_type == 'images':
-                            images = all_images
-                            videos = []
-                        elif media_type == 'videos':
-                            images = []
-                            videos = all_videos
-                        else:  # 'both' or unexpected string → include everything
-                            images = all_images
-                            videos = all_videos
-                        
-                        theme = ThemeConfig(
-                            name=theme_name,
-                            enabled=True,
-                            image_path=images,
-                            animation_path=videos,
-                            font_path=[],
-                            text_line=[]
-                        )
-                        themes.append(theme)
-                        self.logger.info(f"✅ Theme '{theme_name}': {len(images)} images, {len(videos)} videos")
-                    
-                    # Update ThemeBank with loaded themes
-                    if themes:
-                        # Update root_path to empty (using absolute paths)
-                        self.theme_bank._root_path = Path(".")
-                        self.theme_bank._themes = [t for t in themes if t.enabled]
-                        # CRITICAL: Rebuild image caches for new themes
-                        self.theme_bank._preload_theme_images()
-                        self.theme_bank.set_active_themes(primary_index=1)
-                        self.logger.info(f"✅ Media scan complete: {len(themes)} theme(s) loaded, {sum(len(t.image_path) for t in themes)} total images")
-                    else:
-                        self.logger.warning("⚠️  No media found in media bank")
-                
-                except Exception as e:
-                    self.logger.error(f"❌ Background media scan failed: {e}")
-            
-            # Start background thread AFTER a short delay to let UI appear first
-            def delayed_load():
-                import time
-                time.sleep(1)  # Wait 1 second for UI to appear
-                load_media_async()
-            
-            media_thread = threading.Thread(target=delayed_load, daemon=True, name="MediaScanner")
-            media_thread.start()
+            self._schedule_media_bank_refresh(delay=1.0)
             
             # 4. Create VisualDirector (manages playback loading)
             from ..mesmerloom.visual_director import VisualDirector
@@ -734,7 +656,89 @@ class MainApplication(QMainWindow):
             self.display_tab.set_session_data(self.session_data)
         
         self.logger.info("Session data propagated to all tabs")
+        self._schedule_media_bank_refresh()
     
+    def _get_media_bank_entries(self) -> List[dict]:
+        """Return session-defined media bank entries."""
+        if not self.session_data:
+            return []
+        entries = self.session_data.get("media_bank", [])
+        return [dict(entry) for entry in entries if isinstance(entry, dict)]
+
+    def _schedule_media_bank_refresh(self, delay: float = 0.0):
+        """Kick off a background media scan after an optional delay."""
+        if getattr(self, "theme_bank", None) is None:
+            return
+
+        def runner():
+            if delay > 0:
+                time.sleep(delay)
+            self._load_media_bank_async()
+
+        thread = threading.Thread(target=runner, daemon=True, name="MediaScanner")
+        thread.start()
+        self._media_scan_thread = thread
+
+    def _load_media_bank_async(self):
+        """Build ThemeBank themes from the active session's media directories."""
+        try:
+            entries = self._get_media_bank_entries()
+            self.logger.info("🔄 Starting background media scan...")
+
+            themes = []
+            for entry in entries:
+                theme_name = entry.get('name', 'Unnamed')
+                media_dir = Path(entry.get('path', ''))
+                media_type = entry.get('type', 'images')
+
+                if media_dir.drive and media_dir.drive.upper() in ['U:', 'Z:', 'Y:', 'X:', 'W:', 'V:']:
+                    self.logger.warning(
+                        f"⚠️  Skipping network drive '{theme_name}': {media_dir} (use local drives for performance)"
+                    )
+                    continue
+
+                if not media_dir.exists():
+                    self.logger.warning(f"⚠️  Skipping '{theme_name}': {media_dir} doesn't exist")
+                    continue
+
+                all_images, all_videos = scan_media_directory(media_dir)
+
+                if media_type == 'images':
+                    images = all_images
+                    videos = []
+                elif media_type == 'videos':
+                    images = []
+                    videos = all_videos
+                else:
+                    images = all_images
+                    videos = all_videos
+
+                theme = ThemeConfig(
+                    name=theme_name,
+                    enabled=True,
+                    image_path=images,
+                    animation_path=videos,
+                    font_path=[],
+                    text_line=[]
+                )
+                themes.append(theme)
+                self.logger.info(f"✅ Theme '{theme_name}': {len(images)} images, {len(videos)} videos")
+
+            if themes:
+                self.theme_bank._root_path = Path('.')
+                self.theme_bank._themes = [t for t in themes if t.enabled]
+                self.theme_bank._preload_theme_images()
+                self.theme_bank.set_active_themes(primary_index=1)
+                total_images = sum(len(t.image_path) for t in themes)
+                self.logger.info(
+                    f"✅ Media scan complete: {len(themes)} theme(s) loaded, {total_images} total images"
+                )
+            else:
+                self.logger.warning("⚠️  No media found in session media bank")
+
+        except Exception as exc:
+            self.logger.error(f"❌ Background media scan failed: {exc}")
+
     def _on_import_cuelist(self):
         """Import a cuelist file."""
         file_path, _ = QFileDialog.getOpenFileName(

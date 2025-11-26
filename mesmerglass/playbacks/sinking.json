@@ -1,0 +1,23 @@
+{
+  "spiral": {
+    "type": "logarithmic",
+    "rotation_speed": 4.0,
+    "opacity": 0.4,
+    "reverse": true,
+    "arm_color": [1.0, 0.6, 0.4],
+    "gap_color": [0.0, 0.0, 0.0]
+  },
+  "media": {
+    "cycle_speed": 50
+  },
+  "zoom": {
+    "mode": "exponential",
+    "rate": 0.42,
+    "duration_frames": 180
+  },
+  "text": {
+    "items": [
+      {"msg": "Sink deeper", "mode": "default"}
+    ]
+  }
+}

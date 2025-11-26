@@ -163,6 +163,23 @@ If the spiral overlay is black or not rendering on a secondary display:
 8. Report logs and system details for further diagnosis.
 
 **Note:** Some Windows/Qt/driver combinations may fail to create a valid OpenGL context on non-primary screens. The logs will help pinpoint if the compositor is initializing, if the framebuffer/context is valid, and if the window is visible/fullscreen.
+
+## Background Media Diagnostics
+
+The LoomWindowCompositor QOpenGLWindow mirrors the legacy widget compositor but now exposes a `get_background_debug_state()` helper so you can verify the media pipeline without attaching a GPU debugger.
+
+Returned fields include:
+- `enabled`, `texture_id`, and `image_size` (width, height)
+- Current `zoom`, fade queue length, and whether a fade is active
+- `last_render_frame` (frame counter when `_render_background` last succeeded)
+- `last_error` (stringified exception from the last failed background render)
+- Count of `uploads` applied since initialization plus `last_set_timestamp`
+
+Workflow hints:
+1. Run `python -m mesmerglass selftest` — it now asserts this helper exists and prints "background diagnostics available" on success.
+2. From the embedded console (Ctrl+Shift+D) call `app.compositor.get_background_debug_state()` to confirm ThemeBank uploads even when the window looks empty.
+3. If media is still missing, inspect `last_error` and correlate it with `[visual] Background render failed` logs to pinpoint shader/program/context issues quickly.
+
 ## Logging & Diagnostics
 
 To enable verbose spiral trace logging (for debugging multi-display or context issues), set the environment variable:
@@ -247,7 +264,8 @@ Performance impact is minimal (typically <2% even at maximum settings) due to ef
 | uContrast | Contrast multiplier | 0.85–1.25 (clamped) | Intensity adds up to +0.18 |
 | uVignette | Vignette amount | 0.22–0.38 | Intensity scaled |
 | uChromaticShift | Pixel radius color shift | 0.0–0.3 | Intensity scaled |
-| uFlipWaveRadius | Wavefront position | -0.2 → 1.2 | Animates during flip |
+| uFlipWaveRadius | Wavefront radius | 0.0 → 1.2 | Animates from center outward |
+| uFlipWaveWidth | Wavefront thickness | 0.02 → 0.05 | Controls thin visible ring |
 | uFlipState | 0 idle / 1 flipping | {0,1} | Controls boost + radius prog |
 | uIntensity | Current intensity scalar | 0.0–1.0 | UI slider (slew-limited) |
 | uSafetyClamped | Flag if any clamp applied this frame | {0,1} | Diagnostic |
@@ -271,7 +289,8 @@ Performance impact is minimal (typically <2% even at maximum settings) due to ef
 
 ## Inside-Out Flip Wave
 - Trigger cadence: every ~3 min (240→120 s intensity mapped) ±45 s jitter.
-- Wavefront radius animates: `uFlipWaveRadius -0.2 → 1.2` over wave duration (~22–40 s depending on intensity).
+- Wavefront radius animates: `uFlipWaveRadius 0.0 → 1.2` over wave duration (~22–40 s depending on intensity).
+- Band thickness narrows at higher intensity via `uFlipWaveWidth`, keeping the spiral visible while the inside-out wave passes.
 - Wave width soft edge: ~`uFlipWaveWidth` conceptual (~0.08) encoded via shader smoothstep logic.
 - During flip: temporary speed boost (~+0.03 cps) inside active region (simplified: uniform additive boost).
 - After completion: radius resets to -0.2 and state returns to idle.

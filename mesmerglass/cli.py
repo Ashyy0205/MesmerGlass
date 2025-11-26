@@ -8,19 +8,24 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import os
-from typing import Optional
+import shlex
+from pathlib import Path
+from dataclasses import asdict
+from typing import Optional, Callable
 
 # Suppress pygame support prompt so JSON outputs (e.g. session --print) remain clean.
 os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 
 from .engine.buttplug_server import ButtplugServer
 from .engine.pulse import PulseEngine
-from .logging_utils import setup_logging, get_default_log_path
+from .logging_utils import setup_logging, get_default_log_path, LogMode, PerfTracer
 from .devtools.virtual_toy import VirtualToy  # dev-only, used by 'toy' subcommand
 from .content.loader import load_session_pack  # session packs
-import subprocess, sys, warnings, pathlib
+from .session.cue import AudioRole
+import subprocess, sys, warnings
 from mesmerglass.mesmerloom.compositor import LoomCompositor
 
 class GLUnavailableError(RuntimeError):
@@ -35,6 +40,12 @@ def _add_logging_args(parser: argparse.ArgumentParser) -> None:
         help="Set log level (default: INFO)",
     )
     parser.add_argument(
+        "--log-mode",
+        choices=[mode.value for mode in LogMode],
+        default=LogMode.NORMAL.value,
+        help="Logging preset: quiet suppresses console info, perf forces DEBUG",
+    )
+    parser.add_argument(
         "--log-file",
         default=str(get_default_log_path()),
         help="Path to log file (default: per-user MesmerGlass directory)",
@@ -45,6 +56,12 @@ def _add_logging_args(parser: argparse.ArgumentParser) -> None:
         default="plain",
         help="Log format (plain or json)",
     )
+
+
+def _build_logging_parent() -> argparse.ArgumentParser:
+    parent = argparse.ArgumentParser(add_help=False)
+    _add_logging_args(parent)
+    return parent
 
 
 async def _cli_pulse(level: float, duration_ms: int, port: int) -> int:
@@ -85,20 +102,245 @@ def selftest() -> int:
     try:
         import PyQt6  # noqa: F401  # Ensure UI deps import
         from .engine import audio, video, pulse  # noqa: F401
-        logging.getLogger(__name__).info("Selftest OK: imports succeeded")
+        from .mesmerloom.window_compositor import LoomWindowCompositor
+
+        if not hasattr(LoomWindowCompositor, "get_background_debug_state"):
+            raise RuntimeError("Background diagnostics helper missing")
+
+        msg = "Selftest OK: imports + background diagnostics available"
+        logging.getLogger(__name__).info(msg)
+        print(msg)
         return 0
     except Exception as e:
         logging.getLogger(__name__).error("Selftest failed: %s", e)
         return 1
 
 
+def _parse_instruction_lines(file_path: Path) -> list[tuple[int, str, list[str]]]:
+    commands: list[tuple[int, str, list[str]]] = []
+    content = file_path.read_text(encoding="utf-8")
+    for lineno, raw_line in enumerate(content.splitlines(), start=1):
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        try:
+            argv = shlex.split(raw_line, comments=True, posix=True)
+        except ValueError as exc:
+            raise ValueError(f"Invalid syntax on line {lineno}: {exc}") from exc
+        if not argv:
+            continue
+        commands.append((lineno, raw_line.rstrip(), argv))
+    return commands
+
+
+def run_instruction_file(
+    file_path: str | os.PathLike[str],
+    *,
+    continue_on_error: bool = False,
+    dry_run: bool = False,
+    workdir: Optional[str] = None,
+    echo: bool = True,
+) -> int:
+    """Execute a newline-delimited list of CLI commands."""
+
+    path = Path(file_path).expanduser().resolve()
+    if not path.exists():
+        print(f"instructions: file not found: {path}")
+        return 1
+    try:
+        commands = _parse_instruction_lines(path)
+    except ValueError as exc:
+        print(f"instructions: {exc}")
+        return 2
+    if not commands:
+        print(f"instructions: no runnable commands in {path}")
+        return 0
+
+    if workdir:
+        if workdir == "@file":
+            cwd = path.parent
+        else:
+            cwd = Path(workdir).expanduser().resolve()
+    else:
+        cwd = Path.cwd()
+    if not cwd.exists():
+        print(f"instructions: working directory does not exist: {cwd}")
+        return 1
+
+    total = len(commands)
+    final_rc = 0
+    for idx, (lineno, raw_line, argv) in enumerate(commands, start=1):
+        display = " ".join(argv)
+        if echo:
+            print(f"[instructions] ({idx}/{total}) {display}")
+        if dry_run:
+            continue
+        proc = subprocess.run(
+            [sys.executable, "-m", "mesmerglass", *argv],
+            cwd=str(cwd),
+        )
+        if proc.returncode != 0:
+            msg = (
+                f"instructions: command from line {lineno} failed with exit code {proc.returncode}"
+            )
+            print(msg)
+            final_rc = proc.returncode
+            if not continue_on_error:
+                return final_rc
+    return final_rc
+
+
+def _load_theme_bank_from_media_bank(
+    media_bank_path: Path,
+    *,
+    cache_size: int = 256,
+):
+    """Build a ThemeBank instance directly from media_bank.json entries."""
+
+    from mesmerglass.content.theme import ThemeConfig
+    from mesmerglass.content.themebank import ThemeBank
+    from mesmerglass.content.media_scan import scan_media_directory
+
+    log = logging.getLogger(__name__)
+    path = media_bank_path.expanduser().resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"media bank not found: {path}")
+
+    try:
+        entries = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:  # pragma: no cover - malformed user file
+        raise ValueError(f"Invalid JSON in {path}: {exc}") from exc
+
+    if not isinstance(entries, list):
+        raise ValueError(f"Media bank must be a list of entries (got {type(entries).__name__})")
+
+    themes: list[ThemeConfig] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        raw_path = entry.get("path")
+        if not raw_path:
+            continue
+        dir_path = Path(raw_path).expanduser()
+        if not dir_path.exists():
+            log.warning("[themebank.cli] Skipping missing directory: %s", dir_path)
+            continue
+        images, videos = scan_media_directory(dir_path)
+        media_type = (entry.get("type") or "both").lower()
+        if media_type == "images":
+            videos = []
+        elif media_type == "videos":
+            images = []
+        theme = ThemeConfig(
+            name=entry.get("name", dir_path.name),
+            enabled=True,
+            image_path=images,
+            animation_path=videos,
+            font_path=[],
+            text_line=[],
+        )
+        themes.append(theme)
+
+    if not themes:
+        raise RuntimeError("No usable media directories were found; run 'media bank' setup first")
+
+    bank = ThemeBank(
+        themes=themes,
+        root_path=Path("."),
+        image_cache_size=max(32, cache_size),
+    )
+    alt_index = 2 if len(themes) > 1 else None
+    bank.set_active_themes(primary_index=1, alt_index=alt_index)
+    return bank
+
+
+def _themebank_payload(status, *, require_videos: bool) -> dict:
+    payload = asdict(status)
+    payload["requires_videos"] = require_videos
+    payload["ready"] = bool(status.ready and (not require_videos or status.total_videos > 0))
+    return payload
+
+
+def cmd_themebank(args) -> int:
+    """CLI helpers for ThemeBank readiness diagnostics."""
+
+    from mesmerglass.content.themebank import ThemeBank
+
+    media_bank = Path(getattr(args, "media_bank", "media_bank.json") or "media_bank.json")
+    wait_s = max(0.0, float(getattr(args, "wait", 0.0) or 0.0))
+    require_videos_flag = bool(getattr(args, "require_videos", False))
+    cmd = getattr(args, "themebank_cmd", "stats")
+    enforce_videos = bool(require_videos_flag or cmd == "pull-video")
+
+    try:
+        bank: ThemeBank = _load_theme_bank_from_media_bank(media_bank)
+    except Exception as exc:
+        print(f"themebank: {exc}", file=sys.stderr)
+        return 2
+
+    try:
+        status = bank.ensure_ready(require_videos=enforce_videos, timeout_s=wait_s)
+        payload = _themebank_payload(status, require_videos=enforce_videos)
+        ready = payload["ready"]
+
+        if cmd == "stats":
+            if getattr(args, "json", False):
+                print(json.dumps({"media_bank": str(media_bank), **payload}, indent=2))
+            else:
+                print(f"ThemeBank ready: {'yes' if ready else 'no'} ({status.ready_reason})")
+                print(f"  Themes: {payload['themes_total']} (primary={payload['active_primary']} alt={payload['active_alternate']})")
+                print(f"  Images: {payload['total_images']} cached={payload['cached_images']} pending={payload['pending_loads']}")
+                print(f"  Videos: {payload['total_videos']}")
+                if payload.get("last_image_path"):
+                    print(f"  Last image: {payload['last_image_path']}")
+                if payload.get("last_video_path"):
+                    print(f"  Last video: {payload['last_video_path']}")
+            return 0 if ready else 2
+
+        if cmd == "selftest":
+            if ready:
+                print("ThemeBank selftest OK")
+                return 0
+            print(f"ThemeBank selftest FAILED ({status.ready_reason})", file=sys.stderr)
+            return 3
+
+        if cmd == "pull-image":
+            image = bank.get_image()
+            if image is None:
+                print("themebank pull-image: ThemeBank returned no image (empty cache)", file=sys.stderr)
+                return 4
+            print(f"Loaded image {image.width}x{image.height} from {image.path}")
+            return 0
+
+        if cmd == "pull-video":
+            video_path = bank.get_video()
+            if video_path is None:
+                print("themebank pull-video: ThemeBank returned no video", file=sys.stderr)
+                return 5
+            print(str(video_path))
+            return 0
+
+        print(f"themebank: unknown subcommand '{cmd}'", file=sys.stderr)
+        return 2
+    finally:
+        bank.shutdown()
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="MesmerGlass CLI")
-    _add_logging_args(parser)
+    logging_parent = _build_logging_parent()
+    parser = argparse.ArgumentParser(
+        description="MesmerGlass CLI",
+        parents=[logging_parent],
+    )
     sub = parser.add_subparsers(dest="command", required=False)
 
+    def add_subparser(name: str, **kwargs: object) -> argparse.ArgumentParser:
+        parents = list(kwargs.pop("parents", []))
+        parents.insert(0, logging_parent)
+        return sub.add_parser(name, parents=parents, **kwargs)
+
     # GUI launcher
-    p_run = sub.add_parser("run", help="Start the GUI (default)")
+    p_run = add_subparser("run", help="Start the GUI (default)")
     p_run.add_argument("--vr", action="store_true", help="Enable head-locked VR streaming (OpenXR if available; falls back to mock)")
     p_run.add_argument("--vr-mock", action="store_true", help="Force VR mock mode (no OpenXR session)")
     p_run.add_argument("--vr-no-begin", action="store_true", help="Proceed without explicit xrBeginSession (unsafe; for minimal bindings)")
@@ -106,21 +348,31 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--vr-minimal", action="store_true", help="Disable media/text/video subsystems; stream spiral only for maximum stability")
     p_run.add_argument("--vr-allow-media", action="store_true", help="Do not auto-mute media components when running in VR (may be unstable)")
 
-    p_pulse = sub.add_parser("pulse", help="Send a single pulse (alias: 'test')")
+    run_theme = p_run.add_argument_group("ThemeBank throttles")
+    run_theme.add_argument("--theme-lookahead", type=int, metavar="N", help="Cap ThemeBank lookahead queue (default 32)")
+    run_theme.add_argument("--theme-batch", type=int, metavar="N", help="Limit images decoded per preload batch (default 12)")
+    run_theme.add_argument("--theme-sleep-ms", type=float, metavar="MS", help="Sleep between background loads in ms (default 4.0)")
+    run_theme.add_argument("--theme-max-ms", type=float, metavar="MS", help="Time budget per preload batch before yielding (default 200)")
+    run_theme.add_argument("--media-queue", type=int, metavar="N", help="Async image decode queue depth (default 8)")
+    theme_toggle = run_theme.add_mutually_exclusive_group()
+    theme_toggle.add_argument("--theme-preload-all", action="store_true", help="Force legacy preload-all behavior (loads every image immediately)")
+    theme_toggle.add_argument("--theme-no-preload", action="store_true", help="Disable background lookahead threads entirely")
+
+    p_pulse = add_subparser("pulse", help="Send a single pulse (alias: 'test')")
     p_pulse.add_argument("--level", type=float, default=0.5, help="Pulse intensity 0..1")
     p_pulse.add_argument("--duration", type=int, default=500, help="Duration in ms")
     p_pulse.add_argument("--port", type=int, default=12345, help="Buttplug server port")
 
     # Alias for backward compatibility (was 'test' in run.py)
-    p_test_alias = sub.add_parser("test", help=argparse.SUPPRESS)
+    p_test_alias = add_subparser("test", help=argparse.SUPPRESS)
     p_test_alias.add_argument("--level", type=float, default=0.5)
     p_test_alias.add_argument("--duration", type=int, default=500)
     p_test_alias.add_argument("--port", type=int, default=12345)
 
-    p_srv = sub.add_parser("server", help="Start a local Buttplug server")
+    p_srv = add_subparser("server", help="Start a local Buttplug server")
     p_srv.add_argument("--port", type=int, default=12345)
 
-    p_ui = sub.add_parser("ui", help="Drive basic UI navigation for testing")
+    p_ui = add_subparser("ui", help="Drive basic UI navigation for testing")
     # Query/Navigation
     p_ui.add_argument("--list-tabs", action="store_true", help="List top-level tab names and exit")
     p_ui.add_argument("--tab", type=str, default=None, help="Select a tab by name (case-insensitive) or index")
@@ -145,8 +397,20 @@ def build_parser() -> argparse.ArgumentParser:
     p_ui.add_argument("--timeout", type=float, default=0.3, help="Seconds to keep the event loop alive (default: 0.3)")
     p_ui.add_argument("--show", action="store_true", help="Show the main window (default: hidden)")
 
+    p_instr = add_subparser("instructions", help="Execute CLI commands listed in a text file")
+    p_instr.add_argument("file", help="Path to instructions text file")
+    p_instr.add_argument("--workdir", type=str, default=None,
+                         help="Working directory for commands (default: current dir; use @file for the instructions folder)")
+    p_instr.add_argument("--continue-on-error", action="store_true",
+                         help="Run all commands even if one fails (exit status reflects failures)")
+    p_instr.add_argument("--dry-run", action="store_true",
+                         help="Parse and print commands without executing them")
+    p_instr.add_argument("--no-echo", dest="echo", action="store_false",
+                         help="Suppress per-command echo output")
+    p_instr.set_defaults(echo=True)
+
     # dev-only: virtual toy simulator to drive tests or local dev without hardware
-    p_toy = sub.add_parser("toy", help="Run a deterministic virtual toy simulator (dev-only)")
+    p_toy = add_subparser("toy", help="Run a deterministic virtual toy simulator (dev-only)")
     p_toy.add_argument("--name", type=str, default="Virtual Test Toy")
     p_toy.add_argument("--port", type=int, default=12345)
     p_toy.add_argument("--latency-ms", type=int, default=0)
@@ -156,18 +420,38 @@ def build_parser() -> argparse.ArgumentParser:
     p_toy.add_argument("--offset", type=float, default=0.0)
     p_toy.add_argument("--run-for", type=float, default=5.0, help="Seconds to run before exiting")
 
-    sub.add_parser("selftest", help="Quick environment/import check")
+    add_subparser("selftest", help="Quick environment/import check")
     
     # Theme and media loading commands
-    p_theme = sub.add_parser("theme", help="Theme and media loading test")
+    p_theme = add_subparser("theme", help="Theme and media loading test")
     p_theme.add_argument("--load", type=str, help="Path to theme JSON file")
     p_theme.add_argument("--list", action="store_true", help="List available themes in collection")
     p_theme.add_argument("--show-config", action="store_true", help="Print theme configuration as JSON")
     p_theme.add_argument("--test-shuffler", type=int, metavar="N", help="Test weighted shuffler N times")
     p_theme.add_argument("--test-cache", action="store_true", help="Test image cache with sample images")
+    p_theme.add_argument("--diag", action="store_true", help="Run ThemeBank perf diagnostics (requires --load)")
+    p_theme.add_argument("--diag-json", action="store_true", help="Print raw PerfTracer snapshot for diagnostics")
+    p_theme.add_argument("--diag-limit", type=int, default=10, help="Maximum spans to list in diagnostics output")
+    p_theme.add_argument("--diag-threshold", type=float, default=150.0, help="Highlight spans at/above this duration in ms")
+    p_theme.add_argument("--diag-lookups", type=int, default=24, help="Number of get_image calls to simulate during diagnostics")
+    p_theme.add_argument("--diag-cache-size", type=int, default=128, help="Image cache size for ThemeBank diagnostics")
+    p_theme.add_argument("--diag-prefetch-only", action="store_true", help="Skip sync get_image calls and only run prefetch threads")
+    p_theme.add_argument("--diag-fail", action="store_true", help="Exit with code 3 if any span meets/exceeds --diag-threshold")
+
+    p_themebank = add_subparser("themebank", help="Inspect or selftest ThemeBank media readiness")
+    p_themebank.add_argument("--media-bank", default="media_bank.json", help="Path to media_bank.json (default: %(default)s)")
+    p_themebank.add_argument("--wait", type=float, default=0.0, help="Seconds to wait for readiness before evaluating (default: 0)")
+    tb_sub = p_themebank.add_subparsers(dest="themebank_cmd", required=True)
+    tb_stats = tb_sub.add_parser("stats", help="Print ThemeBank readiness summary")
+    tb_stats.add_argument("--require-videos", action="store_true", help="Treat missing videos as failure")
+    tb_stats.add_argument("--json", action="store_true", help="Emit JSON payload instead of text")
+    tb_self = tb_sub.add_parser("selftest", help="Exit 0 when ThemeBank has accessible media")
+    tb_self.add_argument("--require-videos", action="store_true", help="Require at least one video")
+    tb_pull_image = tb_sub.add_parser("pull-image", help="Load a single ThemeBank image and print metadata")
+    tb_pull_video = tb_sub.add_parser("pull-video", help="Select a ThemeBank video and print its path")
     
     # MesmerLoom spiral visual test (Phase 2 real implementation)
-    p_spiral = sub.add_parser("spiral-test", help="Run a bounded MesmerLoom spiral render test")
+    p_spiral = add_subparser("spiral-test", help="Run a bounded MesmerLoom spiral render test")
     p_spiral.add_argument("--video", type=str, default="none", help="Video path or 'none' for neutral")
     p_spiral.add_argument("--intensity", type=float, default=0.75, help="Initial intensity 0..1 (default: 0.75)")
     p_spiral.add_argument("--blend", choices=["multiply","screen","softlight"], default="multiply", help="Blend mode (default: multiply)")
@@ -195,7 +479,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_spiral.add_argument("--move-scale-test", action="store_true", help="Test if artifacts are screen-fixed or content-fixed (drag/scale window)")
 
     # Spiral type testing (Trance 7-type system)
-    p_spiral_type = sub.add_parser("spiral-type", help="Test specific Trance spiral types (1-7)")
+    p_spiral_type = add_subparser("spiral-type", help="Test specific Trance spiral types (1-7)")
     p_spiral_type.add_argument("--type", type=int, choices=range(1, 8), default=3,
                               help="Spiral type: 1=log, 2=quad, 3=linear, 4=sqrt, 5=inverse, 6=power, 7=modulated (default: 3)")
     p_spiral_type.add_argument("--width", type=int, choices=[360, 180, 120, 90, 72, 60], default=60,
@@ -212,13 +496,13 @@ def build_parser() -> argparse.ArgumentParser:
                               help="Use QOpenGLWindow instead of QOpenGLWidget")
 
     # Test runner integration (wraps previous run_tests.py functionality)
-    p_tr = sub.add_parser("test-run", help="Run pytest with selection shortcuts (replaces run_tests.py)")
+    p_tr = add_subparser("test-run", help="Run pytest with selection shortcuts (replaces run_tests.py)")
     p_tr.add_argument("type", choices=["all","fast","slow","unit","integration","bluetooth"], nargs="?", default="all")
     p_tr.add_argument("-v","--verbose", action="store_true")
     p_tr.add_argument("-c","--coverage", action="store_true")
 
     # Session pack subcommand
-    p_sess = sub.add_parser("session", help="Load and inspect/apply a session pack")
+    p_sess = add_subparser("session", help="Load and inspect/apply a session pack")
     p_sess.add_argument("--load", required=True, help="Path to session pack JSON file")
     g = p_sess.add_mutually_exclusive_group()
     g.add_argument("--print", action="store_true", help="Print canonical JSON and exit")
@@ -226,7 +510,7 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--summary", action="store_true", help="Print concise summary (default)")
 
     # Runtime session state (save/load current UI configuration)
-    p_state = sub.add_parser("state", help="Save or apply runtime UI/device/audio/text settings")
+    p_state = add_subparser("state", help="Save or apply runtime UI/device/audio/text settings")
     act = p_state.add_mutually_exclusive_group(required=True)
     act.add_argument("--save", action="store_true", help="Capture current defaults (headless) and write to file")
     act.add_argument("--apply", action="store_true", help="Apply a saved state file (headless)")
@@ -234,8 +518,24 @@ def build_parser() -> argparse.ArgumentParser:
     p_state.add_argument("--file", required=True, help="Target state JSON file (input or output depending on action)")
     p_state.add_argument("--from-live", action="store_true", help="(Reserved) Capture from a running instance (not yet implemented)")
 
+    p_cuelist = add_subparser("cuelist", help="Inspect, validate, or run cuelists headlessly")
+    p_cuelist.add_argument("--load", required=True, help="Path to cuelist JSON file")
+    g_cuelist = p_cuelist.add_mutually_exclusive_group()
+    g_cuelist.add_argument("--validate", action="store_true", help="Validate structure and referenced media")
+    g_cuelist.add_argument("--print", action="store_true", help="Print cuelist summary and exit")
+    g_cuelist.add_argument("--execute", action="store_true", help="Execute cuelist headlessly (default)")
+    p_cuelist.add_argument("--duration", type=float, default=None, help="Override execution duration in seconds")
+    p_cuelist.add_argument("--json", action="store_true", help="Emit JSON output when printing or validating")
+    p_cuelist.add_argument("--diag", action="store_true", help="Run headless diagnostics and print PerfTracer spans")
+    p_cuelist.add_argument("--diag-cues", type=int, default=2, help="Number of cues to simulate during diagnostics (default: 2)")
+    p_cuelist.add_argument("--diag-json", action="store_true", help="Emit raw JSON snapshot for diagnostics")
+    p_cuelist.add_argument("--diag-threshold", type=float, default=250.0, help="Highlight spans at/above this duration in ms (default: 250)")
+    p_cuelist.add_argument("--diag-limit", type=int, default=10, help="Maximum spans to list in diagnostics output (default: 10)")
+    p_cuelist.add_argument("--diag-prefetch-only", action="store_true", help="Only measure prefetch timing (skip cue playback start)")
+    p_cuelist.add_argument("--diag-fail", action="store_true", help="Return exit code 3 when any span exceeds the threshold")
+
     # Mode verification (diagnostics for VMC↔Launcher equivalence)
-    p_mv = sub.add_parser("mode-verify", help="Validate a mode's derived timing and spiral RPM math headlessly")
+    p_mv = add_subparser("mode-verify", help="Validate a mode's derived timing and spiral RPM math headlessly")
     p_mv.add_argument("--mode", required=True, help="Path to mode JSON file")
     p_mv.add_argument("--frames", type=int, default=120, help="Frames to simulate (default: 120)")
     p_mv.add_argument("--fps", type=float, default=60.0, help="Frames per second (default: 60)")
@@ -243,7 +543,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_mv.add_argument("--json", dest="json_out", action="store_true", help="Print JSON summary")
 
     # Spiral measurement (arm sweep timing)
-    p_sm = sub.add_parser("spiral-measure", help="Measure time for an arm to sweep a given angle (director or Qt timer)")
+    p_sm = add_subparser("spiral-measure", help="Measure time for an arm to sweep a given angle (director or Qt timer)")
     g_sm = p_sm.add_mutually_exclusive_group(required=False)
     g_sm.add_argument("--rpm", type=float, help="Spiral speed in RPM (negative = reverse)")
     g_sm.add_argument("--x", type=float, help="UI 'x' speed (mapped to RPM using VMC gain: RPM = x * 10)")
@@ -266,7 +566,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_sm.add_argument("--json", dest="json_out", action="store_true", help="Print JSON result")
 
     # Media cycle measurement (VMC vs baseline Qt timer)
-    p_mm = sub.add_parser("media-measure", help="Measure media cycle intervals and compare VMC/Launcher vs Qt timer")
+    p_mm = add_subparser("media-measure", help="Measure media cycle intervals and compare VMC/Launcher vs Qt timer")
     p_mm.add_argument("--mode", choices=["timer","vmc","launcher","both","all"], default="both", help="Measurement mode: timer, vmc, launcher, both(timer+vmc) or all")
     p_mm.add_argument("--speeds", type=str, default=None, help="Comma-separated cycle speeds 1..100, e.g. '10,20,50,80,100'")
     p_mm.add_argument("--sweep", type=str, default=None, help="Speed sweep as start:end:step (inclusive), e.g. '10:100:10'")
@@ -292,7 +592,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_mm.add_argument("--csv", type=str, default=None, help="Write results to CSV file path")
 
     # VR offscreen self-test (no Qt widgets) for ALVR/OpenXR
-    p_vrs = sub.add_parser("vr-selftest", help="Run offscreen GL + OpenXR submit loop (no UI)")
+    p_vrs = add_subparser("vr-selftest", help="Run offscreen GL + OpenXR submit loop (no UI)")
     p_vrs.add_argument("--seconds", type=float, default=15.0, help="Duration in seconds (default: 15.0)")
     p_vrs.add_argument("--fps", type=float, default=60.0, help="Target frames per second (default: 60)")
     p_vrs.add_argument("--pattern", choices=["solid", "grid"], default="solid", help="Test pattern to render (default: solid)")
@@ -300,7 +600,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_vrs.add_argument("--mock", action="store_true", help="Force VR mock mode (skip OpenXR)")
     
     # MesmerVisor VR streaming commands
-    p_vr_stream = sub.add_parser("vr-stream", help="Stream live visuals to VR headset (MesmerVisor)")
+    p_vr_stream = add_subparser("vr-stream", help="Stream live visuals to VR headset (MesmerVisor)")
     p_vr_stream.add_argument("--host", type=str, default="0.0.0.0", help="Server host address (default: 0.0.0.0)")
     p_vr_stream.add_argument("--port", type=int, default=5555, help="TCP streaming port (default: 5555)")
     p_vr_stream.add_argument("--discovery-port", type=int, default=5556, help="UDP discovery port (default: 5556)")
@@ -315,7 +615,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_vr_stream.add_argument("--intensity", type=float, default=0.75, help="Initial spiral intensity 0-1 (default: 0.75)")
     p_vr_stream.add_argument("--duration", type=float, default=0, help="Stream duration in seconds (0=infinite)")
     
-    p_vr_test = sub.add_parser("vr-test", help="Test VR streaming with generated pattern (no full app)")
+    p_vr_test = add_subparser("vr-test", help="Test VR streaming with generated pattern (no full app)")
     p_vr_test.add_argument("--pattern", choices=["checkerboard", "gradient", "noise", "spiral"], default="checkerboard",
                           help="Test pattern type (default: checkerboard)")
     p_vr_test.add_argument("--host", type=str, default="0.0.0.0", help="Server host address")
@@ -926,16 +1226,99 @@ def cmd_spiral_type(args) -> None:
     
     sys.exit(app.exec())
 
+
+def _run_theme_perf_diag(args, collection, *, theme_path) -> int:
+    import json as _json
+    import sys as _sys
+    import time as _time
+    from pathlib import Path as _Path
+
+    from mesmerglass.content.themebank import ThemeBank
+
+    enabled = collection.get_enabled_themes()
+    if not enabled:
+        print("Error: No enabled themes available for diagnostics", file=_sys.stderr)
+        return 1
+
+    tracer = PerfTracer(label="theme-cli", enabled=True)
+    lookups = max(1, int(getattr(args, "diag_lookups", 24) or 24))
+    prefetch_only = bool(getattr(args, "diag_prefetch_only", False))
+    cache_size = max(8, int(getattr(args, "diag_cache_size", 128) or 128))
+    tracer.set_context(
+        theme_file=str(theme_path),
+        enabled_themes=len(enabled),
+        cache_size=cache_size,
+        lookups=lookups,
+        prefetch_only=prefetch_only,
+    )
+
+    bank: ThemeBank | None = None
+    try:
+        bank = ThemeBank(
+            themes=enabled,
+            root_path=_Path(theme_path).parent,
+            image_cache_size=cache_size,
+            perf_tracer=tracer,
+        )
+        alt_index = 2 if len(enabled) > 1 else None
+        bank.set_active_themes(primary_index=1, alt_index=alt_index)
+
+        iterations = lookups
+        for idx in range(iterations):
+            if not prefetch_only:
+                alternate = bool(alt_index and (idx % 2 == 1))
+                bank.get_image(alternate=alternate)
+            bank.async_update()
+            _time.sleep(0.01)
+
+        snapshot = bank.get_perf_snapshot(reset=False) or {}
+    finally:
+        if bank is not None:
+            bank.shutdown()
+
+    threshold = max(0.0, float(getattr(args, "diag_threshold", 0.0) or 0.0))
+    limit = max(1, int(getattr(args, "diag_limit", 10) or 10))
+
+    if getattr(args, "diag_json", False):
+        print(_json.dumps(snapshot, ensure_ascii=False, indent=2))
+    else:
+        spans = snapshot.get("span_count") or len(snapshot.get("spans", []))
+        print(
+            f"[theme-diag] spans={spans} lookups={lookups} threshold={threshold:.1f}ms alt={'yes' if len(enabled) > 1 else 'no'} prefetch_only={prefetch_only}"
+        )
+        categories = snapshot.get("categories") or {}
+        if categories:
+            print("[theme-diag] Category totals (ms):")
+            for name, total in sorted(categories.items(), key=lambda item: item[1], reverse=True):
+                print(f"  - {name}: {total:.1f}")
+        table_lines, _ = _render_diag_table(snapshot, limit=limit, threshold_ms=threshold)
+        if table_lines:
+            for line in table_lines:
+                print(line)
+        else:
+            print("[theme-diag] No spans matched the threshold")
+
+    spans = snapshot.get("spans", [])
+    offending_total = sum(1 for span in spans if span.get("duration_ms", 0.0) >= threshold)
+    if getattr(args, "diag_fail", False) and offending_total > 0:
+        return 3
+    return 0
+
 def cmd_theme(args) -> int:
-    """Theme and media loading test command.
-    
+    """Theme and media loading test/diagnostic command.
+
     Exit codes:
-      0 success
-      1 error
+        0 success
+        1 error / invalid input
+        3 perf threshold exceeded (when --diag-fail is set)
     """
     import json
     from pathlib import Path
     from mesmerglass.content.theme import load_theme_collection, ThemeCollection, Shuffler
+
+    if args.diag and not args.load:
+        print("Error: --diag requires --load", file=sys.stderr)
+        return 1
     
     if args.load:
         path = Path(args.load)
@@ -948,6 +1331,9 @@ def cmd_theme(args) -> int:
         except Exception as e:
             print(f"Error loading theme: {e}", file=sys.stderr)
             return 1
+
+        if args.diag:
+            return _run_theme_perf_diag(args, collection, theme_path=path)
         
         if args.list:
             print(f"\nThemes in collection ({len(collection.themes)} total):")
@@ -1058,7 +1444,8 @@ def cmd_mode_verify(args) -> int:
         dt = 1.0 / float(args.fps)
         start = d.state.phase
         for _ in range(frames):
-            d.rotate_spiral(0.0)
+            # update() already advances rotation using the provided dt, so avoid
+            # double-stepping the phase accumulator which skewed RPM math.
             d.update(dt)
         end = d.state.phase
         delta = (end - start) % 1.0
@@ -1096,6 +1483,335 @@ def cmd_mode_verify(args) -> int:
     except Exception as e:
         print(f"Error: mode-verify failed: {e}")
         return 1
+
+
+def cmd_cuelist(args) -> int:
+    """Inspect, validate, or execute cuelist files without launching the UI."""
+    import json as _json
+    from pathlib import Path as _Path
+    import time as _time
+
+    from .session.cuelist import Cuelist
+
+    log = logging.getLogger(__name__)
+    cuelist_path = _Path(args.load)
+
+    if not cuelist_path.exists():
+        print(f"Error: cuelist file not found: {cuelist_path}")
+        return 1
+
+    try:
+        cuelist = Cuelist.load(cuelist_path)
+    except Exception as exc:
+        log.error("Failed to load cuelist %s: %s", cuelist_path, exc)
+        print(f"Error: failed to load cuelist: {exc}")
+        return 1
+
+    mode = "execute"
+    if getattr(args, "validate", False):
+        mode = "validate"
+    elif getattr(args, "print", False):
+        mode = "print"
+    elif getattr(args, "execute", False):
+        mode = "execute"
+
+    base_dir = cuelist_path.parent
+
+    if getattr(args, "diag", False):
+        if mode != "execute":
+            print("Error: --diag can only be used when executing the cuelist")
+            return 1
+        diag_result = _run_cuelist_diag(
+            cuelist,
+            cue_limit=getattr(args, "diag_cues", 2),
+            prefetch_only=getattr(args, "diag_prefetch_only", False),
+        )
+        error = diag_result.get("error")
+        if error:
+            print(f"Error: {error}")
+            snapshot = diag_result.get("snapshot")
+            if getattr(args, "diag_json", False) and snapshot:
+                print(_json.dumps(snapshot, ensure_ascii=False, indent=2))
+            return diag_result.get("code", 1)
+        snapshot = diag_result.get("snapshot")
+        limit = max(1, int(getattr(args, "diag_limit", 10) or 10))
+        threshold = max(0.0, float(getattr(args, "diag_threshold", 0.0) or 0.0))
+        table_lines, offending = _render_diag_table(snapshot, limit=limit, threshold_ms=threshold)
+        if getattr(args, "diag_json", False):
+            print(_json.dumps(snapshot or {}, ensure_ascii=False, indent=2))
+        else:
+            executed = diag_result.get("executed", 0)
+            print(f"[diag] Simulated {executed} cue(s); threshold={threshold:.1f} ms")
+            context = (snapshot or {}).get("context") if snapshot else None
+            if context:
+                print(f"[diag] Context: {context}")
+            if table_lines:
+                for line in table_lines:
+                    print(line)
+            else:
+                print("[diag] No spans met the threshold")
+            categories = (snapshot or {}).get("categories") if snapshot else None
+            if isinstance(categories, dict) and categories:
+                print("[diag] Category totals (ms):")
+                for name, total in sorted(categories.items(), key=lambda item: item[1], reverse=True):
+                    print(f"  - {name}: {total:.1f}")
+        if getattr(args, "diag_fail", False) and offending > 0:
+            return 3
+        return 0
+
+    if mode == "validate":
+        errors: list[str] = []
+        warnings: list[str] = []
+        is_valid, msg = cuelist.validate()
+        if not is_valid:
+            errors.append(msg)
+
+        for idx, cue in enumerate(cuelist.cues):
+            for entry in cue.playback_pool:
+                pb_path = entry.playback_path
+                if not pb_path.is_absolute():
+                    pb_path = (base_dir / pb_path).resolve()
+                if not pb_path.exists():
+                    errors.append(
+                        f"Cue {idx + 1} '{cue.name}': playback file not found: {entry.playback_path}"
+                    )
+            for track in cue.audio_tracks:
+                tr_path = track.file_path
+                if not tr_path.is_absolute():
+                    tr_path = (base_dir / tr_path).resolve()
+                if not tr_path.exists():
+                    errors.append(
+                        f"Cue {idx + 1} '{cue.name}': audio file not found: {track.file_path}"
+                    )
+
+            audio_layers = cue.get_audio_layers()
+            if cue.audio_tracks:
+                if AudioRole.HYPNO not in audio_layers:
+                    errors.append(
+                        f"Cue {idx + 1} '{cue.name}': hypno track missing role assignment"
+                    )
+                if AudioRole.BACKGROUND not in audio_layers:
+                    warnings.append(
+                        f"Cue {idx + 1} '{cue.name}': background track not configured"
+                    )
+                else:
+                    background_track = audio_layers[AudioRole.BACKGROUND]
+                    if not background_track.loop:
+                        warnings.append(
+                            f"Cue {idx + 1} '{cue.name}': background track does not loop"
+                        )
+
+        summary = {
+            "valid": len(errors) == 0,
+            "cuelist": {"name": cuelist.name, "cues": len(cuelist.cues)},
+            "errors": errors,
+            "warnings": warnings,
+        }
+
+        if getattr(args, "json", False):
+            print(_json.dumps(summary, ensure_ascii=False))
+        else:
+            status = "PASSED" if summary["valid"] else "FAILED"
+            print(f"Validation: {status}")
+            if errors:
+                print(f"[FAIL] Found {len(errors)} error(s):")
+                for err in errors:
+                    print(f"  - {err}")
+            if warnings:
+                print(f"[WARN] Found {len(warnings)} warning(s):")
+                for warn in warnings:
+                    print(f"  - {warn}")
+        return 0 if summary["valid"] else 1
+
+    if mode == "print":
+        if getattr(args, "json", False):
+            print(_json.dumps(cuelist.to_dict(), ensure_ascii=False, indent=2))
+            return 0
+
+        total_duration = cuelist.total_duration()
+        print(f"Cuelist: {cuelist.name}")
+        print(f"Version: {cuelist.version}")
+        print(f"Author: {cuelist.author or 'Unknown'}")
+        print(f"Loop Mode: {cuelist.loop_mode.value}")
+        if cuelist.description:
+            print(f"Description: {cuelist.description}")
+        print(f"Cues: {len(cuelist.cues)}  Total Duration: {total_duration:.1f}s")
+        print()
+        for idx, cue in enumerate(cuelist.cues, start=1):
+            print(f"  [{idx}] {cue.name} ({cue.duration_seconds:.1f}s)")
+            print(f"      Playbacks: {len(cue.playback_pool)} | Audio Tracks: {len(cue.audio_tracks)}")
+            hyp = "yes" if cue.get_audio_track(AudioRole.HYPNO) else "no"
+            bg = "yes" if cue.get_audio_track(AudioRole.BACKGROUND) else "no"
+            print(f"      Audio Roles -> hypno: {hyp}, background: {bg}")
+        return 0
+
+    # Default: execute headlessly
+    duration_override = getattr(args, "duration", None)
+    if duration_override is not None and duration_override <= 0:
+        print("Error: --duration must be positive when provided")
+        return 1
+
+    target_duration = duration_override if duration_override is not None else cuelist.total_duration()
+    if target_duration <= 0:
+        print("Error: cuelist has no duration to execute")
+        return 1
+
+    remaining = target_duration
+    print(f"[INFO] Starting cuelist session: {cuelist.name}")
+    print(f"[INFO] Total cues: {len(cuelist.cues)}")
+    print(f"[INFO] Session duration: {target_duration:.1f}s")
+    print()
+
+    start_ts = _time.perf_counter()
+    for idx, cue in enumerate(cuelist.cues, start=1):
+        if remaining <= 0:
+            break
+        slice_duration = min(cue.duration_seconds, remaining)
+        print(f"[TIME] Cue {idx}/{len(cuelist.cues)}: {cue.name} ({slice_duration:.1f}s)")
+        _time.sleep(min(0.5, slice_duration))
+        remaining -= slice_duration
+
+    elapsed = _time.perf_counter() - start_ts
+    print()
+    print(f"[OK] Session completed in {elapsed:.1f}s")
+    return 0
+
+
+class _DiagTextDirector:
+    def reset(self) -> None:
+        return None
+
+    def set_secondary_compositors(self, *_args, **_kwargs) -> None:
+        return None
+
+
+class _DiagVisualDirector:
+    def __init__(self) -> None:
+        self.text_director = _DiagTextDirector()
+        self._cycle_callbacks: list[Callable[[], None]] = []
+        self._cycle_count = 0
+
+    def register_cycle_callback(self, callback: Callable[[], None]) -> None:
+        if callback not in self._cycle_callbacks:
+            self._cycle_callbacks.append(callback)
+
+    def unregister_cycle_callback(self, callback: Callable[[], None]) -> None:
+        if callback in self._cycle_callbacks:
+            self._cycle_callbacks.remove(callback)
+
+    def register_secondary_compositor(self, *_args, **_kwargs) -> None:
+        return None
+
+    def unregister_secondary_compositor(self, *_args, **_kwargs) -> None:
+        return None
+
+    def get_cycle_count(self) -> int:
+        return self._cycle_count
+
+    def load_playback(self, _playback_path) -> bool:
+        # Pretend load succeeded instantly
+        return True
+
+    def start_playback(self) -> None:
+        # Advance cycle count and fire callbacks to emulate boundary events
+        self._cycle_count += 1
+        for callback in list(self._cycle_callbacks):
+            try:
+                callback()
+            except Exception:
+                continue
+
+    def pause(self) -> None:
+        return None
+
+    def resume(self) -> None:
+        return None
+
+    def update(self, *_args, **_kwargs) -> None:
+        return None
+
+
+def _run_cuelist_diag(
+    cuelist,
+    *,
+    cue_limit: int,
+    prefetch_only: bool,
+) -> dict[str, object]:
+    import time as _time
+    from .session.runner import SessionRunner, SessionState
+    from .engine.audio import AudioEngine
+    from .logging_utils import LogMode, get_log_mode, set_log_mode
+
+    if not cuelist.cues:
+        return {"error": "Cuelist has no cues to diagnose", "code": 1}
+
+    if get_log_mode() is not LogMode.PERF:
+        set_log_mode(LogMode.PERF)
+
+    audio_engine = AudioEngine(num_channels=2)
+    if not getattr(audio_engine, "init_ok", True):
+        return {"error": "AudioEngine failed to initialize (pygame mixer unavailable)", "code": 2}
+
+    visual_director = _DiagVisualDirector()
+    runner = SessionRunner(
+        cuelist=cuelist,
+        visual_director=visual_director,
+        audio_engine=audio_engine,
+        session_data=None,
+    )
+    runner._state = SessionState.RUNNING  # type: ignore[attr-defined]
+    runner._session_start_time = _time.time()
+
+    cue_total = min(max(1, int(cue_limit or 1)), len(cuelist.cues))
+    executed = 0
+    error: Optional[str] = None
+    try:
+        for cue_index in range(cue_total):
+            runner._prefetch_cue_audio(cue_index, force=True)  # type: ignore[attr-defined]
+            runner._await_cue_audio_ready(cue_index)  # type: ignore[attr-defined]
+            if prefetch_only:
+                executed += 1
+                continue
+            if not runner._start_cue(cue_index):  # type: ignore[attr-defined]
+                error = f"Failed to start cue {cue_index}"
+                break
+            runner._end_cue()  # type: ignore[attr-defined]
+            executed += 1
+    finally:
+        runner._current_cue_index = -1  # type: ignore[attr-defined]
+        if runner._prefetch_worker:  # type: ignore[attr-defined]
+            runner._prefetch_worker.shutdown(wait=True)  # type: ignore[attr-defined]
+        runner.stop()
+
+    snapshot = runner.get_perf_snapshot(reset=True)
+    if error:
+        return {"error": error, "code": 1, "snapshot": snapshot, "executed": executed}
+    return {"snapshot": snapshot, "executed": executed}
+
+
+def _render_diag_table(snapshot: Optional[dict[str, object]], *, limit: int, threshold_ms: float) -> tuple[list[str], int]:
+    import json as _json_diag
+
+    if not snapshot:
+        return [], 0
+    spans = snapshot.get("spans") or []
+    if not isinstance(spans, list):
+        return [], 0
+    filtered = [s for s in spans if isinstance(s, dict) and s.get("duration_ms", 0.0) >= threshold_ms]
+    filtered.sort(key=lambda item: item.get("duration_ms", 0.0), reverse=True)
+    if limit > 0:
+        filtered = filtered[:limit]
+    if not filtered:
+        return [], 0
+    width = max(4, max(len(str(s.get("name", ""))) for s in filtered))
+    header = f"{'Span':<{width}} | Category   | Duration (ms) | Metadata"
+    lines = [header, "-" * len(header)]
+    for row in filtered:
+        meta_json = _json_diag.dumps(row.get("metadata", {}), ensure_ascii=False)
+        lines.append(
+            f"{row.get('name', ''):<{width}} | {row.get('category', ''):<10} | {row.get('duration_ms', 0.0):>12.2f} | {meta_json}"
+        )
+    return lines, len(filtered)
 
 # --- Spiral arm sweep measurement helpers ---
 VMC_SPEED_GAIN = 10.0  # Keep in sync with scripts/visual_mode_creator.py
@@ -1320,7 +2036,6 @@ def measure_spiral_time_director(rpm: float, delta_deg: float, reverse: bool = F
     # Safety cap to avoid infinite loop
     max_frames = int(10 * fps)  # up to 10s
     while frames < max_frames:
-        d.rotate_spiral(0.0)
         d.update(1.0 / fps)
         frames += 1
         cur = d.state.phase
@@ -1356,7 +2071,6 @@ def measure_spiral_time_qt(rpm: float, delta_deg: float, interval_ms: int, rever
     def _tick():
         nonlocal ticks, achieved
         ticks += 1
-        d.rotate_spiral(0.0)
         d.update(1/60.0)  # director’s rotation uses fixed 60 FPS increments
         cur = d.state.phase
         delta = (cur - start_phase) % 1.0
@@ -1894,6 +2608,8 @@ def _measure_launcher_intervals(speed: int, cycles: int, quiet: bool = False,
         # Import launcher and construct without showing window
         from .ui.launcher import Launcher
         launcher = Launcher(title="Measure", enable_device_sync_default=False)
+        if getattr(launcher, "is_headless_stub", False):
+            raise GLUnavailableError("Launcher UI not available; install full Phase 7 UI to use --mode launcher")
         if callable(progress_cb):
             try:
                 progress_cb("  [launch] launcher created (headless)")
@@ -2116,19 +2832,24 @@ def cmd_media_measure(args) -> int:
             })
             _progress(f"  [vmc]   {vm.get('count', 0)} samples avg {vm.get('avg_ms', 0.0):.2f} ms (± {vm.get('std_ms', 0.0):.2f})")
         if "launcher" in selected_modes:
-            ln = _measure_launcher_intervals(
-                s,
-                per_speed_cycles,
-                quiet=quiet_flag,
-                timeout_multiplier=getattr(args, 'timeout_multiplier', 2.5),
-                max_seconds=getattr(args, 'max_seconds', None),
-                progress_cb=_progress,
-            )
-            row.update({
-                "launcher_avg_ms": round(ln.get("avg_ms", 0.0), 2),
-                "launcher_std_ms": round(ln.get("std_ms", 0.0), 2),
-            })
-            _progress(f"  [launch] {ln.get('count', 0)} samples avg {ln.get('avg_ms', 0.0):.2f} ms (± {ln.get('std_ms', 0.0):.2f})")
+            try:
+                ln = _measure_launcher_intervals(
+                    s,
+                    per_speed_cycles,
+                    quiet=quiet_flag,
+                    timeout_multiplier=getattr(args, 'timeout_multiplier', 2.5),
+                    max_seconds=getattr(args, 'max_seconds', None),
+                    progress_cb=_progress,
+                )
+            except GLUnavailableError as exc:
+                row["launcher_error"] = str(exc)
+                _progress(f"  [launch] skipped: {exc}")
+            else:
+                row.update({
+                    "launcher_avg_ms": round(ln.get("avg_ms", 0.0), 2),
+                    "launcher_std_ms": round(ln.get("std_ms", 0.0), 2),
+                })
+                _progress(f"  [launch] {ln.get('count', 0)} samples avg {ln.get('avg_ms', 0.0):.2f} ms (± {ln.get('std_ms', 0.0):.2f})")
         _progress(f"✔ done speed {s}\n")
         rows.append(row)
     # Optional CSV export
@@ -2434,14 +3155,25 @@ def main(argv: Optional[list[str]] = None) -> int:
     # Suppress pygame support prompt globally for all commands (ensures JSON-only stdout for tests)
     import os as _os_global
     _os_global.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
+    if getattr(args, "log_mode", None):
+        _os_global.environ["MESMERGLASS_LOG_MODE"] = args.log_mode
     setup_logging(
         level=args.log_level,
         log_file=args.log_file,
         json_format=(args.log_format == "json"),
+        log_mode=args.log_mode,
         add_console=True,
     )
 
     cmd = args.command or "run"
+    if cmd == "instructions":
+        return run_instruction_file(
+            args.file,
+            continue_on_error=getattr(args, "continue_on_error", False),
+            dry_run=getattr(args, "dry_run", False),
+            workdir=getattr(args, "workdir", None),
+            echo=getattr(args, "echo", True),
+        )
     if cmd == "run":
         # Propagate VR flags via env before importing the GUI app
         try:
@@ -2465,6 +3197,20 @@ def main(argv: Optional[list[str]] = None) -> int:
             # Soft mitigation: when VR is enabled but not in minimal mode, reduce OpenCV risk unless user explicitly opts-in
             if getattr(args, "vr", False) and not getattr(args, "vr_minimal", False) and not getattr(args, "vr_allow_media", False):
                 _os_run.environ.setdefault("MESMERGLASS_DISABLE_OPENCV", "1")
+            if getattr(args, "theme_lookahead", None) is not None:
+                _os_run.environ["MESMERGLASS_THEME_LOOKAHEAD"] = str(max(0, int(args.theme_lookahead)))
+            if getattr(args, "theme_batch", None) is not None:
+                _os_run.environ["MESMERGLASS_THEME_BATCH"] = str(max(0, int(args.theme_batch)))
+            if getattr(args, "theme_sleep_ms", None) is not None:
+                _os_run.environ["MESMERGLASS_THEME_SLEEP_MS"] = str(max(0.0, float(args.theme_sleep_ms)))
+            if getattr(args, "theme_max_ms", None) is not None:
+                _os_run.environ["MESMERGLASS_THEME_MAX_MS"] = str(max(0.0, float(args.theme_max_ms)))
+            if getattr(args, "media_queue", None) is not None:
+                _os_run.environ["MESMERGLASS_MEDIA_QUEUE"] = str(max(1, int(args.media_queue)))
+            if getattr(args, "theme_preload_all", False):
+                _os_run.environ["MESMERGLASS_THEME_PRELOAD_ALL"] = "1"
+            elif getattr(args, "theme_no_preload", False):
+                _os_run.environ["MESMERGLASS_THEME_PRELOAD_ALL"] = "0"
         except Exception:
             pass
         # Import app lazily so that commands like 'session' don't trigger pygame/audio init
@@ -2620,7 +3366,16 @@ def main(argv: Optional[list[str]] = None) -> int:
             except Exception as e:
                 print(f"Error: failed to apply session pack: {e}")
                 return 1
-            status = {"pack": pack.name, "text": getattr(win, "text", None), "buzz_intensity": getattr(win, "buzz_intensity", None)}
+            status_text = getattr(win, "text", None)
+            if status_text is None and getattr(pack, "first_text", None):
+                status_text = (pack.first_text or None)
+            if isinstance(status_text, str):
+                status_text = status_text.strip() or status_text
+            status = {
+                "pack": pack.name,
+                "text": status_text,
+                "buzz_intensity": getattr(win, "buzz_intensity", 0.0),
+            }
             print(_json.dumps(status, ensure_ascii=False))
             try:
                 win.close()
@@ -2632,6 +3387,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             ps = f"{len(pack.pulse.stages)} stages" if hasattr(pack, 'pulse') and hasattr(pack.pulse, 'stages') and pack.pulse.stages else "0 stages"
             print(f"SessionPack '{pack.name}' v{pack.version} — {ti}, {ps}")
             return 0
+    if cmd == "cuelist":
+        return cmd_cuelist(args)
     if cmd == "state":
         from .content.loader import load_session_state, save_session_state
         from PyQt6.QtWidgets import QApplication
@@ -2798,6 +3555,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             if idx is None:
                 logging.getLogger(__name__).error("Unknown tab: %s", target)
                 win.close()
+                return 1
             win.tabs.setCurrentIndex(idx)
             logging.getLogger(__name__).info("Selected tab: %s", win.tabs.tabText(idx))
         # Load state first if requested (so subsequent setters override)
@@ -2981,6 +3739,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         return cmd_vr_stream(args)
     if cmd == "vr-test":
         return cmd_vr_test(args)
+    if cmd == "themebank":
+        return cmd_themebank(args)
 
     parser.print_help()
     return 2

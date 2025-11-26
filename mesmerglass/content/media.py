@@ -11,12 +11,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 import logging
-from typing import Optional, List, Callable, Tuple
+import time
+from typing import Optional, List, Callable, Tuple, Any
 from pathlib import Path
 import threading
 import queue
 from collections import deque
 import numpy as np
+from ..logging_utils import BurstSampler, PerfTracer
 
 try:
     from PIL import Image as PILImage
@@ -79,75 +81,77 @@ class CachedImage:
     last_used: float = 0.0
 
 
-def load_image_sync(path: Path) -> Optional[ImageData]:
-    """Load image from file synchronously.
-    
-    Tries OpenCV first (faster), falls back to PIL if available.
-    
-    Args:
-        path: Path to image file
-    
-    Returns:
-        ImageData if successful, None if failed
-    """
-    # Try OpenCV first (faster)
-    if _HAS_CV2:
-        try:
-            # Load image with opencv (BGR format)
-            img_bgr = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
-            
-            if img_bgr is None:
-                raise ValueError(f"OpenCV failed to load {path}")
-            
-            # Convert BGR(A) to RGBA
-            if len(img_bgr.shape) == 2:
-                # Grayscale
-                img_rgba = cv2.cvtColor(img_bgr, cv2.COLOR_GRAY2RGBA)
-            elif img_bgr.shape[2] == 3:
-                # BGR → RGBA
-                img_rgba = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGBA)
-            elif img_bgr.shape[2] == 4:
-                # BGRA → RGBA
-                img_rgba = cv2.cvtColor(img_bgr, cv2.COLOR_BGRA2RGBA)
-            else:
-                raise ValueError(f"Unexpected channel count: {img_bgr.shape[2]}")
-            
-            height, width = img_rgba.shape[:2]
-            
-            return ImageData(
-                width=width,
-                height=height,
-                data=img_rgba,
-                path=path
+def _perf_span(
+    tracer: Optional[PerfTracer],
+    name: str,
+    *,
+    category: str = "media",
+    metadata: Optional[dict[str, Any]] = None,
+):
+    if tracer is None:
+        return PerfTracer.noop_span()
+    meta = dict(metadata or {})
+    return tracer.span(name, category=category, metadata=meta)
+
+
+def load_image_sync(path: Path, perf_tracer: Optional[PerfTracer] = None) -> Optional[ImageData]:
+    """Load image from file synchronously with optional PerfTracer spans."""
+
+    span = _perf_span(perf_tracer, "media_load_image", metadata={"path": path.name})
+    backend = None
+    error: Optional[str] = None
+    start = time.perf_counter()
+    image: Optional[ImageData] = None
+
+    with span:
+        if _HAS_CV2:
+            try:
+                img_bgr = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+                if img_bgr is None:
+                    raise ValueError(f"OpenCV failed to load {path}")
+
+                if len(img_bgr.shape) == 2:
+                    img_rgba = cv2.cvtColor(img_bgr, cv2.COLOR_GRAY2RGBA)
+                elif img_bgr.shape[2] == 3:
+                    img_rgba = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGBA)
+                elif img_bgr.shape[2] == 4:
+                    img_rgba = cv2.cvtColor(img_bgr, cv2.COLOR_BGRA2RGBA)
+                else:
+                    raise ValueError(f"Unexpected channel count: {img_bgr.shape[2]}")
+
+                height, width = img_rgba.shape[:2]
+                image = ImageData(width=width, height=height, data=img_rgba, path=path)
+                backend = "opencv"
+            except Exception as exc:  # noqa: BLE001
+                error = str(exc)
+                if not _HAS_PIL:
+                    span.annotate(result="fail", backend="opencv", error=error)
+                    return None
+
+        if image is None and _HAS_PIL:
+            try:
+                img = PILImage.open(path)
+                if img.mode != "RGBA":
+                    img = img.convert("RGBA")
+                data = np.array(img, dtype=np.uint8)
+                image = ImageData(width=img.width, height=img.height, data=data, path=path)
+                backend = "pil"
+            except Exception as exc:  # noqa: BLE001
+                error = str(exc)
+
+        duration_ms = (time.perf_counter() - start) * 1000.0
+        if image is not None:
+            span.annotate(
+                result="ok",
+                backend=backend or "unknown",
+                width=image.width,
+                height=image.height,
+                duration_ms=round(duration_ms, 3),
             )
-        except Exception as e:
-            # Fall through to PIL if opencv fails
-            if not _HAS_PIL:
-                return None
-    
-    # Fallback to PIL
-    if _HAS_PIL:
-        try:
-            # Load image with PIL
-            img = PILImage.open(path)
-            
-            # Convert to RGBA
-            if img.mode != 'RGBA':
-                img = img.convert('RGBA')
-            
-            # Convert to numpy array
-            data = np.array(img, dtype=np.uint8)
-            
-            return ImageData(
-                width=img.width,
-                height=img.height,
-                data=data,
-                path=path
-            )
-        except Exception as e:
-            return None
-    
-    return None
+        else:
+            span.annotate(result="fail", backend=backend or "none", error=error or "unknown", duration_ms=round(duration_ms, 3))
+
+    return image
 
 
 class AsyncImageLoader:
@@ -158,7 +162,14 @@ class AsyncImageLoader:
     2. Main thread: Upload RAM → GPU texture (on-demand)
     """
     
-    def __init__(self, max_queue_size: int = 4):
+    def __init__(
+        self,
+        max_queue_size: int = 4,
+        throttle_sleep: float = 0.0,
+        *,
+        perf_tracer: Optional[PerfTracer] = None,
+        name: str = "async_loader",
+    ):
         """Initialize async loader.
         
         Args:
@@ -168,6 +179,20 @@ class AsyncImageLoader:
         self._result_queue: queue.Queue = queue.Queue()
         self._running = False
         self._thread: Optional[threading.Thread] = None
+        self._throttle_sleep = max(0.0, float(throttle_sleep))
+        self._stats_sampler = BurstSampler(interval_s=2.0)
+        self._stats_success = 0
+        self._stats_failed = 0
+        self._perf = perf_tracer
+        self._perf_name = name
+
+    def _perf_span(self, name: str, *, metadata: Optional[dict[str, Any]] = None):
+        if self._perf is None:
+            return PerfTracer.noop_span()
+        meta = {"loader": self._perf_name}
+        if metadata:
+            meta.update(metadata)
+        return self._perf.span(name, category="media", metadata=meta)
     
     def start(self) -> None:
         """Start background loading thread."""
@@ -195,6 +220,14 @@ class AsyncImageLoader:
                 pass
             self._thread.join(timeout=2.0)
             self._thread = None
+
+    def pending(self) -> int:
+        """Return approximate queue depth for diagnostics."""
+
+        try:
+            return self._load_queue.qsize()
+        except Exception:
+            return 0
     
     def request_load(self, path: Path) -> bool:
         """Request async load of image.
@@ -207,11 +240,17 @@ class AsyncImageLoader:
         """
         if _NO_MEDIA:
             return False
-        try:
-            self._load_queue.put(path, block=False)
-            return True
-        except queue.Full:
-            return False
+        span = self._perf_span("media_queue_request", metadata={"path": path.name})
+        with span:
+            try:
+                self._load_queue.put(path, block=False)
+                depth = self._load_queue.qsize()
+                span.annotate(result="queued", queue_depth=depth)
+                return True
+            except queue.Full:
+                depth = self._load_queue.qsize() if hasattr(self._load_queue, "qsize") else -1
+                span.annotate(result="full", queue_depth=depth)
+                return False
     
     def get_loaded_image(self) -> Optional[Tuple[Path, Optional[ImageData]]]:
         """Get next loaded image from results.
@@ -223,6 +262,37 @@ class AsyncImageLoader:
             return self._result_queue.get(block=False)
         except queue.Empty:
             return None
+
+    def _record_loader_stats(self, success: bool) -> None:
+        """Update counters and emit a summary INFO line when the sampler fires."""
+
+        if success:
+            self._stats_success += 1
+        else:
+            self._stats_failed += 1
+
+        processed = self._stats_sampler.record()
+        if not processed:
+            return
+
+        logger = logging.getLogger(__name__)
+        success_count = self._stats_success
+        failure_count = self._stats_failed
+        self._stats_success = 0
+        self._stats_failed = 0
+        try:
+            queue_depth = self._load_queue.qsize()
+        except Exception:
+            queue_depth = -1
+
+        logger.info(
+            "[AsyncLoader] Processed %d image(s) in last %.1fs (ok=%d, failed=%d, queue=%d)",
+            processed,
+            self._stats_sampler.interval_s,
+            success_count,
+            failure_count,
+            queue_depth,
+        )
     
     def _worker(self) -> None:
         """Background worker thread."""
@@ -238,24 +308,33 @@ class AsyncImageLoader:
         while self._running:
             try:
                 # Get next load request (blocking with timeout)
-                path = self._load_queue.get(timeout=0.1)
+                wait_span = self._perf_span("media_queue_wait")
+                with wait_span:
+                    path = self._load_queue.get(timeout=0.1)
                 
                 # None = stop signal
                 if path is None:
                     break
                 
                 # Load image synchronously in background thread
-                try:
-                    logging.getLogger(__name__).info(f"[AsyncLoader] Starting load: {path}")
-                    image_data = load_image_sync(path)
-                    if image_data:
-                        logging.getLogger(__name__).info(f"[AsyncLoader] Loaded successfully: {path} ({image_data.width}x{image_data.height})")
-                    else:
-                        logging.getLogger(__name__).warning(f"[AsyncLoader] Load returned None: {path}")
-                except Exception as e:
-                    # Catch-all to avoid propagating into native layer
-                    logging.getLogger(__name__).warning(f"[media] load_image_sync crashed for {path}: {e}")
-                    image_data = None
+                decode_span = self._perf_span("media_async_decode", metadata={"path": getattr(path, "name", str(path))})
+                with decode_span:
+                    try:
+                        logging.getLogger(__name__).debug(f"[AsyncLoader] Starting load: {path}")
+                        image_data = load_image_sync(path, perf_tracer=self._perf)
+                        if image_data:
+                            logging.getLogger(__name__).debug(
+                                f"[AsyncLoader] Loaded successfully: {path} ({image_data.width}x{image_data.height})"
+                            )
+                            decode_span.annotate(result="ok", width=image_data.width, height=image_data.height)
+                        else:
+                            logging.getLogger(__name__).warning(f"[AsyncLoader] Load returned None: {path}")
+                            decode_span.annotate(result="none")
+                    except Exception as e:
+                        # Catch-all to avoid propagating into native layer
+                        logging.getLogger(__name__).warning(f"[media] load_image_sync crashed for {path}: {e}")
+                        decode_span.annotate(result="error", error=str(e))
+                        image_data = None
                 
                 # Put result in queue
                 try:
@@ -267,6 +346,11 @@ class AsyncImageLoader:
                     except queue.Empty:
                         pass
                     self._result_queue.put((path, image_data), timeout=1.0)
+
+                if self._throttle_sleep > 0:
+                    time.sleep(self._throttle_sleep)
+
+                self._record_loader_stats(image_data is not None)
                 
             except queue.Empty:
                 continue
@@ -285,7 +369,14 @@ class ImageCache:
     - Configurable cache size per theme
     """
     
-    def __init__(self, cache_size: int = 16):
+    def __init__(
+        self,
+        cache_size: int = 16,
+        loader_queue_size: int = 4,
+        loader_throttle_ms: float = 0.0,
+        perf_tracer: Optional[PerfTracer] = None,
+        cache_name: Optional[str] = None,
+    ):
         """Initialize image cache.
         
         Args:
@@ -294,11 +385,27 @@ class ImageCache:
         self._cache_size = cache_size
         self._cache: dict[Path, CachedImage] = {}
         self._lru_order: deque[Path] = deque()
-        self._loader = AsyncImageLoader()
+        throttle_sec = max(0.0, loader_throttle_ms) / 1000.0
+        self._perf = perf_tracer
+        self._perf_name = cache_name or "image_cache"
+        self._loader = AsyncImageLoader(
+            max_queue_size=loader_queue_size,
+            throttle_sleep=throttle_sec,
+            perf_tracer=perf_tracer,
+            name=f"{self._perf_name}:loader",
+        )
         try:
             self._loader.start()
         except Exception as e:
             logging.getLogger(__name__).warning(f"[media] AsyncImageLoader start skipped: {e}")
+
+    def _perf_span(self, name: str, *, metadata: Optional[dict[str, Any]] = None):
+        if self._perf is None:
+            return PerfTracer.noop_span()
+        meta = {"cache": self._perf_name}
+        if metadata:
+            meta.update(metadata)
+        return self._perf.span(name, category="media", metadata=meta)
     
     def __del__(self):
         """Cleanup on destruction."""
@@ -336,7 +443,7 @@ class ImageCache:
         # Not in cache - request async load
         logger = logging.getLogger(__name__)
         success = self._loader.request_load(path)
-        logger.info(f"[ImageCache] Requested async load: {path} (queued={success})")
+        logger.debug(f"[ImageCache] Requested async load: {path} (queued={success})")
         return None
     
     def process_loaded_images(self) -> int:
@@ -356,30 +463,43 @@ class ImageCache:
                 break
             
             path, image_data = result
-            if image_data is None:
-                logger.warning(f"[ImageCache] Loaded image was None: {path}")
-                continue
-            
-            logger.info(f"[ImageCache] Processing loaded image: {path} ({image_data.width}x{image_data.height})")
-            
-            # Add to cache
-            if path not in self._cache:
-                # Evict oldest if cache full
-                while len(self._cache) >= self._cache_size:
-                    if not self._lru_order:
-                        break
-                    oldest_path = self._lru_order.pop()
-                    if oldest_path in self._cache:
-                        del self._cache[oldest_path]
+            span = self._perf_span("media_cache_ingest", metadata={"path": path.name})
+            with span:
+                if image_data is None:
+                    logger.warning(f"[ImageCache] Loaded image was None: {path}")
+                    span.annotate(result="none")
+                    continue
                 
-                # Add new image
-                self._cache[path] = CachedImage(
-                    image_data=image_data,
-                    gpu_texture_id=None,
-                    last_used=time.time()
-                )
-                self._lru_order.appendleft(path)
-                count += 1
+                logger.info(f"[ImageCache] Processing loaded image: {path} ({image_data.width}x{image_data.height})")
+                if path not in self._cache:
+                    evicted = 0
+                    while len(self._cache) >= self._cache_size:
+                        if not self._lru_order:
+                            break
+                        oldest_path = self._lru_order.pop()
+                        if oldest_path in self._cache:
+                            evicted_item = self._cache[oldest_path]
+                            if evicted_item.gpu_texture_id is not None:
+                                from .texture import delete_texture
+
+                                delete_texture(evicted_item.gpu_texture_id)
+                            del self._cache[oldest_path]
+                            evicted += 1
+                    self._cache[path] = CachedImage(
+                        image_data=image_data,
+                        gpu_texture_id=None,
+                        last_used=time.time(),
+                    )
+                    self._lru_order.appendleft(path)
+                    count += 1
+                    span.annotate(
+                        result="cached",
+                        cache_fill=len(self._cache),
+                        cache_limit=self._cache_size,
+                        evicted=evicted,
+                    )
+                else:
+                    span.annotate(result="duplicate")
         
         return count
     
@@ -398,12 +518,29 @@ class ImageCache:
     
     def clear(self) -> None:
         """Clear cache."""
+        # CRITICAL: Release all GPU textures before clearing!
+        from .texture import delete_texture
+        for cached in self._cache.values():
+            if cached.gpu_texture_id is not None:
+                delete_texture(cached.gpu_texture_id)
+        
         self._cache.clear()
         self._lru_order.clear()
     
     def get_cached_count(self) -> int:
         """Get number of cached images."""
         return len(self._cache)
+
+    def pending_loads(self) -> int:
+        """Get number of queued async decode requests."""
+
+        loader = getattr(self, "_loader", None)
+        if not loader:
+            return 0
+        try:
+            return loader.pending()
+        except Exception:
+            return 0
     
     def get_texture_id(self, path: Path, upload_callback: Optional[Callable[[ImageData], int]] = None) -> Optional[int]:
         """Get GPU texture ID for image, uploading if needed.

@@ -11,10 +11,10 @@ def test_custom_mode_settings_parity():
     """Test that custom mode settings are applied correctly in launcher."""
     
     # Load sinking mode
-    mode_path = Path("mesmerglass/modes/sinking.json")
-    assert mode_path.exists(), "sinking.json must exist"
+    playback_path = Path("mesmerglass/playbacks/sinking.json")
+    assert playback_path.exists(), "sinking.json must exist"
     
-    with open(mode_path) as f:
+    with open(playback_path) as f:
         config = json.load(f)
     
     # Verify JSON structure

@@ -10,6 +10,7 @@ from mesmerglass.content.theme import (
     ThemeConfig, ThemeCollection, Shuffler,
     load_theme_collection, save_theme_collection
 )
+from mesmerglass.content.themebank import ThemeBank
 from mesmerglass.content.media import ImageData
 
 
@@ -240,3 +241,44 @@ class TestImageData:
         data = np.zeros((100, 200, 4), dtype=np.uint8)
         with pytest.raises(ValueError, match="shape mismatch"):
             ImageData(width=999, height=100, data=data, path=Path("test.jpg"))
+
+
+class TestThemeBankVideo:
+    def test_get_video_returns_paths(self, tmp_path):
+        """ThemeBank should surface animation_path entries via get_video."""
+
+        theme = ThemeConfig(
+            name="vids",
+            enabled=True,
+            animation_path=["video1.mp4", "video2.mp4"],
+            image_path=[],
+        )
+        bank = ThemeBank(themes=[theme], root_path=tmp_path)
+        bank.set_active_themes(primary_index=1)
+
+        selections = {bank.get_video() for _ in range(4)}
+        assert all(isinstance(path, Path) for path in selections if path)
+        names = {path.name for path in selections if path}
+        assert {"video1.mp4", "video2.mp4"}.issuperset(names)
+
+    def test_get_video_falls_back_when_primary_has_none(self, tmp_path):
+        """Video requests should fall back to any theme with animations."""
+
+        primary = ThemeConfig(
+            name="images-only",
+            enabled=True,
+            image_path=["img.jpg"],
+            animation_path=[],
+        )
+        video_theme = ThemeConfig(
+            name="video-bank",
+            enabled=True,
+            animation_path=["clip.mp4"],
+            image_path=[],
+        )
+        bank = ThemeBank(themes=[primary, video_theme], root_path=tmp_path)
+        bank.set_active_themes(primary_index=1, alt_index=2)
+
+        video = bank.get_video()
+        assert video is not None
+        assert video.name == "clip.mp4"
