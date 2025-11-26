@@ -901,16 +901,15 @@ class LoomWindowCompositor(QOpenGLWindow):
         
         # If fade is enabled and we have a current texture, start fade transition
         if self._fade_enabled and self._background_texture is not None and self._background_enabled:
-            # Use frame_count (incremented in paintGL) instead of non-existent _frame_counter
-            current_frame = self.frame_count
-            
+            start_frame = self.frame_count
+
             # Add current texture to fade queue for ghosting effect
             self._fade_queue.append({
                 'texture': self._background_texture,
                 'zoom': self._background_zoom,
                 'width': self._background_image_width,
                 'height': self._background_image_height,
-                'start_frame': current_frame
+                'start_frame': start_frame
             })
             
             # Also store in old texture for backward compatibility
@@ -920,7 +919,7 @@ class LoomWindowCompositor(QOpenGLWindow):
             self._fade_old_height = self._background_image_height
             self._fade_active = True
             self._fade_progress = 0.0
-            self._fade_frame_start = current_frame
+            self._fade_frame_start = start_frame
             logger.info(f"[fade] Starting fade transition (duration={self._fade_duration:.2f}s, queue_size={len(self._fade_queue)})")
         
         self._background_texture = texture_id
@@ -1193,16 +1192,15 @@ class LoomWindowCompositor(QOpenGLWindow):
                 # Trigger fade transition if this is a new video and we have existing content
                 old_texture_enqueued_for_fade = False
                 if new_video and self._fade_enabled and self._background_texture is not None and self._background_enabled:
-                    # Use frame_count (incremented in paintGL) instead of non-existent _frame_counter
-                    current_frame = self.frame_count
-                    
+                    start_frame = self.frame_count
+
                     # Add current texture to fade queue for ghosting effect
                     self._fade_queue.append({
                         'texture': self._background_texture,
                         'zoom': self._background_zoom,
                         'width': self._background_image_width,
                         'height': self._background_image_height,
-                        'start_frame': current_frame
+                        'start_frame': start_frame
                     })
                     
                     # Also store in old texture for backward compatibility
@@ -1212,7 +1210,7 @@ class LoomWindowCompositor(QOpenGLWindow):
                     self._fade_old_height = self._background_image_height
                     self._fade_active = True
                     self._fade_progress = 0.0
-                    self._fade_frame_start = current_frame
+                    self._fade_frame_start = start_frame
                     logger.info(f"[fade] Starting fade transition for video (duration={self._fade_duration:.2f}s, queue_size={len(self._fade_queue)})")
                     
                     # Force texture recreation so we don't overwrite the old texture during fade
@@ -1396,9 +1394,7 @@ void main() {
     // Sample texture (NO Y-FLIP - image data is already in correct orientation)
     vec4 color = texture(uTexture, uv);
     
-    // Apply fade opacity for transitions
-    // Multiply RGB by opacity for proper alpha blending
-    color.rgb *= uOpacity;
+    // Apply fade opacity for transitions (match LoomCompositor behavior)
     color.a = uOpacity;
     
     FragColor = color;
@@ -1470,10 +1466,20 @@ void main() {
             return
         
         render_start = time.perf_counter()
-        # Update fade progress and clean up expired textures in queue
-        # Use frame_count (incremented in paintGL) instead of non-existent _frame_counter
+        now = time.monotonic()  # Legacy support for queues created before frame-based timing
         current_frame = self.frame_count
-        fade_duration_frames = self._fade_duration * 60.0  # Convert seconds to frames (60 FPS)
+        fade_duration_frames = max(0.0, self._fade_duration) * 60.0
+
+        def _resolve_start_frame(item: dict[str, Any]) -> int:
+            start_frame = item.get('start_frame')
+            if start_frame is not None:
+                return int(start_frame)
+            # Fallback for old entries that only have start_time (seconds)
+            start_time = item.get('start_time')
+            if start_time is None:
+                return current_frame
+            elapsed_seconds = max(0.0, now - start_time)
+            return max(0, current_frame - int(elapsed_seconds * 60.0))
         
         # Remove fully faded textures from queue
         # CRITICAL: Delete expired textures before removing from queue (memory leak fix!)
@@ -1481,7 +1487,9 @@ void main() {
         textures_to_delete = []
         new_queue = []
         for item in self._fade_queue:
-            if (current_frame - item['start_frame']) < fade_duration_frames:
+            start_frame = _resolve_start_frame(item)
+            frames_elapsed = current_frame - start_frame
+            if fade_duration_frames > 0.0 and frames_elapsed < fade_duration_frames:
                 new_queue.append(item)
             else:
                 # Texture has faded out - delete it
@@ -1501,19 +1509,23 @@ void main() {
         if cleanup_ms >= _FADE_CLEANUP_WARN_MS:
             self._record_fade_perf_event("cleanup", cleanup_ms, queue_size=len(self._fade_queue))
         
-        # Log fade state every 10 frames for debugging
-        if current_frame % 10 == 0 and (self._fade_queue or self._fade_active):
-            logger.info(f"[fade] Frame {current_frame}: queue_size={len(self._fade_queue)}, fade_active={self._fade_active}, fade_progress={self._fade_progress:.2f}")
+        # Log fade state periodically for debugging
+        if self.frame_count % 10 == 0 and (self._fade_queue or self._fade_active):
+            logger.info(
+                "[fade] State: queue_size=%d, fade_active=%s, fade_progress=%.2f",
+                len(self._fade_queue),
+                self._fade_active,
+                self._fade_progress,
+            )
         
         # Update main fade progress if active
         if self._fade_active:
-            frames_elapsed = current_frame - self._fade_frame_start
-            
-            if fade_duration_frames > 0:
+            frames_elapsed = current_frame - getattr(self, '_fade_frame_start', current_frame)
+            if fade_duration_frames > 0.0:
                 self._fade_progress = min(1.0, frames_elapsed / fade_duration_frames)
             else:
                 self._fade_progress = 1.0
-            
+
             # End fade when complete
             if self._fade_progress >= 1.0:
                 self._fade_active = False
@@ -1526,11 +1538,22 @@ void main() {
                     except Exception as e:
                         logger.warning(f"[visual] Failed to delete old fade texture: {e}")
                 self._fade_old_texture = None
-                logger.info(f"[fade] Fade complete at frame {current_frame}")
+                elapsed_seconds = frames_elapsed / 60.0
+                logger.info(f"[fade] Fade complete after {elapsed_seconds:.2f}s")
         
-        # Disable blending for opaque background
-        was_blend_enabled = GL.glIsEnabled(GL.GL_BLEND)
-        if was_blend_enabled:
+        # Track prior blend state so we can restore spiral's premultiplied configuration afterwards
+        prev_blend_enabled = GL.glIsEnabled(GL.GL_BLEND)
+        prev_src_rgb = GL.glGetIntegerv(GL.GL_BLEND_SRC_RGB)
+        prev_dst_rgb = GL.glGetIntegerv(GL.GL_BLEND_DST_RGB)
+        prev_src_alpha = GL.glGetIntegerv(GL.GL_BLEND_SRC_ALPHA)
+        prev_dst_alpha = GL.glGetIntegerv(GL.GL_BLEND_DST_ALPHA)
+
+        fade_active_now = bool(self._fade_queue or self._fade_active)
+        if fade_active_now:
+            # Begin fade stacks with blending disabled so first layer stamps opaque base
+            GL.glDisable(GL.GL_BLEND)
+        elif prev_blend_enabled:
+            # No fade layers to composite—render background opaquely for optimal throughput
             GL.glDisable(GL.GL_BLEND)
         
         # Lazily build background shader program once
@@ -1551,103 +1574,103 @@ void main() {
         
         # Render all fading textures for ghosting effect (oldest to newest)
         if self._fade_queue:
-            first_layer = True
             fade_layers_start = time.perf_counter()
             layers_drawn = 0
-            
-            for item in self._fade_queue:
-                frames_elapsed = current_frame - item['start_frame']
+            first_layer = True
+
+            for item in list(self._fade_queue):
+                start_frame = _resolve_start_frame(item)
+                frames_elapsed = current_frame - start_frame
                 fade_progress = min(1.0, frames_elapsed / fade_duration_frames) if fade_duration_frames > 0 else 1.0
-                opacity = 1.0 - fade_progress  # Fade out
-                
-                # Skip if fully faded
-                if opacity <= 0.01:
+                opacity = 1.0 - fade_progress  # Fade out old texture
+
+                if opacity <= 0.01 or not GL.glIsTexture(item['texture']):
                     continue
-                
-                # First layer renders without blending (opaque background)
-                # Subsequent layers blend on top
+
                 if not first_layer:
                     GL.glEnable(GL.GL_BLEND)
                     GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA)
-                
+
                 GL.glActiveTexture(GL.GL_TEXTURE0)
                 GL.glBindTexture(GL.GL_TEXTURE_2D, item['texture'])
-                
+
                 loc = GL.glGetUniformLocation(self._background_program, 'uTexture')
                 if loc >= 0:
                     GL.glUniform1i(loc, 0)
-                
+
                 loc = GL.glGetUniformLocation(self._background_program, 'uZoom')
                 if loc >= 0:
                     GL.glUniform1f(loc, item['zoom'])
-                
+
                 loc = GL.glGetUniformLocation(self._background_program, 'uOffset')
                 if loc >= 0:
                     offset = getattr(self, '_background_offset', [0.0, 0.0])
                     GL.glUniform2f(loc, offset[0], offset[1])
-                
+
                 loc = GL.glGetUniformLocation(self._background_program, 'uKaleidoscope')
                 if loc >= 0:
                     kaleidoscope = getattr(self, '_background_kaleidoscope', False)
                     GL.glUniform1i(loc, 1 if kaleidoscope else 0)
-                
+
                 loc = GL.glGetUniformLocation(self._background_program, 'uImageSize')
                 if loc >= 0:
                     GL.glUniform2f(loc, float(item['width']), float(item['height']))
-                
+
                 loc = GL.glGetUniformLocation(self._background_program, 'uOpacity')
                 if loc >= 0:
                     GL.glUniform1f(loc, opacity)
-                
-                # Draw texture
+
                 self.vao.bind()
                 GL.glDrawElements(GL.GL_TRIANGLES, 6, GL.GL_UNSIGNED_INT, None)
-                
-                first_layer = False
+                self.vao.release()
+
                 layers_drawn += 1
-            
-            # Enable blending for current texture (blend on top of all fading textures)
+                first_layer = False
+
+            # Remove invalid or completed fade textures (mirrors LoomCompositor)
+            self._fade_queue = [
+                item for item in self._fade_queue
+                if GL.glIsTexture(item['texture'])
+                and fade_duration_frames > 0.0
+                and (current_frame - _resolve_start_frame(item)) < fade_duration_frames
+            ]
+
             GL.glEnable(GL.GL_BLEND)
             GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA)
-            
-            # Render current texture ALWAYS at full opacity when fading
-            # The old texture fades OUT, new texture is ALWAYS visible
+
             GL.glActiveTexture(GL.GL_TEXTURE0)
             GL.glBindTexture(GL.GL_TEXTURE_2D, self._background_texture)
-            
+
             loc = GL.glGetUniformLocation(self._background_program, 'uTexture')
             if loc >= 0:
                 GL.glUniform1i(loc, 0)
-            
+
             loc = GL.glGetUniformLocation(self._background_program, 'uZoom')
             if loc >= 0:
                 GL.glUniform1f(loc, self._background_zoom)
-            
+
             loc = GL.glGetUniformLocation(self._background_program, 'uOffset')
             if loc >= 0:
                 offset = getattr(self, '_background_offset', [0.0, 0.0])
                 GL.glUniform2f(loc, offset[0], offset[1])
-            
+
             loc = GL.glGetUniformLocation(self._background_program, 'uKaleidoscope')
             if loc >= 0:
                 kaleidoscope = getattr(self, '_background_kaleidoscope', False)
                 GL.glUniform1i(loc, 1 if kaleidoscope else 0)
-            
+
             loc = GL.glGetUniformLocation(self._background_program, 'uImageSize')
             if loc >= 0:
                 GL.glUniform2f(loc, float(self._background_image_width), float(self._background_image_height))
-            
+
             loc = GL.glGetUniformLocation(self._background_program, 'uOpacity')
             if loc >= 0:
-                # NEW IMAGE ALWAYS AT FULL OPACITY - old fades out underneath
-                GL.glUniform1f(loc, 1.0)
-            
-            # Draw current texture
+                opacity = self._fade_progress if self._fade_active else 1.0
+                GL.glUniform1f(loc, opacity)
+
             self.vao.bind()
             GL.glDrawElements(GL.GL_TRIANGLES, 6, GL.GL_UNSIGNED_INT, None)
-            
-            # Disable blending again
-            GL.glDisable(GL.GL_BLEND)
+            self.vao.release()
 
             layer_ms = (time.perf_counter() - fade_layers_start) * 1000.0
             if layer_ms >= _FADE_LAYER_WARN_MS:
@@ -1687,9 +1710,12 @@ void main() {
             self.vao.bind()
             GL.glDrawElements(GL.GL_TRIANGLES, 6, GL.GL_UNSIGNED_INT, None)
         
-        # Re-enable blending for spiral
-        if was_blend_enabled:
+        # Restore prior blend state for spiral rendering
+        if prev_blend_enabled:
             GL.glEnable(GL.GL_BLEND)
+        else:
+            GL.glDisable(GL.GL_BLEND)
+        GL.glBlendFuncSeparate(prev_src_rgb, prev_dst_rgb, prev_src_alpha, prev_dst_alpha)
         total_bg_ms = (time.perf_counter() - render_start) * 1000.0
         if total_bg_ms >= _BACKGROUND_RENDER_WARN_MS:
             self._record_fade_perf_event("total", total_bg_ms, queue_size=len(self._fade_queue))
