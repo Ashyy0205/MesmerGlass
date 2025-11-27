@@ -597,6 +597,11 @@ class SessionRunner:
         """Check if session completed successfully."""
         return self._state == SessionState.COMPLETED
     
+    @property
+    def state(self) -> SessionState:
+        """Get current session state."""
+        return self._state
+    
     def get_current_cue_index(self) -> int:
         """Get index of current cue (-1 if none)."""
         return self._current_cue_index
@@ -851,6 +856,11 @@ class SessionRunner:
         
         self.logger.info("[session] Stopping session")
         
+        # If paused, resume first to ensure clean state transition
+        if prev_state == SessionState.PAUSED:
+            self.logger.debug("[session] Resuming from pause before stop")
+            self.visual_director.resume()
+        
         # End current cue if running
         if self._current_cue_index >= 0:
             self._end_cue()
@@ -893,29 +903,36 @@ class SessionRunner:
             except Exception as e:
                 self.logger.error(f"[session] Failed to stop VR streaming: {e}")
         
-        # Deactivate and cleanup compositors
+        # Deactivate and cleanup compositors (fast path - no blocking operations)
         if self.compositor:
-            # Deactivate primary compositor
+            # Deactivate primary compositor immediately
             self.compositor.set_active(False)
-            self.compositor.hide()
+            # Hide asynchronously to avoid blocking
+            try:
+                self.compositor.hide()
+            except Exception as e:
+                self.logger.debug(f"[session] Compositor hide error (non-critical): {e}")
             self.logger.info("[session] Primary compositor deactivated and hidden")
             
-            # Cleanup secondary compositors
+            # Cleanup secondary compositors quickly
+            count = len(self._secondary_compositors)
             for i, secondary in enumerate(self._secondary_compositors, start=1):
                 try:
                     # Unregister from VisualDirector
                     self.visual_director.unregister_secondary_compositor(secondary)
                     
-                    # Deactivate and cleanup
+                    # Deactivate and schedule cleanup (non-blocking)
                     secondary.set_active(False)
-                    secondary.hide()
+                    try:
+                        secondary.hide()
+                    except:
+                        pass  # Ignore hide errors
                     secondary.deleteLater()  # Schedule for Qt deletion
-                    self.logger.info(f"[session] Secondary compositor {i} deactivated and scheduled for cleanup")
                 except Exception as e:
-                    self.logger.error(f"[session] Failed to cleanup secondary compositor {i}: {e}")
+                    self.logger.debug(f"[session] Secondary compositor {i} cleanup error (non-critical): {e}")
             
             self._secondary_compositors.clear()
-            self.logger.info(f"[session] All compositors deactivated ({1 + len(self._secondary_compositors)} total)")
+            self.logger.info(f"[session] All compositors deactivated ({1 + count} total)")
         
         # Emit stop event
         self.event_emitter.emit(SessionEvent(

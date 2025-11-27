@@ -2821,18 +2821,58 @@ class PlaybackEditor(QDialog):
             # Build playback config dict
             config = self._build_config_dict()
             
-            # Determine key (use existing or generate from name)
+            # Determine key and check if we need to rename
+            old_key = self.playback_key
+            new_key_suggestion = mode_name.replace(' ', '_').lower()
+            
             if self.playback_key:
-                key = self.playback_key
+                # Editing existing playback
+                # Check if name changed significantly enough to warrant key rename
+                if new_key_suggestion != self.playback_key:
+                    # Offer to rename key
+                    reply = QMessageBox.question(
+                        self,
+                        "Rename Playback Key?",
+                        f"The playback name has changed.\n\n"
+                        f"Current key: {self.playback_key}\n"
+                        f"Suggested key: {new_key_suggestion}\n\n"
+                        f"Update the key? This will update all references in cuelists.",
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                        QMessageBox.StandardButton.Yes
+                    )
+                    
+                    if reply == QMessageBox.StandardButton.Yes:
+                        # Ensure new key is unique
+                        base_key = new_key_suggestion
+                        counter = 1
+                        while new_key_suggestion in self.session_data.get("playbacks", {}) and new_key_suggestion != self.playback_key:
+                            new_key_suggestion = f"{base_key}_{counter}"
+                            counter += 1
+                        
+                        # Update all references in cuelists
+                        self._update_playback_references(old_key, new_key_suggestion)
+                        
+                        # Remove old key, use new key
+                        if old_key in self.session_data.get("playbacks", {}):
+                            del self.session_data["playbacks"][old_key]
+                        key = new_key_suggestion
+                        self.playback_key = new_key_suggestion  # Update for future saves
+                    else:
+                        # Keep old key
+                        key = self.playback_key
+                else:
+                    # Key is fine, keep it
+                    key = self.playback_key
             else:
-                # Generate key from name (for new playback)
-                key = mode_name.replace(' ', '_').lower()
+                # New playback - generate key from name
+                key = new_key_suggestion
                 # Ensure uniqueness
                 base_key = key
                 counter = 1
                 while key in self.session_data.get("playbacks", {}):
                     key = f"{base_key}_{counter}"
                     counter += 1
+                self.playback_key = key  # Save for future reference
             
             # Update session dict
             if "playbacks" not in self.session_data:
@@ -2852,6 +2892,32 @@ class PlaybackEditor(QDialog):
         except Exception as e:
             logger.error(f"[PlaybackEditor] Session save failed: {e}")
             QMessageBox.critical(self, "Save Error", f"Failed to save playback:\n{e}")
+    
+    def _update_playback_references(self, old_key: str, new_key: str):
+        """Update all references to a playback key in cuelists and cues.
+        
+        Args:
+            old_key: Old playback key
+            new_key: New playback key
+        """
+        try:
+            cuelists = self.session_data.get("cuelists", {})
+            updated_count = 0
+            
+            for cuelist_key, cuelist_data in cuelists.items():
+                cues = cuelist_data.get("cues", [])
+                for cue in cues:
+                    playback_pool = cue.get("playback_pool", [])
+                    for entry in playback_pool:
+                        if entry.get("playback") == old_key:
+                            entry["playback"] = new_key
+                            updated_count += 1
+            
+            if updated_count > 0:
+                logger.info(f"[PlaybackEditor] Updated {updated_count} playback references from '{old_key}' to '{new_key}'")
+        
+        except Exception as e:
+            logger.error(f"[PlaybackEditor] Failed to update playback references: {e}", exc_info=True)
     
     def _build_config_dict(self) -> dict:
         """Build playback configuration dictionary (shared by file and session save)."""

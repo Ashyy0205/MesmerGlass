@@ -626,6 +626,7 @@ class SessionRunnerTab(QWidget):
         self.update_timer.stop()
         self.btn_start.setEnabled(True)
         self.btn_pause.setEnabled(False)
+        self.btn_pause.setText("⏸️ Pause")  # Reset pause button text
         self.btn_stop.setEnabled(False)
         self.btn_skip_next.setEnabled(False)
         
@@ -749,8 +750,8 @@ class SessionRunnerTab(QWidget):
             progress_pct = min(100, int((elapsed / total_duration) * 100))
             self.progress_bar.setValue(progress_pct)
             
-            # Format time remaining
-            remaining = total_duration - elapsed
+            # Format time remaining (clamp to 0 to prevent negative display)
+            remaining = max(0, total_duration - elapsed)
             mins_remaining = int(remaining // 60)
             secs_remaining = int(remaining % 60)
             self.progress_bar.setFormat(f"{progress_pct}% - {mins_remaining}:{secs_remaining:02d} remaining")

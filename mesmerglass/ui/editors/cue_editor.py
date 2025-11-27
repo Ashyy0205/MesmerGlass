@@ -790,7 +790,15 @@ class CueEditor(QDialog):
             max_duration *= 10.0
 
         if self.is_session_mode:
-            display_name = playback_path or "<missing playback>"
+            # Look up actual name from session playbacks
+            if playback_path and self.session_data:
+                playback_data = self.session_data.get("playbacks", {}).get(playback_path)
+                if playback_data:
+                    display_name = playback_data.get("name", playback_path)
+                else:
+                    display_name = playback_path or "<missing playback>"
+            else:
+                display_name = playback_path or "<missing playback>"
         else:
             display_name = Path(playback_path).name if playback_path else "<missing playback>"
 
@@ -824,7 +832,12 @@ class CueEditor(QDialog):
                 return
             
             for key in sorted(available_playbacks.keys()):
-                playback_list_widget.addItem(key)
+                # Show name from JSON, not key
+                playback_data = available_playbacks[key]
+                display_name = playback_data.get("name", key)
+                item = QListWidgetItem(display_name)
+                item.setData(Qt.ItemDataRole.UserRole, key)  # Store key as data
+                playback_list_widget.addItem(item)
             
             layout.addWidget(playback_list_widget)
             
@@ -834,7 +847,8 @@ class CueEditor(QDialog):
             layout.addWidget(button_box)
             
             if dialog.exec() == QDialog.DialogCode.Accepted and playback_list_widget.currentItem():
-                playback_key = playback_list_widget.currentItem().text()
+                # Get key from item data (not text, which is the display name)
+                playback_key = playback_list_widget.currentItem().data(Qt.ItemDataRole.UserRole)
                 
                 # Create playback entry (use key for session mode)
                 entry = {

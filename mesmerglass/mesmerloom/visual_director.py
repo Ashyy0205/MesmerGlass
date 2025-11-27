@@ -58,6 +58,7 @@ class VisualDirector:
         
         self.current_visual: Optional[Visual] = None
         self._paused = False
+        self._pause_saved_rotation_speed: Optional[float] = None
         self._frame_count = 0
         self._video_first_frame = False  # Track first frame of new video for fade
         self._pending_image_path = None  # Path of image we're waiting to load
@@ -267,6 +268,7 @@ class VisualDirector:
             # Store as current visual
             self.current_visual = custom_visual
             self._paused = False
+            self._pause_saved_rotation_speed = None  # Clear saved rotation speed on new visual
             self._frame_count = 0
             
             # CRITICAL FIX: Do NOT reset _last_cycle_marker during playback switches
@@ -651,10 +653,36 @@ class VisualDirector:
     def pause(self) -> None:
         """Pause current visual."""
         self._paused = True
+        
+        # Pause spiral rotation by setting speed to 0
+        spiral = None
+        if self.compositor and hasattr(self.compositor, 'spiral_director'):
+            spiral = self.compositor.spiral_director
+        elif self.compositor and hasattr(self.compositor, 'director'):
+            spiral = self.compositor.director
+        
+        if spiral and hasattr(spiral, 'rotation_speed'):
+            self._pause_saved_rotation_speed = spiral.rotation_speed
+            spiral.set_rotation_speed(0.0)
     
     def resume(self) -> None:
         """Resume current visual."""
         self._paused = False
+        
+        # Restore spiral rotation speed (only if we have a saved value)
+        if self._pause_saved_rotation_speed is not None:
+            spiral = None
+            if self.compositor and hasattr(self.compositor, 'spiral_director'):
+                spiral = self.compositor.spiral_director
+            elif self.compositor and hasattr(self.compositor, 'director'):
+                spiral = self.compositor.director
+            
+            if spiral and hasattr(spiral, 'set_rotation_speed'):
+                try:
+                    spiral.set_rotation_speed(self._pause_saved_rotation_speed)
+                except Exception as e:
+                    self.logger.warning(f"[visual] Failed to restore rotation speed: {e}")
+            self._pause_saved_rotation_speed = None
     
     def toggle_pause(self) -> bool:
         """Toggle pause state.

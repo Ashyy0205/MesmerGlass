@@ -486,18 +486,58 @@ class CuelistEditor(QDialog):
                 QMessageBox.warning(self, "Validation Error", "Cuelist name is required.")
                 return
             
-            # Determine key (use existing or generate from name)
+            # Determine key and check if we need to rename
+            old_key = self.cuelist_key
+            new_key_suggestion = self.cuelist_data["name"].replace(' ', '_').lower()
+            
             if self.cuelist_key:
-                key = self.cuelist_key
+                # Editing existing cuelist
+                # Check if name changed significantly enough to warrant key rename
+                if new_key_suggestion != self.cuelist_key:
+                    # Offer to rename key
+                    reply = QMessageBox.question(
+                        self,
+                        "Rename Cuelist Key?",
+                        f"The cuelist name has changed.\n\n"
+                        f"Current key: {self.cuelist_key}\n"
+                        f"Suggested key: {new_key_suggestion}\n\n"
+                        f"Update the key? This will update references in session runtime state.",
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                        QMessageBox.StandardButton.Yes
+                    )
+                    
+                    if reply == QMessageBox.StandardButton.Yes:
+                        # Ensure new key is unique
+                        base_key = new_key_suggestion
+                        counter = 1
+                        while new_key_suggestion in self.session_data.get("cuelists", {}) and new_key_suggestion != self.cuelist_key:
+                            new_key_suggestion = f"{base_key}_{counter}"
+                            counter += 1
+                        
+                        # Update runtime state if this cuelist is active
+                        self._update_cuelist_references(old_key, new_key_suggestion)
+                        
+                        # Remove old key, use new key
+                        if old_key in self.session_data.get("cuelists", {}):
+                            del self.session_data["cuelists"][old_key]
+                        key = new_key_suggestion
+                        self.cuelist_key = new_key_suggestion  # Update for future saves
+                    else:
+                        # Keep old key
+                        key = self.cuelist_key
+                else:
+                    # Key is fine, keep it
+                    key = self.cuelist_key
             else:
-                # Generate key from name (for new cuelist)
-                key = self.cuelist_data["name"].replace(' ', '_').lower()
+                # New cuelist - generate key from name
+                key = new_key_suggestion
                 # Ensure uniqueness
                 base_key = key
                 counter = 1
                 while key in self.session_data.get("cuelists", {}):
                     key = f"{base_key}_{counter}"
                     counter += 1
+                self.cuelist_key = key  # Save for future reference
             
             # Update session dict
             if "cuelists" not in self.session_data:
@@ -517,6 +557,23 @@ class CuelistEditor(QDialog):
         except Exception as e:
             self.logger.error(f"Failed to save cuelist to session: {e}", exc_info=True)
             QMessageBox.critical(self, "Save Error", f"Failed to save cuelist:\n{e}")
+    
+    def _update_cuelist_references(self, old_key: str, new_key: str):
+        """Update references to a cuelist key in session runtime state.
+        
+        Args:
+            old_key: Old cuelist key
+            new_key: New cuelist key
+        """
+        try:
+            # Update runtime state if this cuelist is currently active
+            runtime = self.session_data.get("runtime", {})
+            if runtime.get("active_cuelist") == old_key:
+                runtime["active_cuelist"] = new_key
+                self.logger.info(f"[CuelistEditor] Updated active_cuelist from '{old_key}' to '{new_key}'")
+        
+        except Exception as e:
+            self.logger.error(f"[CuelistEditor] Failed to update cuelist references: {e}", exc_info=True)
     
     def _save_to_file(self, file_path: Path):
         """Save cuelist to file (file mode)."""
