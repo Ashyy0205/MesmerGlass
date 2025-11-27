@@ -1997,18 +1997,18 @@ class SessionRunner:
                     counts[i] += 1
                     break
         
-        self.logger.info("")
-        self.logger.info("=" * 70)
-        self.logger.info("FRAME TIMING STATISTICS")
-        self.logger.info("=" * 70)
-        self.logger.info(f"Total Frames: {total_frames}")
-        self.logger.info(f"Average: {avg_frame_time:.2f}ms")
-        self.logger.info(f"Min: {min_frame_time:.2f}ms")
-        self.logger.info(f"Max: {max_frame_time:.2f}ms")
-        self.logger.info(f"Budget: {self._frame_budget_ms:.2f}ms (60fps)")
-        self.logger.info(f"On-time: {on_time_frames}/{total_frames} ({on_time_percent:.1f}%)")
-        self.logger.info(f"Late: {late_frames}")
-        self.logger.info("")
+        self.logger.warning("")
+        self.logger.warning("=" * 70)
+        self.logger.warning("📊 FRAME TIMING STATISTICS")
+        self.logger.warning("=" * 70)
+        self.logger.warning(f"Total Frames: {total_frames}")
+        self.logger.warning(f"Average: {avg_frame_time:.2f}ms")
+        self.logger.warning(f"Min: {min_frame_time:.2f}ms")
+        self.logger.warning(f"Max: {max_frame_time:.2f}ms")
+        self.logger.warning(f"Budget: {self._frame_budget_ms:.2f}ms (60fps)")
+        self.logger.warning(f"On-time: {on_time_frames}/{total_frames} ({on_time_percent:.1f}%)")
+        self.logger.warning(f"Late: {late_frames}")
+        self.logger.warning("")
         
         # Memory usage statistics
         if self._memory_samples:
@@ -2016,43 +2016,43 @@ class SessionRunner:
             max_mem = max(self._memory_samples)
             avg_mem = sum(self._memory_samples) / len(self._memory_samples)
             final_mem = self._memory_samples[-1]
-            self.logger.info("MEMORY USAGE:")
-            self.logger.info(f"  Start: {self._memory_samples[0]:.0f}MB")
-            self.logger.info(f"  Peak: {max_mem:.0f}MB")
-            self.logger.info(f"  Final: {final_mem:.0f}MB")
-            self.logger.info(f"  Average: {avg_mem:.0f}MB")
-            self.logger.info(f"  Growth: {final_mem - self._memory_samples[0]:.0f}MB ({((final_mem / self._memory_samples[0]) - 1) * 100:.1f}%)")
+            self.logger.warning("💾 MEMORY USAGE:")
+            self.logger.warning(f"  Start: {self._memory_samples[0]:.0f}MB")
+            self.logger.warning(f"  Peak: {max_mem:.0f}MB")
+            self.logger.warning(f"  Final: {final_mem:.0f}MB")
+            self.logger.warning(f"  Average: {avg_mem:.0f}MB")
+            self.logger.warning(f"  Growth: {final_mem - self._memory_samples[0]:.0f}MB ({((final_mem / self._memory_samples[0]) - 1) * 100:.1f}%)")
             if final_mem > 10000:
                 self.logger.warning(f"  ⚠️  MEMORY LEAK DETECTED: {final_mem:.0f}MB is excessive!")
-            self.logger.info("")
+            self.logger.warning("")
 
         if self._worst_frame_spike:
             blocker = self._worst_frame_spike.get("blocker")
             if blocker:
                 summary = self._format_blocking_summary(blocker)
-                self.logger.info(
-                    "Worst Frame Spike: %.1fms (blocked by %s)",
+                self.logger.warning(
+                    "⚡ Worst Frame Spike: %.1fms (blocked by %s)",
                     self._worst_frame_spike.get("delta_ms", 0.0),
                     summary,
                 )
             else:
-                self.logger.info(
-                    "Worst Frame Spike: %.1fms (cause unknown)",
+                self.logger.warning(
+                    "⚡ Worst Frame Spike: %.1fms (cause unknown)",
                     self._worst_frame_spike.get("delta_ms", 0.0),
                 )
         else:
-            self.logger.info(
-                "Worst Frame Spike: none above %.0fms threshold",
+            self.logger.warning(
+                "⚡ Worst Frame Spike: none above %.0fms threshold",
                 self._frame_spike_warn_ms,
             )
         
-        self.logger.info("Frame Delay Distribution (all frames):")
+        self.logger.warning("📈 Frame Delay Distribution (all frames):")
         total_sampled = sum(counts)
         for label, count in zip(labels, counts):
             percent = (count / total_sampled * 100) if total_sampled > 0 else 0
-            self.logger.info(f"  {label}: {count} ({percent:.1f}%)")
-        self.logger.info("=" * 70)
-        self.logger.info("")
+            self.logger.warning(f"  {label}: {count} ({percent:.1f}%)")
+        self.logger.warning("=" * 70)
+        self.logger.warning("")
     
     def _execute_transition(self, next_cue_index: int) -> None:
         """Execute transition to next cue (with SNAP or FADE based on cuelist settings)."""

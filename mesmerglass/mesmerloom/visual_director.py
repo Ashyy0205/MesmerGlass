@@ -142,7 +142,7 @@ class VisualDirector:
             self.logger.warning("[visual.perf] %s took %.1fms", label, duration_ms)
             return
         if duration_ms >= info_ms and self._perf_sampler.record():
-            self.logger.info("[visual.perf] %s took %.1fms", label, duration_ms)
+            self.logger.warning("[visual.perf] %s took %.1fms", label, duration_ms)
 
     @contextmanager
     def _perf_section(

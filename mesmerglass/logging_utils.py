@@ -20,6 +20,17 @@ from typing import Any, Optional
 
 DEFAULT_LOG_FILENAME = "mesmerglass.log"
 
+# Custom PERF log level (between INFO=20 and WARNING=30)
+PERF_LEVEL = 25
+logging.addLevelName(PERF_LEVEL, "PERF")
+
+def perf(self, message, *args, **kwargs):
+    """Log performance statistics at PERF level."""
+    if self.isEnabledFor(PERF_LEVEL):
+        self._log(PERF_LEVEL, message, args, **kwargs)
+
+logging.Logger.perf = perf
+
 
 class LogMode(str, Enum):
     """Logging presets that affect verbosity targets."""

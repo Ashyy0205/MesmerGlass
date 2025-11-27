@@ -36,22 +36,6 @@ def _launch_gui() -> None:
     from mesmerglass.app import run as run_gui
 
     run_gui()
-    
-    if args:
-        candidate = Path(args[0])
-        if candidate.exists() and candidate.is_file():
-            if len(args) == 1:
-                from mesmerglass.cli import run_instruction_file
-
-                return run_instruction_file(str(candidate))
-            from mesmerglass.cli import main as cli_main
-
-            return cli_main(["instructions", *args])
-        from mesmerglass.cli import main as cli_main
-
-        return cli_main(args)
-    _launch_gui()
-    return 0
 
 
 if __name__ == "__main__":
