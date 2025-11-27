@@ -1,4 +1,6 @@
 import sys, threading, traceback, signal, time, os
+import asyncio
+import qasync
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtCore import qInstallMessageHandler
 from .ui.main_application import MainApplication
@@ -84,7 +86,14 @@ def run():
     if not logging.getLogger().handlers:
         setup_logging(add_console=True, log_mode=log_mode_env)
     _install_diagnostics()
+    
+    # Create QApplication
     app = QApplication(sys.argv)
+    
+    # Setup qasync event loop for async/await support with PyQt6
+    loop = qasync.QEventLoop(app)
+    asyncio.set_event_loop(loop)
+    
     # app.setStyleSheet(QSS)  # Temporarily disabled for easier testing
     win = MainApplication()
     try:
@@ -92,7 +101,10 @@ def run():
     except Exception:
         pass
     win.show()
-    sys.exit(app.exec())
+    
+    # Run the event loop with qasync
+    with loop:
+        loop.run_forever()
 
 
 if __name__ == "__main__":

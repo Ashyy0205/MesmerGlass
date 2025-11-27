@@ -404,7 +404,8 @@ class MesmerIntifaceServer(ButtplugServer):
                 buttplug_device = Device(
                     index=device_index,
                     name=device.name or f"Device {device.address}",
-                    device_messages=device_messages
+                    device_messages=device_messages,
+                    is_connected=device.is_connected
                 )
                 
                 buttplug_devices.append(buttplug_device)
@@ -436,11 +437,8 @@ class MesmerIntifaceServer(ButtplugServer):
                 len(virtual_devices),
             )
             
-            # Auto-stop scanning if we found sex toy devices
-            if buttplug_devices and self.is_real_scanning():
-                # Auto-stop scanning once we have target devices; log action
-                self._logger.info("Auto-stopping scan — found target devices")
-                asyncio.create_task(self.stop_real_scanning())
+            # Don't auto-stop scanning - let user control when to stop
+            # This allows discovering multiple devices
             
             # Notify callbacks
             self._notify_device_callbacks()
@@ -556,6 +554,88 @@ class MesmerIntifaceServer(ButtplugServer):
         except Exception as e:
             self._logger.error(f"Error during shutdown: {e}")
             
+    async def test_all_devices(self, intensity: float = 0.5) -> Dict[str, bool]:
+        """Send a test vibration to all connected devices.
+        
+        Args:
+            intensity: Vibration intensity (0.0 to 1.0, default 0.5)
+        
+        Returns:
+            Dictionary mapping device names to success status
+        """
+        results = {}
+        
+        for address, protocol in self._device_protocols.items():
+            device_info = self._bluetooth_devices.get(address)
+            device_name = device_info.name if device_info else address
+            
+            try:
+                # Use custom intensity for vibration
+                level = int(intensity * 20)  # Convert 0.0-1.0 to 0-20 Lovense range
+                
+                # Check if protocol supports vibrate
+                if hasattr(protocol, 'vibrate'):
+                    success = await protocol.vibrate(level)
+                    # Stop after short duration
+                    await asyncio.sleep(0.5)
+                    await protocol.stop()
+                    results[device_name] = success
+                    if success:
+                        self._logger.info(f"Test vibration ({int(intensity*100)}%) sent to {device_name}")
+                    else:
+                        self._logger.warning(f"Test vibration failed for {device_name}")
+                else:
+                    self._logger.debug(f"Device {device_name} does not support vibrate")
+                    results[device_name] = False
+            except Exception as e:
+                self._logger.error(f"Error testing device {device_name}: {e}")
+                results[device_name] = False
+                
+        return results
+    
+    async def quick_pulse_all_devices(self, intensity: float = 0.5) -> Dict[str, bool]:
+        """Send a quick vibration pulse to all connected devices.
+        
+        This is optimized for rapid repeated triggers like text cycling.
+        Uses a very short 100ms pulse without waiting for completion.
+        
+        Args:
+            intensity: Vibration intensity (0.0 to 1.0, default 0.5)
+        
+        Returns:
+            Dictionary mapping device names to success status
+        """
+        results = {}
+        
+        for address, protocol in self._device_protocols.items():
+            device_info = self._bluetooth_devices.get(address)
+            device_name = device_info.name if device_info else address
+            
+            try:
+                level = int(intensity * 20)  # Convert 0.0-1.0 to 0-20 Lovense range
+                
+                if hasattr(protocol, 'vibrate'):
+                    # Fire and forget - don't await the stop
+                    success = await protocol.vibrate(level)
+                    # Very short pulse - schedule stop but don't wait
+                    asyncio.create_task(self._quick_stop(protocol, 0.1))
+                    results[device_name] = success
+                else:
+                    results[device_name] = False
+            except Exception as e:
+                self._logger.debug(f"Quick pulse error for {device_name}: {e}")
+                results[device_name] = False
+                
+        return results
+    
+    async def _quick_stop(self, protocol, delay: float):
+        """Stop a device after a short delay."""
+        try:
+            await asyncio.sleep(delay)
+            await protocol.stop()
+        except Exception as e:
+            self._logger.debug(f"Quick stop error: {e}")
+    
     def get_status(self) -> Dict:
         """Get comprehensive server status."""
         bluetooth_devices = list(self._bluetooth_devices.values())

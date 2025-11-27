@@ -14,6 +14,7 @@ class Device:
     index: int
     name: str
     device_messages: Dict[str, dict]
+    is_connected: bool = False
 
 class DeviceList:
     """Manages a list of connected devices."""

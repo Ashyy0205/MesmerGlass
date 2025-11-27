@@ -36,7 +36,8 @@ class VisualDirector:
         compositor: Optional[Any] = None,
         text_renderer: Optional[Any] = None,
         video_streamer: Optional[Any] = None,
-        text_director: Optional[Any] = None
+        text_director: Optional[Any] = None,
+        mesmer_server: Optional[Any] = None
     ):
         """Initialize visual director.
         
@@ -46,12 +47,14 @@ class VisualDirector:
             text_renderer: TextRenderer instance for text overlays
             video_streamer: VideoStreamer instance for video playback
             text_director: TextDirector instance for text library management
+            mesmer_server: MesmerIntifaceServer instance for device vibration control
         """
         self.theme_bank = theme_bank
         self.compositor = compositor  # Primary compositor
         self.text_renderer = text_renderer
         self.video_streamer = video_streamer
         self.text_director = text_director
+        self.mesmer_server = mesmer_server
         
         self.current_visual: Optional[Visual] = None
         self._paused = False
@@ -66,6 +69,9 @@ class VisualDirector:
         
         # Multi-display support: Additional compositors for secondary displays
         self._secondary_compositors: list[Any] = []  # Additional compositors to mirror content to
+        
+        # Current cue settings (for vibration on text cycle)
+        self._current_cue_settings: Optional[dict] = None
         
         self.logger = logging.getLogger(__name__)
         self._image_upload_sampler = BurstSampler(interval_s=2.0)
@@ -552,6 +558,18 @@ class VisualDirector:
         """
         return self._cycle_count
     
+    def set_current_cue_settings(self, cue_data: Optional[dict]) -> None:
+        """Set current cue settings for features like vibration on text cycle.
+        
+        Args:
+            cue_data: Dictionary containing cue settings (vibrate_on_text_cycle, vibration_intensity, etc.)
+        """
+        self._current_cue_settings = cue_data
+        if cue_data:
+            vibrate = cue_data.get('vibrate_on_text_cycle', False)
+            intensity = cue_data.get('vibration_intensity', 0.5)
+            self.logger.debug(f"[visual] Cue settings updated: vibrate={vibrate}, intensity={intensity:.0%}")
+    
     def register_cycle_callback(self, callback: Callable[[], None]) -> None:
         """Register callback to fire when a media cycle completes.
         
@@ -838,33 +856,38 @@ class VisualDirector:
         except Exception as e:
             self.logger.error(f"Failed to change image with zoom: {e}", exc_info=True)
     
-    def _on_change_text(self, text: str) -> None:
+    def _on_change_text(self, text: str, split_mode: Optional[Any] = None) -> None:
         """Update main text overlay.
         
-        Visual calls this when it wants a text change. We get the text from
-        the text_director (respecting user's weights/split modes) instead of
-        using the provided text.
+        Called by TextDirector when text changes. This triggers vibration if enabled.
         
         Args:
-            text: Text string from visual (IGNORED - we use text_director instead)
+            text: Text string from TextDirector (already selected)
+            split_mode: Split mode from TextDirector
         """
         if self.text_renderer is None or self.compositor is None:
             return
         
-        # Get text from text_director if available
-        if self.text_director:
-            try:
-                actual_text, split_mode = self.text_director.get_random_text()
-                if not actual_text:
-                    # No texts enabled, clear display
-                    self.compositor.clear_text_textures()
-                    return
-                # TODO: Use split_mode when rendering
-                text = actual_text
-                self.logger.debug(f"[visual] Text from director: '{text}' (split: {split_mode})")
-            except Exception as e:
-                self.logger.warning(f"[visual] Failed to get text from director: {e}")
-                # Fall back to provided text
+        # Check if we should vibrate on text cycle
+        if self._current_cue_settings:
+            vibrate = self._current_cue_settings.get('vibrate_on_text_cycle', False)
+            if vibrate:
+                intensity = self._current_cue_settings.get('vibration_intensity', 0.5)
+                self.logger.info(f"[visual] Text changed, triggering vibration (intensity={intensity:.0%})")
+                self._trigger_vibration(intensity)
+            else:
+                self.logger.debug(f"[visual] Text changed but vibration disabled in cue")
+        else:
+            self.logger.debug(f"[visual] Text changed but no cue settings available")
+        
+        # Text is already provided by TextDirector - no need to call get_random_text()
+        # (calling get_random_text() here would cause infinite recursion)
+        if not text:
+            # No text provided, clear display
+            self.compositor.clear_text_textures()
+            return
+        
+        self.logger.debug(f"[visual] Text from callback: '{text}' (split: {split_mode})")
         
         with self._perf_section("text.main.render", warn_ms=18.0, info_ms=12.0):
             try:
@@ -893,6 +916,46 @@ class VisualDirector:
                             self.logger.error(f"[visual] Failed to add text on compositor: {e}")
             except Exception as e:
                 self.logger.error(f"Failed to change text: {e}", exc_info=True)
+    
+    def _trigger_vibration(self, intensity: float) -> None:
+        """Trigger vibration on connected devices.
+        
+        Args:
+            intensity: Vibration intensity (0.0 to 1.0)
+        """
+        self.logger.info(f"[vibration] Triggering vibration at {intensity:.0%} intensity")
+        try:
+            if self.mesmer_server:
+                import asyncio
+                
+                # Check if any devices have protocols (meaning they're connected and initialized)
+                has_connected = bool(self.mesmer_server._device_protocols)
+                if has_connected:
+                    self.logger.debug(f"[vibration] Pulsing {len(self.mesmer_server._device_protocols)} device(s) at {intensity:.0%}")
+                    # Use quick_pulse for rapid text cycles (100ms pulse vs 500ms test)
+                    coro = self.mesmer_server.quick_pulse_all_devices(intensity=intensity)
+                    
+                    # Try to run in existing event loop
+                    try:
+                        loop = asyncio.get_event_loop()
+                        if loop.is_running():
+                            # Schedule as task in running loop
+                            asyncio.create_task(coro)
+                            self.logger.debug(f"[vibration] Scheduled vibration task in running loop")
+                        else:
+                            # Run in new event loop
+                            asyncio.run(coro)
+                            self.logger.debug(f"[vibration] Ran vibration in new event loop")
+                    except RuntimeError:
+                        # No event loop, create one
+                        asyncio.run(coro)
+                        self.logger.debug(f"[vibration] Created event loop and ran vibration")
+                else:
+                    self.logger.warning(f"[vibration] No devices with active protocols found")
+            else:
+                self.logger.warning(f"[vibration] MesmerIntifaceServer not available")
+        except Exception as e:
+            self.logger.error(f"[vibration] Failed to trigger vibration: {e}", exc_info=True)
     
     def _on_change_subtext(self, text: str) -> None:
         """Update subtext overlay (scrolling bands).

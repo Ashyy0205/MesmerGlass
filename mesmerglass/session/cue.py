@@ -305,6 +305,8 @@ class Cue:
     transition_out: CueTransition = field(default_factory=CueTransition)
     audio_tracks: List[AudioTrack] = field(default_factory=list)
     text_messages: Optional[List[str]] = None
+    vibrate_on_text_cycle: bool = False
+    vibration_intensity: float = 0.5  # 0.0 to 1.0
     
     def validate(self) -> tuple[bool, str]:
         """
@@ -393,6 +395,12 @@ class Cue:
         if self.text_messages is not None:
             data["text_messages"] = self.text_messages
         
+        if self.vibrate_on_text_cycle:
+            data["vibrate_on_text_cycle"] = self.vibrate_on_text_cycle
+        
+        if self.vibration_intensity != 0.5:  # Only save if non-default
+            data["vibration_intensity"] = self.vibration_intensity
+        
         return data
     
     @classmethod
@@ -453,7 +461,9 @@ class Cue:
             transition_in=CueTransition.from_dict(data.get("transition_in", {})),
             transition_out=CueTransition.from_dict(data.get("transition_out", {})),
             audio_tracks=tracks,
-            text_messages=data.get("text_messages")
+            text_messages=data.get("text_messages"),
+            vibrate_on_text_cycle=data.get("vibrate_on_text_cycle", False),
+            vibration_intensity=data.get("vibration_intensity", 0.5)
         )
 
     # Convenience helpers -------------------------------------------------

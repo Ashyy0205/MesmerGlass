@@ -18,7 +18,7 @@ from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton,
     QListWidget, QListWidgetItem, QSpinBox, QDoubleSpinBox, QComboBox,
     QGroupBox, QFormLayout, QDialogButtonBox, QMessageBox, QFileDialog,
-    QTextEdit, QWidget, QScrollArea
+    QTextEdit, QWidget, QScrollArea, QCheckBox, QSlider
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QSize
 from PyQt6.QtGui import QGuiApplication
@@ -76,6 +76,7 @@ class CueEditor(QDialog):
         
         self._setup_ui()
         self._apply_responsive_default_size()
+        self._update_vibration_controls_state()
         
         # Load data based on mode
         if self.is_session_mode and self.cuelist_key and self.cue_index is not None:
@@ -264,6 +265,33 @@ class CueEditor(QDialog):
         text_layout.addWidget(self.text_edit)
         layout.addWidget(text_group)
         
+        # === VIBRATION CONTROLS ===
+        vibration_group = QGroupBox("Device Vibration")
+        vibration_layout = QVBoxLayout(vibration_group)
+        
+        # Checkbox
+        self.vibrate_checkbox = QCheckBox("Vibrate on Text Cycle")
+        self.vibrate_checkbox.stateChanged.connect(self._mark_modified)
+        vibration_layout.addWidget(self.vibrate_checkbox)
+        
+        # Intensity slider
+        intensity_container = QHBoxLayout()
+        intensity_label_left = QLabel("Intensity:")
+        self.intensity_slider = QSlider(Qt.Orientation.Horizontal)
+        self.intensity_slider.setRange(0, 100)
+        self.intensity_slider.setValue(50)
+        self.intensity_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+        self.intensity_slider.setTickInterval(10)
+        self.intensity_slider.valueChanged.connect(self._on_intensity_changed)
+        self.intensity_label = QLabel("50%")
+        self.intensity_label.setMinimumWidth(40)
+        intensity_container.addWidget(intensity_label_left)
+        intensity_container.addWidget(self.intensity_slider, 1)
+        intensity_container.addWidget(self.intensity_label)
+        vibration_layout.addLayout(intensity_container)
+        
+        layout.addWidget(vibration_group)
+        
         # === TRANSITIONS ===
         transitions_group = QGroupBox("Transitions")
         transitions_layout = QFormLayout(transitions_group)
@@ -387,6 +415,20 @@ class CueEditor(QDialog):
         else:
             self.selection_mode_combo.setCurrentIndex(0)
         self.selection_mode_combo.blockSignals(False)
+        
+        # Vibration settings
+        self.vibrate_checkbox.blockSignals(True)
+        self.vibrate_checkbox.setChecked(self.cue_data.get("vibrate_on_text_cycle", False))
+        self.vibrate_checkbox.blockSignals(False)
+        
+        intensity = self.cue_data.get("vibration_intensity", 0.5)
+        self.intensity_slider.blockSignals(True)
+        self.intensity_slider.setValue(int(intensity * 100))
+        self.intensity_label.setText(f"{int(intensity * 100)}%")
+        self.intensity_slider.blockSignals(False)
+        
+        # Update enabled state
+        self._update_vibration_controls_state()
 
         # Playback pool
         self.playback_list.clear()
@@ -585,12 +627,73 @@ class CueEditor(QDialog):
         self._duration_manual_override = True
         self._refresh_duration_hint_label()
         self._mark_modified()
+    
+    def _on_intensity_changed(self, value: int) -> None:
+        """Update intensity label when slider changes."""
+        self.intensity_label.setText(f"{value}%")
+        self._mark_modified()
+    
+    def _update_vibration_controls_state(self) -> None:
+        """Enable/disable vibration controls based on device connection status."""
+        # Check if any devices are connected via MesmerIntifaceServer
+        has_connected_devices = False
+        
+        try:
+            # Try to get the server from the parent window chain
+            server = None
+            parent = self.parent()
+            while parent is not None:
+                if hasattr(parent, 'mesmer_intiface_server'):
+                    server = parent.mesmer_intiface_server
+                    break
+                parent = parent.parent() if hasattr(parent, 'parent') else None
+            
+            if server:
+                self.logger.debug(f"[vibration] Found MesmerIntifaceServer instance")
+                
+                # Check if any devices are connected in _bluetooth_devices dict
+                if hasattr(server, '_bluetooth_devices'):
+                    self.logger.debug(f"[vibration] Found _bluetooth_devices with {len(server._bluetooth_devices)} entries")
+                    for addr, device_info in server._bluetooth_devices.items():
+                        if hasattr(device_info, 'is_connected') and device_info.is_connected:
+                            has_connected_devices = True
+                            self.logger.debug(f"[vibration] Found connected device: {addr}")
+                            break
+                
+                # Also check _device_protocols dict as backup
+                if not has_connected_devices and hasattr(server, '_device_protocols'):
+                    protocol_count = len(server._device_protocols)
+                    self.logger.debug(f"[vibration] Found _device_protocols with {protocol_count} entries")
+                    has_connected_devices = protocol_count > 0
+            else:
+                self.logger.debug(f"[vibration] No MesmerIntifaceServer found in parent chain")
+        except Exception as e:
+            self.logger.debug(f"Could not check device status: {e}", exc_info=True)
+        
+        self.logger.info(f"[vibration] Setting controls enabled={has_connected_devices}")
+        
+        # Enable/disable vibration controls
+        self.vibrate_checkbox.setEnabled(has_connected_devices)
+        self.intensity_slider.setEnabled(has_connected_devices)
+        self.intensity_label.setEnabled(has_connected_devices)
+        
+        if not has_connected_devices:
+            # Grey out with tooltip
+            self.vibrate_checkbox.setToolTip("No devices connected. Connect devices in the Devices tab.")
+            self.intensity_slider.setToolTip("No devices connected. Connect devices in the Devices tab.")
+        else:
+            self.vibrate_checkbox.setToolTip("")
+            self.intensity_slider.setToolTip("")
 
     def _update_data_from_ui(self):
         """Update cue_data from UI widgets."""
         self.cue_data["name"] = self.name_edit.text()
         self.cue_data["duration_seconds"] = self.duration_spin.value()
         self.cue_data["selection_mode"] = self.selection_mode_combo.currentText()
+        
+        # Vibration settings
+        self.cue_data["vibrate_on_text_cycle"] = self.vibrate_checkbox.isChecked()
+        self.cue_data["vibration_intensity"] = self.intensity_slider.value() / 100.0
         
         # Playback pool
         playback_pool = []

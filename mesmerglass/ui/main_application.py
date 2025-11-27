@@ -23,6 +23,7 @@ from .tabs.home_tab import HomeTab
 from .tabs.cuelists_tab import CuelistsTab
 from .tabs.playbacks_tab import PlaybacksTab
 from .tabs.display_tab import DisplayTab
+from .tabs.devices_tab import DevicesTab
 from ..content.simple_video_streamer import SimpleVideoStreamer
 from ..content.media_scan import scan_media_directory
 from ..content.themebank import ThemeBank
@@ -115,6 +116,7 @@ class MainApplication(QMainWindow):
             
             # 3. Create TextRenderer and TextDirector
             self.text_renderer = TextRenderer()
+            # Note: VisualDirector is created later, so we'll wire the callback after that
             self.text_director = TextDirector(
                 text_renderer=self.text_renderer,
                 compositor=self.compositor
@@ -156,14 +158,21 @@ class MainApplication(QMainWindow):
             
             # 4. Create VisualDirector (manages playback loading)
             from ..mesmerloom.visual_director import VisualDirector
+            # Note: mesmer_intiface_server will be set after it's initialized (step 7)
             self.visual_director = VisualDirector(
                 theme_bank=self.theme_bank,
                 compositor=self.compositor,
                 text_renderer=self.text_renderer,
                 video_streamer=self.video_streamer,
-                text_director=self.text_director
+                text_director=self.text_director,
+                mesmer_server=None  # Will be set after mesmer_intiface_server is created
             )
             self.logger.info("VisualDirector initialized")
+            
+            # Wire up text change callback for vibration on text cycle
+            # This allows VisualDirector to trigger vibration when TextDirector changes text
+            self.text_director._on_text_change = self.visual_director._on_change_text
+            self.logger.debug("Text change callback wired to VisualDirector for vibration support")
             
             # 5. Create AudioEngine (multi-channel audio for sessions)
             from ..engine.audio import AudioEngine
@@ -178,6 +187,20 @@ class MainApplication(QMainWindow):
             except Exception as e:
                 self.logger.warning(f"DeviceManager not available: {e}")
                 self.device_manager = None
+                
+            # 7. Create MesmerIntifaceServer for Bluetooth device control
+            try:
+                from ..engine.mesmerintiface import MesmerIntifaceServer
+                self.mesmer_intiface_server = MesmerIntifaceServer(port=12350)
+                self.mesmer_intiface_server.start()
+                self.logger.info("MesmerIntifaceServer initialized on port 12350")
+                
+                # Wire up server to VisualDirector for vibration on text cycle
+                self.visual_director.mesmer_server = self.mesmer_intiface_server
+                self.logger.debug("MesmerIntifaceServer wired to VisualDirector for vibration support")
+            except Exception as e:
+                self.logger.warning(f"MesmerIntifaceServer not available: {e}")
+                self.mesmer_intiface_server = None
             
             self.logger.info("All engines initialized successfully")
             
@@ -300,13 +323,9 @@ class MainApplication(QMainWindow):
         if hasattr(self.playbacks_tab, 'data_changed'):
             self.playbacks_tab.data_changed.connect(self._mark_session_dirty)
         
-        # Tab 5: Device Control (placeholder)
-        placeholder = QWidget()
-        layout = QVBoxLayout(placeholder)
-        label = QLabel("🔗 Device tab\n\nComing soon...")
-        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(label)
-        self.tabs.addTab(placeholder, "🔗 Device")
+        # Tab 5: Device Control (Bluetooth device scanning and connection)
+        self.devices_tab = DevicesTab(self)
+        self.tabs.addTab(self.devices_tab, "🔗 Device")
         
         # Tab 6: Performance monitoring (placeholder)
         placeholder = QWidget()

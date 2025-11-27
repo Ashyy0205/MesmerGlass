@@ -40,16 +40,13 @@ class BluetoothDeviceScanner:
         "5a300001-0023-4bd4-bbd5-a6920e4c5653": "lovense_v2",  # Lovense Hush and newer devices
     # Lovense Diamo (field observation: variant service UUID 5230.... instead of 5a30....)
     "52300001-0023-4bd4-bbd5-a6920e4c5653": "lovense_v2",
+    "57300001-0023-4bd4-bbd5-a6920e4c5653": "lovense_v2",  # Lovense Domi 2 variant UUID
         
         # We-Vibe devices  
         "f000aa80-0451-4000-b000-000000000000": "we_vibe",
         
         # Kiiroo devices
         "88f80580-0000-01e6-aace-0002a5d5c51b": "kiiroo",
-        
-        # Generic sex toy services
-        "0000180f-0000-1000-8000-00805f9b34fb": "battery_service",
-        "0000180a-0000-1000-8000-00805f9b34fb": "device_info_service",
     }
     
     # Manufacturer data company IDs

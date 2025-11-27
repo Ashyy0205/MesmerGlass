@@ -74,6 +74,10 @@ class LovenseProtocol(DeviceProtocol):
     SERVICE_UUID_V2_ALT = "52300001-0023-4bd4-bbd5-a6920e4c5653"
     TX_CHAR_UUID_V2_ALT = "52300002-0023-4bd4-bbd5-a6920e4c5653"
     RX_CHAR_UUID_V2_ALT = "52300003-0023-4bd4-bbd5-a6920e4c5653"
+    # Lovense v2 Domi 2 variant (uses 5730 prefix)
+    SERVICE_UUID_V2_DOMI = "57300001-0023-4bd4-bbd5-a6920e4c5653"
+    TX_CHAR_UUID_V2_DOMI = "57300002-0023-4bd4-bbd5-a6920e4c5653"
+    RX_CHAR_UUID_V2_DOMI = "57300003-0023-4bd4-bbd5-a6920e4c5653"
     
     def __init__(self, device_address: str, device_name: str):
         super().__init__(device_address, device_name)
@@ -152,20 +156,26 @@ class LovenseProtocol(DeviceProtocol):
             
             for service in services:
                 su = service.uuid.lower()
-                if su == self.SERVICE_UUID_V2.lower() or su == self.SERVICE_UUID_V2_ALT.lower():
+                if su == self.SERVICE_UUID_V2.lower() or su == self.SERVICE_UUID_V2_ALT.lower() or su == self.SERVICE_UUID_V2_DOMI.lower():
                     v2_service = service
                 elif su == self.SERVICE_UUID_V1.lower():
                     v1_service = service
                     
             # Prefer v2 if available, fall back to v1
             if v2_service:
-                # Determine which v2 mapping applies (standard 5a30 or alt 5230)
+                # Determine which v2 mapping applies (standard 5a30, alt 5230, or Domi 5730)
                 if v2_service.uuid.lower() == self.SERVICE_UUID_V2_ALT.lower():
                     self._logger.info(f"Detected Lovense v2 protocol (alt 5230) for {self.device_name}")
                     self.is_v2_protocol = True
                     self.SERVICE_UUID = self.SERVICE_UUID_V2_ALT
                     self.TX_CHAR_UUID = self.TX_CHAR_UUID_V2_ALT
                     self.RX_CHAR_UUID = self.RX_CHAR_UUID_V2_ALT
+                elif v2_service.uuid.lower() == self.SERVICE_UUID_V2_DOMI.lower():
+                    self._logger.info(f"Detected Lovense v2 protocol (Domi 5730) for {self.device_name}")
+                    self.is_v2_protocol = True
+                    self.SERVICE_UUID = self.SERVICE_UUID_V2_DOMI
+                    self.TX_CHAR_UUID = self.TX_CHAR_UUID_V2_DOMI
+                    self.RX_CHAR_UUID = self.RX_CHAR_UUID_V2_DOMI
                 else:
                     self._logger.info(f"Detected Lovense v2 protocol for {self.device_name}")
                     self.is_v2_protocol = True
@@ -350,6 +360,29 @@ class LovenseProtocol(DeviceProtocol):
         except Exception as e:
             self._logger.error(f"Failed to request battery level: {e}")
             return None
+            
+    async def test_vibrate(self) -> bool:
+        """Send a short test vibration pulse (0.5 seconds at medium intensity)."""
+        if not self._client:
+            return False
+            
+        try:
+            # Send medium intensity vibration (level 10 out of 20)
+            await self.vibrate(0.5, actuator_index=0)
+            self._logger.debug(f"Sent test vibration to {self.device_name}")
+            
+            # Wait for half a second
+            await asyncio.sleep(0.5)
+            
+            # Stop vibration
+            await self.stop()
+            self._logger.debug(f"Stopped test vibration on {self.device_name}")
+            
+            return True
+            
+        except Exception as e:
+            self._logger.error(f"Failed to send test vibration: {e}")
+            return False
             
     def _on_notification(self, sender, data: bytearray):
         """Handle notifications from Lovense device."""

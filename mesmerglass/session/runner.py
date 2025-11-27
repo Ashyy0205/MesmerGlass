@@ -1274,6 +1274,13 @@ class SessionRunner:
         self._cue_start_cycle = self.visual_director.get_cycle_count()
         self._playback_history.clear()  # Reset history for new cue
         
+        # Update visual director with current cue settings (for vibration on text cycle)
+        cue_settings = {
+            'vibrate_on_text_cycle': cue.vibrate_on_text_cycle,
+            'vibration_intensity': cue.vibration_intensity
+        }
+        self.visual_director.set_current_cue_settings(cue_settings)
+        
         self.logger.info(f"[session] Starting cue {cue_index}: '{cue.name}' (duration={cue.duration_seconds}s)")
         
         # Select and load first playback from cue's pool
