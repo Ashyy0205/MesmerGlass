@@ -736,12 +736,15 @@ class CustomVisual(Visual):
 
     def _load_accelerate_settings(self) -> None:
         """Load accelerate configuration from playback JSON and reset runtime state."""
+        self.logger.info(f"[CustomVisual][ACCEL-LOAD] _load_accelerate_settings() called")
         accel_config = self.config.get("accelerate") or {}
+        self.logger.info(f"[CustomVisual][ACCEL-LOAD] accel_config: {accel_config}")
         spiral_config = self.config.get("spiral", {})
         media_config = self.config.get("media", {})
         zoom_config = self.config.get("zoom", {})
 
         self._accelerate_enabled = bool(accel_config.get("enabled", False))
+        self.logger.info(f"[CustomVisual][ACCEL-LOAD] _accelerate_enabled set to: {self._accelerate_enabled}")
         duration = float(accel_config.get("duration", 30.0))
         self._accelerate_duration = max(self.ACCEL_MIN_DURATION, duration)
 
@@ -753,9 +756,12 @@ class CustomVisual(Visual):
             accel_config.get("start_rotation_x"),
             default_rotation_x,
         )
-        self._accelerate_media_start_speed = self._coerce_float(
-            accel_config.get("start_media_speed"),
-            default_media_speed,
+        self._accelerate_media_start_speed = max(
+            self.ACCEL_MEDIA_START_SPEED,
+            self._coerce_float(
+                accel_config.get("start_media_speed"),
+                default_media_speed,
+            )
         )
         self._accelerate_zoom_start_rate = self._coerce_float(
             accel_config.get("start_zoom_rate"),
@@ -821,6 +827,7 @@ class CustomVisual(Visual):
         if force or self._accelerate_start_time is None:
             self._accelerate_start_time = now
             elapsed = 0.0
+            self.logger.info(f"[CustomVisual][ACCEL] Starting acceleration at time {now:.6f}")
         else:
             elapsed = now - self._accelerate_start_time
 
@@ -839,6 +846,9 @@ class CustomVisual(Visual):
         rotation_x = rotation_start + (rotation_target - rotation_start) * progress
         media_speed = media_start + (media_target - media_start) * progress
         zoom_rate = zoom_start + (zoom_target - zoom_start) * progress
+
+        if force or elapsed < 1.0:  # Log first second
+            self.logger.info(f"[CustomVisual][ACCEL] Progress: {progress:.3f}, media_speed: {media_speed:.1f}, rotation: {rotation_x:.1f}, zoom: {zoom_rate:.2f}")
 
         self._apply_accelerate_rotation(rotation_x)
         self._apply_accelerate_media_speed(media_speed)
@@ -891,7 +901,7 @@ class CustomVisual(Visual):
         self._accelerate_last_applied_speed = smoothed
 
         frames, _interval_ms = self._cycle_speed_to_frames(int(round(smoothed)))
-        interval_s = max(self.ACCEL_MIN_DURATION, frames / 60.0)
+        interval_s = frames / 60.0  # Remove ACCEL_MIN_DURATION clamp to allow true high speeds
         self._accelerate_media_interval_s = interval_s
         
         # Only set next media time if not already scheduled (first initialization)
@@ -918,7 +928,7 @@ class CustomVisual(Visual):
         if interval is None:
             interval = self._frames_per_cycle / 60.0
             self.logger.info(f"[CustomVisual][DEBUG] _tick: interval was None, using default {interval:.3f}s (_frames_per_cycle={self._frames_per_cycle})")
-        interval = max(self.ACCEL_MIN_DURATION, interval)
+        # Remove ACCEL_MIN_DURATION clamp to allow true high speeds
 
         now = time.perf_counter()
         if self._accelerate_next_media_time is None:
@@ -951,7 +961,7 @@ class CustomVisual(Visual):
         interval = self._accelerate_media_interval_s
         if interval is None:
             interval = self._frames_per_cycle / 60.0
-        interval = max(self.ACCEL_MIN_DURATION, interval)
+        # Remove ACCEL_MIN_DURATION clamp to allow true high speeds
         self._accelerate_next_media_time = time.perf_counter() + interval
     
     # ===== Cycler Interface (Required by Visual base class) =====
@@ -1062,6 +1072,9 @@ class CustomVisual(Visual):
     def start(self) -> None:
         """Start visual playback - loads first media item and begins cycling."""
         self.logger.info(f"[CustomVisual] start() called - media_items={len(getattr(self, '_media_paths', [])) if hasattr(self, '_media_paths') else 'NO _media_paths'}, _use_theme_bank_media={self._use_theme_bank_media}")
+        self.logger.info(f"[CustomVisual][ACCEL] Acceleration enabled: {self._accelerate_enabled}, duration: {self._accelerate_duration}s")
+        if self._accelerate_enabled:
+            self.logger.info(f"[CustomVisual][ACCEL] Start values: rotation_x={self._accelerate_rotation_start_x}, media_speed={self._accelerate_media_start_speed}, zoom_rate={self._accelerate_zoom_start_rate}")
 
         self._reset_accelerate_runtime_state()
         self.logger.info(f"[CustomVisual][DEBUG] After reset: _accelerate_media_interval_s={self._accelerate_media_interval_s}")
@@ -1075,7 +1088,7 @@ class CustomVisual(Visual):
             if self._accelerate_media_interval_s is None:
                 start_speed = self._accelerate_media_start_speed or 50.0
                 frames, _ = self._cycle_speed_to_frames(int(round(start_speed)))
-                self._accelerate_media_interval_s = max(self.ACCEL_MIN_DURATION, frames / 60.0)
+                self._accelerate_media_interval_s = frames / 60.0  # Remove ACCEL_MIN_DURATION clamp
                 self.logger.info(f"[CustomVisual][DEBUG] FALLBACK: Calculated initial interval: {self._accelerate_media_interval_s:.3f}s for speed {start_speed}")
             else:
                 self.logger.info(f"[CustomVisual][DEBUG] Interval already set: {self._accelerate_media_interval_s:.3f}s")
