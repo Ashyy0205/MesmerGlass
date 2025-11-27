@@ -83,8 +83,10 @@ def _install_diagnostics():
 def run():
     # Ensure logging is configured when launching GUI directly
     log_mode_env = os.environ.get("MESMERGLASS_LOG_MODE")
+    debug_mode = os.environ.get("MESMERGLASS_DEBUG", "0") in ("1", "true", "True", "yes")
+    log_level = "DEBUG" if debug_mode else "WARNING"
     if not logging.getLogger().handlers:
-        setup_logging(add_console=True, log_mode=log_mode_env)
+        setup_logging(level=log_level, add_console=True, log_mode=log_mode_env)
     _install_diagnostics()
     
     # Create QApplication

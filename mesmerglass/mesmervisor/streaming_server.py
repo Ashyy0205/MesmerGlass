@@ -440,11 +440,11 @@ class VRStreamingServer:
                         right_kb = len(right_encoded) / 1024
                         total_kb = (len(left_encoded) + len(right_encoded)) / 1024
                         
-                        logger.info(f"📊 VR Performance Stats (Frame {frame_id}):")
-                        logger.info(f"   FPS: {window_fps:.1f} (window) | {actual_fps:.1f} (avg)")
-                        logger.info(f"   Latency: {total_latency_ms:.1f}ms (encode: {avg_encode_ms:.1f}ms, send: {avg_send_ms:.1f}ms)")
-                        logger.info(f"   Bandwidth: {bandwidth_mbps:.2f} Mbps")
-                        logger.info(f"   Frame size: {total_kb:.1f} KB (L: {left_kb:.1f} KB, R: {right_kb:.1f} KB)")
+                        logger.warning(f"📊 VR Performance Stats (Frame {frame_id}):")
+                        logger.warning(f"   FPS: {window_fps:.1f} (window) | {actual_fps:.1f} (avg)")
+                        logger.warning(f"   Latency: {total_latency_ms:.1f}ms (encode: {avg_encode_ms:.1f}ms, send: {avg_send_ms:.1f}ms)")
+                        logger.warning(f"   Bandwidth: {bandwidth_mbps:.2f} Mbps")
+                        logger.warning(f"   Frame size: {total_kb:.1f} KB (L: {left_kb:.1f} KB, R: {right_kb:.1f} KB)")
                         
                         self.last_stats_time = current_time
                         
