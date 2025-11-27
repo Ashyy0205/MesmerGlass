@@ -327,8 +327,8 @@ class LoomCompositor(QOpenGLWidget):  # type: ignore[misc]
             7: 1.0    # sawtooth/modulated: moderate pull
         }
         
-        # Max zoom before reset (configurable, default 5.0x)
-        self._max_zoom_before_reset = 5.0
+        # Max zoom before reset (configurable, None = unlimited)
+        self._max_zoom_before_reset: float | None = 5.0
         
         self.available = False
         self._announced_available = False
@@ -1152,6 +1152,17 @@ class LoomCompositor(QOpenGLWidget):  # type: ignore[misc]
         self._render_background(w_px, h_px)
         
         # --- NOW RENDER SPIRAL ON TOP ---
+        # Background rendering may have disabled or reconfigured blending; restore spiral settings
+        if internal_opacity or test_opaque:
+            GL.glDisable(GL.GL_BLEND)
+        else:
+            GL.glEnable(GL.GL_BLEND)
+            if use_legacy_blend:
+                GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA)
+            else:
+                GL.glBlendFuncSeparate(GL.GL_ONE, GL.GL_ONE_MINUS_SRC_ALPHA,
+                                       GL.GL_ONE, GL.GL_ONE_MINUS_SRC_ALPHA)
+
         # Re-activate spiral program (background rendering may have changed it)
         GL.glUseProgram(self._program)
         
@@ -1432,9 +1443,12 @@ class LoomCompositor(QOpenGLWidget):  # type: ignore[misc]
         Args:
             duration_seconds: Fade duration in seconds (0.0 = instant, 0.5 = half second, etc.)
         """
-        self._fade_duration = max(0.0, min(5.0, duration_seconds))  # Clamp 0-5 seconds
-        self._fade_enabled = duration_seconds > 0.0
-        logging.getLogger(__name__).info(f"[fade] Fade duration set to {self._fade_duration:.2f}s (enabled={self._fade_enabled})")
+        # Fade transitions are globally disabled; ignore requested duration
+        self._fade_duration = 0.0
+        self._fade_enabled = False
+        self._fade_queue.clear()
+        self._fade_active = False
+        logging.getLogger(__name__).info("[fade] Disabled (instant media swaps)")
     
     def set_background_video_frame(self, frame_data: 'np.ndarray', width: int, height: int, zoom: float = 1.0, new_video: bool = False) -> None:
         """Update background with video frame (efficient GPU upload).
@@ -1888,6 +1902,23 @@ class LoomCompositor(QOpenGLWidget):  # type: ignore[misc]
         else:
             logging.getLogger(__name__).warning(f"[zoom] Invalid mode '{mode}', keeping current: {self._zoom_mode}")
     
+    def set_max_zoom_before_reset(self, limit: float | None) -> None:
+        """Configure exponential zoom cap; None disables automatic resets."""
+        if limit is None:
+            self._max_zoom_before_reset = None
+            logging.getLogger(__name__).info("[zoom] Max zoom reset disabled")
+            return
+
+        try:
+            value = float(limit)
+        except (TypeError, ValueError):
+            logging.getLogger(__name__).warning(f"[zoom] Invalid max zoom value '{limit}', keeping {self._max_zoom_before_reset}")
+            return
+
+        value = max(0.5, value)
+        self._max_zoom_before_reset = value
+        logging.getLogger(__name__).info(f"[zoom] Max zoom reset set to {value:.2f}x")
+
     def get_zoom_info(self) -> dict:
         """Get current zoom animation parameters (for debugging/UI).
         
@@ -1925,11 +1956,12 @@ class LoomCompositor(QOpenGLWidget):  # type: ignore[misc]
             self._zoom_current = self._zoom_start * math.exp(self._zoom_rate * elapsed_time)
             
             # Reset when zoom gets too large (deep zoom limit)
-            if self._zoom_current > self._max_zoom_before_reset:
+            max_cap = self._max_zoom_before_reset
+            if max_cap is not None and max_cap > 0 and self._zoom_current > max_cap:
                 self._zoom_start = 1.0
                 self._zoom_current = 1.0
                 self._zoom_start_time = time.time()
-                logging.getLogger(__name__).debug(f"[zoom] Exponential zoom reset (reached {self._max_zoom_before_reset:.1f}x)")
+                logging.getLogger(__name__).debug(f"[zoom] Exponential zoom reset (reached {max_cap:.1f}x)")
         
         elif self._zoom_mode == "pulse":
             # Pulsing wave: scale = 1.0 + amplitude * sin(rate * time)

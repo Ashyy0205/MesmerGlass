@@ -231,15 +231,10 @@ class VisualModeCreator(QMainWindow):
         media_layout.addWidget(self.bg_opacity_slider)
         media_layout.addWidget(self.bg_opacity_label)
         
-        # Fade Duration (transition time between images/videos)
-        media_layout.addWidget(QLabel("Media Fade Duration:"))
-        self.fade_duration_slider = QSlider(Qt.Orientation.Horizontal)
-        self.fade_duration_slider.setRange(0, 50)  # 0 to 5.0 seconds (stored as tenths)
-        self.fade_duration_slider.setValue(5)  # Default 0.5 seconds
-        self.fade_duration_slider.valueChanged.connect(self.on_fade_duration_changed)
-        self.fade_duration_label = QLabel("0.5s")
-        media_layout.addWidget(self.fade_duration_slider)
-        media_layout.addWidget(self.fade_duration_label)
+        fade_info = QLabel("Media fades are disabled; transitions are instant.")
+        fade_info.setStyleSheet("color: #777; font-size: 9pt;")
+        fade_info.setWordWrap(True)
+        media_layout.addWidget(fade_info)
         
         # Media Bank Selection
         media_layout.addWidget(QLabel("─" * 30))  # Separator
@@ -420,7 +415,7 @@ class VisualModeCreator(QMainWindow):
         QTimer.singleShot(500, self.load_test_images)
         
         # Initialize fade duration (0.5s default for smooth transitions)
-        self.compositor.set_fade_duration(0.5)
+        self.compositor.set_fade_duration(0.0)
         
         # Update initial state
         self.on_spiral_type_changed(2)  # Linear
@@ -951,14 +946,6 @@ class VisualModeCreator(QMainWindow):
         # Apply to compositor if needed
         # self.compositor.set_background_opacity(opacity)
     
-    def on_fade_duration_changed(self, value):
-        """Handle fade duration slider (transition time between media)."""
-        duration_s = value / 10.0  # Convert tenths to seconds (0.0 - 5.0)
-        self.fade_duration_label.setText(f"{duration_s:.1f}s")
-        
-        # Apply to compositor in real-time for 1:1 preview match with launcher
-        self.compositor.set_fade_duration(duration_s)
-    
     def on_text_opacity_changed(self, value):
         """Handle text opacity slider."""
         opacity = value / 100.0
@@ -1096,7 +1083,7 @@ class VisualModeCreator(QMainWindow):
             "media": {
                 "mode": media_modes[media_mode_index] if media_mode_index < len(media_modes) else "both",
                 "cycle_speed": self.media_speed_slider.value(),  # 1-100
-                "fade_duration": self.fade_duration_slider.value() / 10.0,  # Convert tenths to seconds (0.0-5.0)
+                "fade_duration": 0.0,
                 "use_theme_bank": True,  # Always use ThemeBank for now
                 "paths": [],  # Empty - using ThemeBank
                 "shuffle": False,  # Can be added to UI later

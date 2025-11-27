@@ -14,6 +14,7 @@ Custom playbacks are the future-proof replacement for built-in Visual classes.
 from __future__ import annotations
 import json
 import logging
+import time
 from pathlib import Path
 from typing import Optional, Callable, Any, List, Dict, TYPE_CHECKING
 
@@ -24,7 +25,7 @@ if TYPE_CHECKING:
     from ..engine.text_director import TextDirector
 
 from mesmerglass.mesmerloom.visuals import Visual
-from mesmerglass.mesmerloom.cyclers import ActionCycler
+from mesmerglass.mesmerloom.cyclers import ActionCycler, ParallelCycler
 
 
 class CustomVisual(Visual):
@@ -76,6 +77,18 @@ class CustomVisual(Visual):
     
     See docs/technical/custom-mode-settings-reference.md for complete details.
     """
+
+    ACCEL_ROTATION_START_X = 4.0
+    ACCEL_ROTATION_END_X = 24.0
+    ACCEL_MEDIA_START_SPEED = 50.0
+    ACCEL_MEDIA_END_SPEED = 100.0
+    ACCEL_ZOOM_START_RATE = 0.4
+    ACCEL_ZOOM_END_RATE = 3.0
+    ACCEL_RPM_GAIN = 10.0  # Matches PlaybackEditor.SPEED_GAIN for parity
+    ACCEL_MIN_DURATION = 0.1
+    ACCEL_MEDIA_UPDATE_COOLDOWN = 0.15
+    ACCEL_MEDIA_SMOOTH_DELTA = 1.0
+    ACCEL_MEDIA_APPLY_EPSILON = 0.25
     
     def __init__(
         self,
@@ -139,12 +152,29 @@ class CustomVisual(Visual):
         # internal cycler. The Launcher will drive media changes using a
         # precise QTimer at the exact interval derived from the playback.
         self._strict_mode = False
+
+        # Accelerate runtime state
+        self._accelerate_enabled = False
+        self._accelerate_duration = 30.0
+        self._accelerate_rotation_start_x: Optional[float] = None
+        self._accelerate_media_start_speed: Optional[float] = None
+        self._accelerate_zoom_start_rate: Optional[float] = None
+        self._accelerate_start_time: Optional[float] = None
+        self._accelerate_progress = 0.0
+        self._accelerate_media_interval_s: Optional[float] = None
+        self._accelerate_media_speed_current: Optional[float] = None
+        self._accelerate_next_media_time: Optional[float] = None
+        self._accelerate_media_speed_smoothed: Optional[float] = None
+        self._accelerate_last_interval_update_ts: Optional[float] = None
+        self._accelerate_last_applied_speed: Optional[float] = None
+        self._accelerate_last_log_time: Optional[float] = None
         
         # Load and validate playback file
         self._load_playback_file()
         
         # Apply initial settings
         self._apply_initial_settings()
+        self._load_accelerate_settings()
     
     # ===== Multi-Display Support =====
     
@@ -216,6 +246,7 @@ class CustomVisual(Visual):
         self._apply_media_settings()
         self._apply_text_settings()
         self._apply_zoom_settings()
+        self._load_accelerate_settings()
         self.logger.info("[CustomVisual] All settings re-applied")
     
     def reload_from_disk(self) -> bool:
@@ -238,6 +269,7 @@ class CustomVisual(Visual):
             self._apply_media_settings()
             self._apply_text_settings()
             self._apply_zoom_settings()
+            self._load_accelerate_settings()
             
             self.logger.info(f"[CustomVisual] Successfully reloaded '{self.playback_name}' from disk")
             return True
@@ -369,12 +401,10 @@ class CustomVisual(Visual):
         self._cycler = None
         self.logger.debug(f"[CustomVisual] Cleared cycler to force rebuild with new period={self._frames_per_cycle}")
         
-        # Fade duration (in seconds)
-        fade_duration = media_config.get("fade_duration", 0.5)
-        fade_duration = max(0.0, min(5.0, fade_duration))  # Clamp 0-5 seconds
+        # Fade duration (disabled)
         if self.compositor and hasattr(self.compositor, 'set_fade_duration'):
-            self.compositor.set_fade_duration(fade_duration)
-            self.logger.info(f"[CustomVisual] Applied media fade duration: {fade_duration:.2f}s")
+            self.compositor.set_fade_duration(0.0)
+            self.logger.info("[CustomVisual] Media fades disabled; using instant cuts")
         
         # Build media path list or configure ThemeBank usage
         use_theme_bank = media_config.get("use_theme_bank", True)
@@ -532,6 +562,20 @@ class CustomVisual(Visual):
         if hasattr(self.text_director, 'set_opacity'):
             self.text_director.set_opacity(opacity)
         
+        # Text color (defaults to white for backward compatibility)
+        target_color = text_config.get("color")
+        if not isinstance(target_color, (list, tuple)) or len(target_color) < 3:
+            target_color = (1.0, 1.0, 1.0)
+        try:
+            r, g, b = (
+                max(0.0, min(1.0, float(target_color[i] if i < len(target_color) else 1.0)))
+                for i in range(3)
+            )
+        except Exception:
+            r, g, b = (1.0, 1.0, 1.0)
+        if hasattr(self.text_director, 'set_text_color'):
+            self.text_director.set_text_color(r, g, b)
+
         # Text library
         use_theme_bank = text_config.get("use_theme_bank", True)
         
@@ -687,21 +731,244 @@ class CustomVisual(Visual):
                     comp.set_zoom_rate(rate)
             
             self.logger.info(f"[CustomVisual] Applied zoom animation on {len(all_compositors)} compositor(s): mode={zoom_mode}, rate={zoom_rate}")
+
+    # ===== Accelerate Handling =====
+
+    def _load_accelerate_settings(self) -> None:
+        """Load accelerate configuration from playback JSON and reset runtime state."""
+        accel_config = self.config.get("accelerate") or {}
+        spiral_config = self.config.get("spiral", {})
+        media_config = self.config.get("media", {})
+        zoom_config = self.config.get("zoom", {})
+
+        self._accelerate_enabled = bool(accel_config.get("enabled", False))
+        duration = float(accel_config.get("duration", 30.0))
+        self._accelerate_duration = max(self.ACCEL_MIN_DURATION, duration)
+
+        default_rotation_x = abs(float(spiral_config.get("rotation_speed", 40.0))) / self.ACCEL_RPM_GAIN
+        default_media_speed = float(media_config.get("cycle_speed", 50.0))
+        default_zoom_rate = float(zoom_config.get("rate", 0.2))
+
+        self._accelerate_rotation_start_x = self._coerce_float(
+            accel_config.get("start_rotation_x"),
+            default_rotation_x,
+        )
+        self._accelerate_media_start_speed = self._coerce_float(
+            accel_config.get("start_media_speed"),
+            default_media_speed,
+        )
+        self._accelerate_zoom_start_rate = self._coerce_float(
+            accel_config.get("start_zoom_rate"),
+            default_zoom_rate,
+        )
+
+        self._reset_accelerate_runtime_state()
+        self.set_strict_mode(self._accelerate_enabled)
+
+    @staticmethod
+    def _coerce_float(value: Any, fallback: float) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return float(fallback)
+
+    def _reset_accelerate_runtime_state(self) -> None:
+        self._accelerate_start_time = None
+        self._accelerate_progress = 0.0
+        self._accelerate_media_interval_s = None
+        self._accelerate_media_speed_current = None
+        self._accelerate_next_media_time = None
+        self._accelerate_media_speed_smoothed = None
+        self._accelerate_last_interval_update_ts = None
+        self._accelerate_last_applied_speed = None
+        self._accelerate_last_log_time = None
+
+    def _runtime_frame_tick(self) -> None:
+        """Run per-frame maintenance (accelerate + diagnostics)."""
+        self._frame_counter += 1
+
+        if not self._accelerate_enabled:
+            return
+
+        self._update_accelerate_effects()
+        self._tick_strict_media_cycle()
+
+        if not self.logger.isEnabledFor(logging.DEBUG):
+            return
+
+        now = time.perf_counter()
+        last_log = self._accelerate_last_log_time or 0.0
+        if (now - last_log) < 1.0:
+            return
+
+        self._accelerate_last_log_time = now
+        next_media_in = (self._accelerate_next_media_time or now) - now
+        self.logger.debug(
+            "[CustomVisual][strict] frame=%d accel_progress=%.3f media_speed=%.1f interval=%.3fs next_in=%.3fs",
+            self._frame_counter,
+            self._accelerate_progress,
+            self._accelerate_media_speed_smoothed or 0.0,
+            self._accelerate_media_interval_s or 0.0,
+            max(0.0, next_media_in),
+        )
+
+    def _update_accelerate_effects(self, *, force: bool = False) -> None:
+        """Apply accelerate overrides when enabled."""
+        if not self._accelerate_enabled:
+            return
+
+        now = time.perf_counter()
+        if force or self._accelerate_start_time is None:
+            self._accelerate_start_time = now
+            elapsed = 0.0
+        else:
+            elapsed = now - self._accelerate_start_time
+
+        duration = max(self.ACCEL_MIN_DURATION, self._accelerate_duration)
+        progress = max(0.0, min(1.0, elapsed / duration))
+        self._accelerate_progress = progress
+
+        rotation_start = self._accelerate_rotation_start_x or 4.0
+        media_start = self._accelerate_media_start_speed or 50.0
+        zoom_start = self._accelerate_zoom_start_rate or 0.2
+
+        rotation_target = max(rotation_start, self.ACCEL_ROTATION_END_X)
+        media_target = max(media_start, self.ACCEL_MEDIA_END_SPEED)
+        zoom_target = max(zoom_start, self.ACCEL_ZOOM_END_RATE)
+
+        rotation_x = rotation_start + (rotation_target - rotation_start) * progress
+        media_speed = media_start + (media_target - media_start) * progress
+        zoom_rate = zoom_start + (zoom_target - zoom_start) * progress
+
+        self._apply_accelerate_rotation(rotation_x)
+        self._apply_accelerate_media_speed(media_speed)
+        self._apply_accelerate_zoom_rate(zoom_rate)
+
+    def _apply_accelerate_rotation(self, x_value: float) -> None:
+        spiral = None
+        if hasattr(self.compositor, 'spiral_director'):
+            spiral = self.compositor.spiral_director
+        elif hasattr(self.compositor, 'director'):
+            spiral = self.compositor.director
+
+        if not spiral:
+            return
+
+        rpm = float(x_value) * self.ACCEL_RPM_GAIN
+        if self.config.get("spiral", {}).get("reverse", False):
+            rpm = -abs(rpm)
+        spiral.set_rotation_speed(rpm)
+
+    def _apply_accelerate_media_speed(self, speed_value: float) -> None:
+        speed_target = max(1.0, min(100.0, float(speed_value)))
+        self._accelerate_media_speed_current = speed_target
+
+        smoothed = self._accelerate_media_speed_smoothed
+        delta_cap = self.ACCEL_MEDIA_SMOOTH_DELTA
+        if smoothed is None:
+            smoothed = speed_target
+        else:
+            delta = speed_target - smoothed
+            if abs(delta) > delta_cap:
+                smoothed += delta_cap if delta > 0 else -delta_cap
+            else:
+                smoothed = speed_target
+        smoothed = max(1.0, min(100.0, smoothed))
+        self._accelerate_media_speed_smoothed = smoothed
+
+        last_speed = self._accelerate_last_applied_speed
+        if last_speed is not None and abs(last_speed - smoothed) < self.ACCEL_MEDIA_APPLY_EPSILON:
+            return
+
+        now = time.perf_counter()
+        if (
+            self._accelerate_last_interval_update_ts is not None
+            and (now - self._accelerate_last_interval_update_ts) < self.ACCEL_MEDIA_UPDATE_COOLDOWN
+        ):
+            return
+
+        self._accelerate_last_interval_update_ts = now
+        self._accelerate_last_applied_speed = smoothed
+
+        frames, _interval_ms = self._cycle_speed_to_frames(int(round(smoothed)))
+        interval_s = max(self.ACCEL_MIN_DURATION, frames / 60.0)
+        self._accelerate_media_interval_s = interval_s
+        
+        # Only set next media time if not already scheduled (first initialization)
+        # Otherwise, let the existing schedule continue - new interval applies to NEXT cycle
+        if self._accelerate_next_media_time is None:
+            self._accelerate_next_media_time = now + interval_s
+
+    def _apply_accelerate_zoom_rate(self, rate: float) -> None:
+        all_compositors = self._get_all_compositors()
+        if not all_compositors:
+            return
+
+        for comp in all_compositors:
+            if hasattr(comp, 'set_zoom_rate'):
+                comp.set_zoom_rate(rate)
+            elif hasattr(comp, '_zoom_rate'):
+                comp._zoom_rate = rate
+
+    def _tick_strict_media_cycle(self) -> None:
+        if not self._accelerate_enabled:
+            return
+
+        interval = self._accelerate_media_interval_s
+        if interval is None:
+            interval = self._frames_per_cycle / 60.0
+            self.logger.info(f"[CustomVisual][DEBUG] _tick: interval was None, using default {interval:.3f}s (_frames_per_cycle={self._frames_per_cycle})")
+        interval = max(self.ACCEL_MIN_DURATION, interval)
+
+        now = time.perf_counter()
+        if self._accelerate_next_media_time is None:
+            self._accelerate_next_media_time = now + interval
+            self.logger.info(f"[CustomVisual][DEBUG] _tick: First media advance scheduled at {self._accelerate_next_media_time:.6f} (now={now:.6f}, interval={interval:.3f}s)")
+            return
+
+        time_until = self._accelerate_next_media_time - now
+        if now < self._accelerate_next_media_time:
+            return
+
+        self.logger.info(f"[CustomVisual][DEBUG] _tick: Media advancing NOW (was due {-time_until:.3f}s ago, interval={interval:.3f}s)")
+        self._advance_media_cycle()
+        self._accelerate_next_media_time = now + interval
+        self.logger.info(f"[CustomVisual][DEBUG] _tick: Next media scheduled at {self._accelerate_next_media_time:.6f} (now={now:.6f}, interval={interval:.3f}s)")
+
+    def _advance_media_cycle(self) -> None:
+        if not self._use_theme_bank_media and not self._media_paths:
+            return
+
+        if not self._use_theme_bank_media and self._media_paths:
+            self._current_media_index = (self._current_media_index + 1) % len(self._media_paths)
+
+        self._load_current_media()
+
+    def _schedule_next_accelerate_media_tick(self) -> None:
+        if not self._accelerate_enabled:
+            return
+
+        interval = self._accelerate_media_interval_s
+        if interval is None:
+            interval = self._frames_per_cycle / 60.0
+        interval = max(self.ACCEL_MIN_DURATION, interval)
+        self._accelerate_next_media_time = time.perf_counter() + interval
     
     # ===== Cycler Interface (Required by Visual base class) =====
     
     def build_cycler(self):
         """
         Build cycler for frame-based media cycling.
-        
+
         CustomVisual uses a simple ActionCycler that advances media every N frames.
         Unlike complex Visual Programs with nested cyclers, CustomVisual is linear.
         """
-        # If strict mode is enabled, return a no-op cycler so that the
-        # Launcher can drive media changes using a precise timer. This avoids
-        # double-advancement and keeps timing exact to the mode.
+        frame_tick_cycler = ActionCycler(period=1, action=self._runtime_frame_tick)
+
+        # In strict mode the launcher drives media changes; keep per-frame ticks for accelerate.
         if getattr(self, "_strict_mode", False):
-            return ActionCycler(period=999_999_999, action=lambda: None, repeat_count=1)
+            return frame_tick_cycler
+
         def cycle_media():
             """Advance to next media item."""
             if self._use_theme_bank_media:
@@ -711,17 +978,19 @@ class CustomVisual(Visual):
                 # Explicit path list mode - cycle through indices
                 self._current_media_index = (self._current_media_index + 1) % len(self._media_paths)
                 self._load_current_media()
-        
+
         # Create ActionCycler that runs every _frames_per_cycle frames
         # CRITICAL: offset=period to prevent immediate execution on frame 0
         # User expects mode to load without auto-starting media (preview state)
         # Media will load when Launch button is pressed
-        return ActionCycler(
+        media_cycler = ActionCycler(
             period=self._frames_per_cycle,  # Fixed: parameter name is 'period', not 'frames'
             action=cycle_media,
             offset=self._frames_per_cycle  # Wait one full cycle before first media change
         )
-    
+        return ParallelCycler([frame_tick_cycler, media_cycler])
+
+
     def _load_current_media(self) -> None:
         """Load the current media item (image or video)."""
         self.logger.info(f"[CustomVisual] _load_current_media() called - _use_theme_bank_media={self._use_theme_bank_media}, _media_mode={self._media_mode}")
@@ -775,6 +1044,9 @@ class CustomVisual(Visual):
 
         # Reset ThemeBank alternating preference
         self._theme_bank_media_cycle = "image"
+
+        # Reset accelerate runtime state
+        self._reset_accelerate_runtime_state()
         
         # DON'T auto-load media - wait for start() call
         # User expects mode to load in "preview" state without starting playback
@@ -790,6 +1062,25 @@ class CustomVisual(Visual):
     def start(self) -> None:
         """Start visual playback - loads first media item and begins cycling."""
         self.logger.info(f"[CustomVisual] start() called - media_items={len(getattr(self, '_media_paths', [])) if hasattr(self, '_media_paths') else 'NO _media_paths'}, _use_theme_bank_media={self._use_theme_bank_media}")
+
+        self._reset_accelerate_runtime_state()
+        self.logger.info(f"[CustomVisual][DEBUG] After reset: _accelerate_media_interval_s={self._accelerate_media_interval_s}")
+        
+        if self._accelerate_enabled:
+            self._update_accelerate_effects(force=True)
+            self.logger.info(f"[CustomVisual][DEBUG] After _update_accelerate_effects: _accelerate_media_interval_s={self._accelerate_media_interval_s}")
+            
+            # CRITICAL: Ensure interval is calculated immediately for first cycle
+            # This prevents fallback to 3-second default interval
+            if self._accelerate_media_interval_s is None:
+                start_speed = self._accelerate_media_start_speed or 50.0
+                frames, _ = self._cycle_speed_to_frames(int(round(start_speed)))
+                self._accelerate_media_interval_s = max(self.ACCEL_MIN_DURATION, frames / 60.0)
+                self.logger.info(f"[CustomVisual][DEBUG] FALLBACK: Calculated initial interval: {self._accelerate_media_interval_s:.3f}s for speed {start_speed}")
+            else:
+                self.logger.info(f"[CustomVisual][DEBUG] Interval already set: {self._accelerate_media_interval_s:.3f}s")
+            
+            self.logger.info(f"[CustomVisual] Acceleration enabled - starting immediately")
         
         # Check if we have explicit media paths
         if hasattr(self, '_media_paths') and self._media_paths:
@@ -801,6 +1092,14 @@ class CustomVisual(Visual):
             self.logger.info(f"[CustomVisual] '{self.playback_name}' started - ThemeBank media loading")
         else:
             self.logger.warning(f"[CustomVisual] '{self.playback_name}' has no media to start")
+
+        if self._accelerate_enabled:
+            # CRITICAL: Schedule next media cycle NOW so it happens immediately on next frame tick
+            # Don't add interval - that causes 3s stall. Frame tick will detect time has passed and load media.
+            now = time.perf_counter()
+            self._accelerate_next_media_time = now
+            self.logger.info(f"[CustomVisual][DEBUG] Next media scheduled at {self._accelerate_next_media_time:.6f} (now={now:.6f}, diff=0.0s)")
+            self.logger.info(f"[CustomVisual] Next media cycle scheduled for immediate execution")
 
     # ===== Strict mode toggles =====
 
@@ -821,20 +1120,19 @@ class CustomVisual(Visual):
     def advance(self) -> bool:
         """
         Advance visual by one frame.
-        
+
         Returns:
             True if visual should continue, False if complete
         """
-        self._frame_counter += 1
-        
-        # Advance cycler (handles media cycling)
+        # Advance cycler (handles runtime ticks + media cycling)
         cycler = self.get_cycler()
         if cycler:
             cycler.advance()
-        
+
         # CustomVisual never completes - loops indefinitely
         return True
-    
+
+
     def get_name(self) -> str:
         """Get display name of this visual mode."""
         return self.playback_name

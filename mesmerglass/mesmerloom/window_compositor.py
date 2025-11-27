@@ -971,10 +971,11 @@ class LoomWindowCompositor(QOpenGLWindow):
         Args:
             duration_seconds: Fade duration in seconds (0.0 = instant, 0.5 = half second, etc.)
         """
-        self._fade_duration = max(0.0, min(5.0, duration_seconds))
-        self._fade_enabled = duration_seconds > 0.0
-        logger.info(f"[fade] Fade duration set to {self._fade_duration:.2f}s (enabled={self._fade_enabled})")
-        logger.info("[visual] Background texture cleared")
+        self._fade_duration = 0.0
+        self._fade_enabled = False
+        self._fade_queue.clear()
+        self._fade_active = False
+        logger.info("[fade] Disabled (instant transitions)")
     
     def set_background_zoom(self, zoom: float) -> None:
         """Set background zoom factor."""

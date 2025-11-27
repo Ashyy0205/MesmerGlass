@@ -294,7 +294,8 @@ class SessionManager:
                 "use_theme_bank": True,
                 "library": [],
                 "sync_with_media": False,
-                "manual_cycle_speed": 50
+                "manual_cycle_speed": 50,
+                "color": [1.0, 1.0, 1.0]
             },
             "zoom": config["zoom"]
         }

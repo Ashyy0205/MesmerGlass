@@ -14,7 +14,8 @@ import logging
 import random
 import math
 import time
-from typing import Optional, Callable, List, Any
+from collections import OrderedDict
+from typing import Optional, Callable, List, Any, Tuple
 from dataclasses import dataclass
 
 try:
@@ -86,14 +87,24 @@ class TextDirector:
         # Scrolling animation state (for SUBTEXT mode)
         self._scroll_offset = 0.0
         self._scroll_speed = 30.0  # Pixels per second (doubled from 15.0)
+        self._subtext_render_min_interval = 1.0 / 30.0  # ~33ms guard between heavy renders
+        self._subtext_render_min_delta_px = 8.0  # ignore micro scroll adjustments
+        self._last_subtext_render_time: Optional[float] = None
+        self._last_subtext_render_offset: float = 0.0
+
+        # Cache a handful of rendered textures to avoid re-rendering identical text
+        self._text_render_cache_capacity = 10
+        self._text_render_cache: 'OrderedDict[Tuple[str, Optional[SplitMode], bool, bool], Any]' = OrderedDict()
         
         self.logger = logging.getLogger(__name__)
         self.logger.info("[TextDirector] Initialized (independent text system)")
 
         # Global opacity multiplier (matches compositor default)
         self._text_opacity = 1.0
+        self._text_color = (1.0, 1.0, 1.0, 1.0)
         if self.compositor:
             self._apply_opacity_to_compositor(self.compositor)
+        self._apply_text_color_to_renderer()
 
         # Timing helpers use a monotonic clock so slider timing is framerate independent
         self._time_provider: Callable[[], float] = time_provider or time.monotonic
@@ -134,6 +145,36 @@ class TextDirector:
             compositors.append(self.compositor)
         compositors.extend(self._secondary_compositors)
         return compositors
+
+    def _invalidate_text_cache(self) -> None:
+        """Drop cached rendered text so future draws regenerate with new style/state."""
+        if self._text_render_cache:
+            self._text_render_cache.clear()
+
+    def _get_cached_rendered_text(
+        self,
+        text: str,
+        mode: Optional['SplitMode'],
+        *,
+        large: bool,
+        shadow: bool
+    ):
+        """Render text or reuse a cached texture when possible."""
+        if not self.text_renderer:
+            return None
+
+        key = (text, mode, large, shadow)
+        cached = self._text_render_cache.get(key)
+        if cached is not None:
+            self._text_render_cache.move_to_end(key)
+            return cached
+
+        rendered = self.text_renderer.render_main_text(text, large=large, shadow=shadow)
+        if rendered and hasattr(rendered, 'texture_data'):
+            self._text_render_cache[key] = rendered
+            if len(self._text_render_cache) > self._text_render_cache_capacity:
+                self._text_render_cache.popitem(last=False)
+        return rendered
 
     def _apply_opacity_to_compositor(self, compositor: Any) -> None:
         """Apply stored opacity to a compositor when capability exists."""
@@ -225,6 +266,9 @@ class TextDirector:
         self._scroll_offset = 0.0
         self._frame_counter = 0
         self._reset_elapsed_time()
+        self._last_subtext_render_time = None
+        self._last_subtext_render_offset = 0.0
+        self._invalidate_text_cache()
         
         self.logger.info(f"[TextDirector] RESET: offset {old_offset:.2f}→0.0, mode={old_mode} (preserved)")
     
@@ -257,6 +301,39 @@ class TextDirector:
     def get_opacity(self) -> float:
         """Return current text opacity multiplier."""
         return self._text_opacity
+
+    def set_text_color(self, r: float, g: float, b: float, a: float = 1.0) -> None:
+        """Set the RGBA color applied to rendered text."""
+        components = []
+        for value in (r, g, b, a):
+            try:
+                components.append(max(0.0, min(1.0, float(value))))
+            except Exception:
+                components.append(1.0)
+        new_color = tuple(components)
+        if all(math.isclose(new_color[i], self._text_color[i], rel_tol=1e-4, abs_tol=1e-4) for i in range(4)):
+            return
+        self._text_color = new_color
+        self._apply_text_color_to_renderer()
+        self._invalidate_text_cache()
+        if self._enabled and self._current_text:
+            self._render_current_text()
+        self.logger.info(
+            "[TextDirector] Text color set to RGB=(%.2f, %.2f, %.2f)"
+            % (self._text_color[0], self._text_color[1], self._text_color[2])
+        )
+
+    def _apply_text_color_to_renderer(self) -> None:
+        """Push stored color into the text renderer style."""
+        if not self.text_renderer:
+            return
+        try:
+            style = self.text_renderer.get_style()
+            rgba = tuple(int(round(max(0.0, min(1.0, comp)) * 255)) for comp in self._text_color)
+            style.color = rgba
+            self.text_renderer.set_style(style)
+        except Exception as exc:
+            self.logger.debug(f"[TextDirector] Failed to apply text color: {exc}")
     
     def set_timing(self, frames_per_text: int) -> None:
         """Set how long to show each text.
@@ -316,6 +393,7 @@ class TextDirector:
             for t in texts
         ]
         self._user_text_library = user_set
+        self._invalidate_text_cache()
         
         # CRITICAL: Set current split mode immediately when library is loaded
         # This ensures reset() (called after set_text_library) preserves the CORRECT mode
@@ -523,9 +601,9 @@ class TextDirector:
         
         # Re-render SUBTEXT mode every frame for scrolling animation
         if self._current_split_mode and SplitMode and self._current_split_mode == SplitMode.SUBTEXT:
-            self._render_current_text()
+            self._render_current_text(force=False)
     
-    def _render_current_text(self) -> None:
+    def _render_current_text(self, *, force: bool = True) -> None:
         """Render current text to compositor using split mode."""
         if not self._current_text or not self.text_renderer:
             return
@@ -535,6 +613,16 @@ class TextDirector:
         if not all_compositors:
             return
         
+        now = self._time_provider()
+        if (not force and self._current_split_mode and SplitMode
+                and self._current_split_mode == SplitMode.SUBTEXT):
+            if self._last_subtext_render_time is not None:
+                since_last = now - self._last_subtext_render_time
+                delta = abs(self._scroll_offset - self._last_subtext_render_offset)
+                if (since_last < self._subtext_render_min_interval
+                        and delta < self._subtext_render_min_delta_px):
+                    return
+
         try:
             # Clear existing text on ALL compositors
             for comp in all_compositors:
@@ -584,13 +672,18 @@ class TextDirector:
                     self.logger.debug("[TextDirector] Rendering DEFAULT CENTERED (no mode set)")
                 self._render_centered()
                 
+            if self._current_split_mode and SplitMode and self._current_split_mode == SplitMode.SUBTEXT:
+                self._last_subtext_render_time = now
+                self._last_subtext_render_offset = self._scroll_offset
+
         except Exception as e:
             self.logger.error(f"[TextDirector] Failed to render text: {e}", exc_info=True)
     
     def _render_centered(self) -> None:
         """Render text as single centered element on all compositors."""
-        rendered = self.text_renderer.render_main_text(
+        rendered = self._get_cached_rendered_text(
             self._current_text,
+            self._current_split_mode,
             large=True,
             shadow=True
         )
@@ -626,9 +719,10 @@ class TextDirector:
             return
         
         # Render single text instance (will be tiled)
-        rendered = self.text_renderer.render_main_text(
+        rendered = self._get_cached_rendered_text(
             self._current_text,
-            large=True,  # Large text for better visibility
+            self._current_split_mode,
+            large=True,
             shadow=False
         )
         
