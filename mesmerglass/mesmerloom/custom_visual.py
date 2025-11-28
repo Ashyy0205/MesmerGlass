@@ -576,6 +576,36 @@ class CustomVisual(Visual):
         if hasattr(self.text_director, 'set_text_color'):
             self.text_director.set_text_color(r, g, b)
 
+        # Font selection priority: explicit font → ThemeBank font → default renderer font
+        explicit_font = text_config.get("font_path")
+        use_font_bank = text_config.get("use_font_bank", True)
+        applied_font: Optional[str] = None
+        font_locked = (
+            hasattr(self.text_director, "has_user_font_override")
+            and self.text_director.has_user_font_override()
+        )
+        if hasattr(self.text_director, "set_font_path") and not font_locked:
+            if explicit_font:
+                applied_font = explicit_font
+                self.text_director.set_font_path(explicit_font, user_set=False)
+            elif use_font_bank and self.theme_bank and hasattr(self.theme_bank, "pick_font_for_playback"):
+                bank_font = self.theme_bank.pick_font_for_playback()
+                applied_font = bank_font
+                self.text_director.set_font_path(bank_font, user_set=False)
+            else:
+                self.text_director.set_font_path(None, user_set=False)
+
+        if font_locked:
+            self.logger.info("[CustomVisual] Text font locked by user override")
+        elif applied_font:
+            try:
+                font_name = Path(applied_font).name
+            except Exception:
+                font_name = applied_font
+            self.logger.info(f"[CustomVisual] Text font set to {font_name}")
+        else:
+            self.logger.info("[CustomVisual] Text font using renderer default")
+
         # Text library
         use_theme_bank = text_config.get("use_theme_bank", True)
         

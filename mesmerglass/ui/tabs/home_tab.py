@@ -241,7 +241,7 @@ class HomeTab(BaseTab):
         
         return group
     
-    def _refresh_media_bank_list(self):
+    def _refresh_media_bank_list(self, trigger_scan: bool = False):
         """Refresh media bank list from the active session."""
         entries = self.session_data.get("media_bank", []) if self.session_data else []
         
@@ -250,15 +250,33 @@ class HomeTab(BaseTab):
             name = entry.get("name", "Unnamed")
             path = entry.get("path", "")
             media_type = entry.get("type", "images")
-            type_icon = "🖼️" if media_type == "images" else "🎬"
+            if media_type == "images":
+                type_icon = "🖼️"
+            elif media_type == "videos":
+                type_icon = "🎬"
+            elif media_type == "fonts":
+                type_icon = "🔤"
+            else:
+                type_icon = "🌀"
             item = QListWidgetItem(f"{type_icon} {name} ({path})")
             self.media_bank_list.addItem(item)
 
+        if trigger_scan:
+            self._trigger_media_bank_reload()
+
         self.logger.info(f"Loaded {len(entries)} media bank entries")
+
+    def _trigger_media_bank_reload(self):
+        """Ask the main window to rebuild ThemeBank from the latest media bank entries."""
+        scheduler = getattr(self.main_window, "_schedule_media_bank_refresh", None)
+        if callable(scheduler):
+            scheduler()
+        else:
+            self.logger.debug("Main window missing media bank scheduler; skipping reload")
     
     def _on_refresh_media_bank(self):
         """Refresh media bank list."""
-        self._refresh_media_bank_list()
+        self._refresh_media_bank_list(trigger_scan=True)
     
     def _on_add_media_directory(self):
         """Add a new media directory to the bank."""
@@ -289,8 +307,8 @@ class HomeTab(BaseTab):
         name = name.strip() or default_name
 
         # Prompt for media type
-        type_options = ["images", "videos", "both"]
-        type_labels = ["🖼️ Images", "🎬 Videos", "🌀 Both"]
+        type_options = ["images", "videos", "both", "fonts"]
+        type_labels = ["🖼️ Images", "🎬 Videos", "🌀 Both (Images+Videos)", "🔤 Fonts"]
         selection, ok = QInputDialog.getItem(
             self,
             "Media Bank Type",
@@ -310,7 +328,7 @@ class HomeTab(BaseTab):
             "type": selected_type
         })
 
-        self._refresh_media_bank_list()
+        self._refresh_media_bank_list(trigger_scan=True)
         self.mark_dirty()
         self.logger.info(f"Added media directory: {directory}")
     
@@ -331,7 +349,7 @@ class HomeTab(BaseTab):
             return
 
         removed = media_bank.pop(current_item)
-        self._refresh_media_bank_list()
+        self._refresh_media_bank_list(trigger_scan=True)
         self.mark_dirty()
         self.logger.info(f"Removed media directory: {removed.get('name', 'Unnamed')}")
     

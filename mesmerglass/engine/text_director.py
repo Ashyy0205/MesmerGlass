@@ -92,9 +92,9 @@ class TextDirector:
         self._last_subtext_render_time: Optional[float] = None
         self._last_subtext_render_offset: float = 0.0
 
-        # Cache a handful of rendered textures to avoid re-rendering identical text
-        self._text_render_cache_capacity = 10
-        self._text_render_cache: 'OrderedDict[Tuple[str, Optional[SplitMode], bool, bool], Any]' = OrderedDict()
+        # Cache rendered textures (keyed by text, mode, size, font, and color)
+        self._text_render_cache_capacity = 24
+        self._text_render_cache: 'OrderedDict[Tuple[str, Optional[SplitMode], bool, bool, str, Tuple[int, int, int, int]], Any]' = OrderedDict()
         
         self.logger = logging.getLogger(__name__)
         self.logger.info("[TextDirector] Initialized (independent text system)")
@@ -105,6 +105,10 @@ class TextDirector:
         if self.compositor:
             self._apply_opacity_to_compositor(self.compositor)
         self._apply_text_color_to_renderer()
+
+        # Font override tracking (Text tab vs ThemeBank)
+        self._font_override_user = False
+        self._active_font_path: Optional[str] = None
 
         # Timing helpers use a monotonic clock so slider timing is framerate independent
         self._time_provider: Callable[[], float] = time_provider or time.monotonic
@@ -151,6 +155,19 @@ class TextDirector:
         if self._text_render_cache:
             self._text_render_cache.clear()
 
+    def _build_render_cache_key(
+        self,
+        text: str,
+        mode: Optional['SplitMode'],
+        *,
+        large: bool,
+        shadow: bool,
+    ) -> Tuple[str, Optional['SplitMode'], bool, bool, str, Tuple[int, int, int, int]]:
+        """Return a cache key that encapsulates text, sizing, font, and color state."""
+        font_key = self._active_font_path or "__default__"
+        color_key = tuple(int(round(max(0.0, min(1.0, comp)) * 255)) for comp in self._text_color)
+        return (text, mode, large, shadow, font_key, color_key)
+
     def _get_cached_rendered_text(
         self,
         text: str,
@@ -163,7 +180,7 @@ class TextDirector:
         if not self.text_renderer:
             return None
 
-        key = (text, mode, large, shadow)
+        key = self._build_render_cache_key(text, mode, large=large, shadow=shadow)
         cached = self._text_render_cache.get(key)
         if cached is not None:
             self._text_render_cache.move_to_end(key)
@@ -315,7 +332,6 @@ class TextDirector:
             return
         self._text_color = new_color
         self._apply_text_color_to_renderer()
-        self._invalidate_text_cache()
         if self._enabled and self._current_text:
             self._render_current_text()
         self.logger.info(
@@ -376,6 +392,42 @@ class TextDirector:
     
     # ===== Configuration =====
     
+    def has_user_font_override(self) -> bool:
+        """Return True when the Text tab selected an explicit font."""
+        return self._font_override_user
+
+    def set_font_path(self, font_path: Optional[str], *, user_set: bool = False) -> None:
+        """Apply a custom font path to the renderer.
+
+        Args:
+            font_path: Absolute font file path (or None to revert to default)
+            user_set: True when coming from UI (locks future auto overrides)
+        """
+
+        if user_set:
+            self._font_override_user = bool(font_path)
+        elif self._font_override_user:
+            self.logger.debug("[TextDirector] Skipping auto font because user override is active")
+            return
+
+        if font_path == self._active_font_path:
+            return
+
+        self._active_font_path = font_path
+
+        if not self.text_renderer:
+            return
+
+        try:
+            style = self.text_renderer.get_style()
+            style.font_path = font_path
+            self.text_renderer.set_style(style)
+            self.logger.info(
+                "[TextDirector] Applied %s font", font_path if font_path else "default"
+            )
+        except Exception as exc:
+            self.logger.warning(f"[TextDirector] Failed to apply font '{font_path}': {exc}")
+
     def set_text_library(self, texts: List[str], default_split_mode=None, user_set: bool = False) -> None:
         """Set available texts.
         

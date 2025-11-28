@@ -8,9 +8,10 @@ Implements Trance ThemeBank algorithm:
 """
 
 from __future__ import annotations
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any, Tuple, Sequence
 from pathlib import Path
 from collections import deque
+import random
 from dataclasses import dataclass
 import time
 import threading
@@ -221,6 +222,11 @@ class ThemeBank:
         self._image_stats_sampler = BurstSampler(interval_s=2.0)
         self._image_stats_window = {"served": 0, "sync": 0, "slow": 0}
 
+        # Font media support (Phase 8)
+        self._font_library: list[str] = []
+        self._font_queue: deque[str] = deque()
+        self._last_font_choice: Optional[str] = None
+
         logger.info(
             "[ThemeBank] throttle: preload=%s lookahead=%d batch=%d sleep=%.2fms max_ms=%.1f queue=%d",
             self._preload_aggressively,
@@ -231,6 +237,57 @@ class ThemeBank:
             self._throttle.loader_queue_size,
         )
     
+    # ===== Font Library Support =====
+
+    def set_font_library(self, fonts: Sequence[str]) -> None:
+        """Replace the font media pool and rebuild the shuffle queue."""
+
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for raw in fonts or []:
+            if not raw:
+                continue
+            try:
+                candidate = str(Path(raw).resolve())
+            except Exception:
+                candidate = str(raw)
+            key = candidate.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            normalized.append(candidate)
+
+        self._font_library = normalized
+        self._last_font_choice = None
+        self._rebuild_font_queue()
+        logger.debug("[ThemeBank] Font library updated: %d font(s)", len(normalized))
+
+    def pick_font_for_playback(self, *, consume: bool = True) -> Optional[str]:
+        """Return the next font path to use for text overlays."""
+
+        if not self._font_library:
+            return None
+
+        if not self._font_queue:
+            self._rebuild_font_queue()
+
+        if not self._font_queue:
+            return None
+
+        selected = self._font_queue[0] if not consume else self._font_queue.popleft()
+        self._last_font_choice = selected
+        return selected
+
+    def _rebuild_font_queue(self) -> None:
+        if not self._font_library:
+            self._font_queue.clear()
+            return
+
+        shuffled = self._font_library[:]
+        random.shuffle(shuffled)
+        self._font_queue.clear()
+        self._font_queue.extend(shuffled)
+
     # ===== Diagnostics Helpers =====
 
     def _normalized_path(self, path_str: str) -> Path:

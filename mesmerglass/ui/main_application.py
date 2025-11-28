@@ -25,7 +25,7 @@ from .tabs.playbacks_tab import PlaybacksTab
 from .tabs.display_tab import DisplayTab
 from .tabs.devices_tab import DevicesTab
 from ..content.simple_video_streamer import SimpleVideoStreamer
-from ..content.media_scan import scan_media_directory
+from ..content.media_scan import scan_media_directory, scan_font_directory
 from ..content.themebank import ThemeBank
 from ..content.theme import ThemeConfig
 
@@ -705,6 +705,7 @@ class MainApplication(QMainWindow):
             self.logger.info("🔄 Starting background media scan...")
 
             themes = []
+            font_paths: list[str] = []
             for entry in entries:
                 theme_name = entry.get('name', 'Unnamed')
                 media_dir = Path(entry.get('path', ''))
@@ -718,6 +719,15 @@ class MainApplication(QMainWindow):
 
                 if not media_dir.exists():
                     self.logger.warning(f"⚠️  Skipping '{theme_name}': {media_dir} doesn't exist")
+                    continue
+
+                if media_type == 'fonts':
+                    fonts = scan_font_directory(media_dir)
+                    if fonts:
+                        font_paths.extend(fonts)
+                        self.logger.info(f"🔤 Font bank '{theme_name}': {len(fonts)} font(s)")
+                    else:
+                        self.logger.warning(f"⚠️  Font bank '{theme_name}' contains no *.ttf/*.otf files")
                     continue
 
                 all_images, all_videos = scan_media_directory(media_dir)
@@ -754,6 +764,13 @@ class MainApplication(QMainWindow):
                 )
             else:
                 self.logger.warning("⚠️  No media found in session media bank")
+
+            if hasattr(self, "theme_bank") and self.theme_bank:
+                self.theme_bank.set_font_library(font_paths)
+                if font_paths:
+                    self.logger.info(f"🔤 Font library ready: {len(font_paths)} font(s) available")
+                else:
+                    self.logger.info("🔤 Font library empty - using default TextRenderer font")
 
         except Exception as exc:
             self.logger.error(f"❌ Background media scan failed: {exc}")

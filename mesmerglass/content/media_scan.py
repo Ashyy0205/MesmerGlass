@@ -18,6 +18,11 @@ DEFAULT_VIDEO_EXTENSIONS: tuple[str, ...] = (
     ".mkv",
     ".avi",
 )
+DEFAULT_FONT_EXTENSIONS: tuple[str, ...] = (
+    ".ttf",
+    ".otf",
+    ".ttc",
+)
 
 
 def _normalize_extensions(exts: Iterable[str]) -> set[str]:
@@ -65,3 +70,33 @@ def scan_media_directory(
             videos.append(str(path.resolve(strict=False)))
 
     return images, videos
+
+
+def scan_font_directory(
+    root: Path | str,
+    *,
+    font_exts: Sequence[str] | None = None,
+) -> list[str]:
+    """Return list of font files under *root*.
+
+    Args:
+        root: Directory to scan recursively
+        font_exts: Optional iterable of extensions to match
+
+    Returns:
+        List of absolute font file paths
+    """
+    root_path = Path(root)
+    if not root_path.exists():
+        return []
+
+    font_suffixes = _normalize_extensions(font_exts or DEFAULT_FONT_EXTENSIONS)
+    fonts: list[str] = []
+
+    for path in root_path.rglob('*'):
+        if not path.is_file():
+            continue
+        if path.suffix.lower() in font_suffixes:
+            fonts.append(str(path.resolve(strict=False)))
+
+    return fonts

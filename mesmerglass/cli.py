@@ -199,7 +199,7 @@ def _load_theme_bank_from_media_bank(
 
     from mesmerglass.content.theme import ThemeConfig
     from mesmerglass.content.themebank import ThemeBank
-    from mesmerglass.content.media_scan import scan_media_directory
+    from mesmerglass.content.media_scan import scan_media_directory, scan_font_directory
 
     log = logging.getLogger(__name__)
     path = media_bank_path.expanduser().resolve()
@@ -215,6 +215,7 @@ def _load_theme_bank_from_media_bank(
         raise ValueError(f"Media bank must be a list of entries (got {type(entries).__name__})")
 
     themes: list[ThemeConfig] = []
+    font_paths: list[str] = []
     for entry in entries:
         if not isinstance(entry, dict):
             continue
@@ -225,8 +226,12 @@ def _load_theme_bank_from_media_bank(
         if not dir_path.exists():
             log.warning("[themebank.cli] Skipping missing directory: %s", dir_path)
             continue
-        images, videos = scan_media_directory(dir_path)
         media_type = (entry.get("type") or "both").lower()
+        if media_type == "fonts":
+            font_paths.extend(scan_font_directory(dir_path))
+            continue
+
+        images, videos = scan_media_directory(dir_path)
         if media_type == "images":
             videos = []
         elif media_type == "videos":
@@ -251,6 +256,7 @@ def _load_theme_bank_from_media_bank(
     )
     alt_index = 2 if len(themes) > 1 else None
     bank.set_active_themes(primary_index=1, alt_index=alt_index)
+    bank.set_font_library(font_paths)
     return bank
 
 

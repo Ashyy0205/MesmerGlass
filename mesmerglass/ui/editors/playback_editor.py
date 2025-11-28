@@ -16,6 +16,7 @@ Layout: Preview on left (2/3 width), controls on right (1/3 width, scrollable)
 import sys
 import json
 import logging
+import random
 import time
 import threading
 import traceback
@@ -34,6 +35,8 @@ from PyQt6.QtWidgets import (
     QDialogButtonBox
 )
 from PyQt6.QtGui import QColor, QGuiApplication
+
+from mesmerglass.content.media_scan import scan_font_directory
 
 logger = logging.getLogger(__name__)
 
@@ -627,6 +630,7 @@ class PlaybackEditor(QDialog):
         self.current_media_index = 0
         self.current_media_list = []
         self._capture_accelerate_start_values()
+        self._pending_font_bank_fonts: list[str] = []
     
     # === Initialization Methods ===
     
@@ -660,6 +664,8 @@ class PlaybackEditor(QDialog):
                 self.text_director.set_enabled(True)
                 self._apply_text_sync_settings()
                 self._apply_text_color_to_preview()
+                if self._pending_font_bank_fonts:
+                    self._apply_preview_font_from_bank()
                 logger.info("[PlaybackEditor] Text system initialized successfully")
             except Exception as e:
                 logger.error(f"[PlaybackEditor] Failed to initialize text system: {e}")
@@ -746,6 +752,7 @@ class PlaybackEditor(QDialog):
         # Collect directories by type
         image_dirs = []
         video_dirs = []
+        font_dirs = []
         
         for idx in selected_indices:
             if idx >= len(self._media_bank):
@@ -759,6 +766,8 @@ class PlaybackEditor(QDialog):
                 image_dirs.append(entry_path)
             if entry_type in ("videos", "both"):
                 video_dirs.append(entry_path)
+            if entry_type == "fonts":
+                font_dirs.append(entry_path)
         
         # Load images
         self.image_files = []
@@ -778,10 +787,33 @@ class PlaybackEditor(QDialog):
         
         self.video_files.sort()
         
-        logger.info(f"[PlaybackEditor] Media scan complete: {len(self.image_files)} images, {len(self.video_files)} videos")
+        font_files: list[str] = []
+        for font_dir in font_dirs:
+            if font_dir.exists():
+                font_files.extend(scan_font_directory(font_dir))
+
+        if font_files:
+            # Deduplicate while preserving discovery order
+            deduped: list[str] = []
+            seen_fonts: set[str] = set()
+            for font_path in font_files:
+                key = font_path.lower()
+                if key in seen_fonts:
+                    continue
+                seen_fonts.add(key)
+                deduped.append(font_path)
+            font_files = deduped
+
+        logger.info(
+            f"[PlaybackEditor] Media scan complete: {len(self.image_files)} images, {len(self.video_files)} videos, {len(font_files)} fonts"
+        )
         
         self.current_media_index = 0
         self.current_media_list = []
+
+        self._pending_font_bank_fonts = font_files
+        if font_files:
+            self._apply_preview_font_from_bank()
         
         # Build media list based on mode
         self._rebuild_media_list()
@@ -796,6 +828,32 @@ class PlaybackEditor(QDialog):
             
             # Set initial cycle interval (will be overridden by acceleration if enabled)
             self._update_cycle_interval(reason="initial_media_load")
+
+    def _apply_preview_font_from_bank(self):
+        """Shuffle and apply a cached media-bank font to the preview text director."""
+        if not PREVIEW_AVAILABLE or not self.text_director:
+            return
+
+        if (hasattr(self.text_director, "has_user_font_override")
+                and self.text_director.has_user_font_override()):
+            logger.info("[PlaybackEditor] Font override active; skipping media bank font preview")
+            return
+
+        if not self._pending_font_bank_fonts:
+            return
+
+        try:
+            font_path = random.choice(self._pending_font_bank_fonts)
+        except Exception:
+            return
+
+        if hasattr(self.text_director, "set_font_path"):
+            self.text_director.set_font_path(font_path, user_set=False)
+            try:
+                display_name = Path(font_path).name
+            except Exception:
+                display_name = font_path
+            logger.info(f"[PlaybackEditor] Preview font set to {display_name}")
 
     @contextmanager
     def _trace_operation(self, label: str):
@@ -2553,8 +2611,10 @@ class PlaybackEditor(QDialog):
                     icon = "🖼️"
                 elif entry_type == "videos":
                     icon = "🎬"
+                elif entry_type == "fonts":
+                    icon = "🔤"
                 else:
-                    icon = "📁"
+                    icon = "🌀"
                 
                 item = QListWidgetItem(f"{icon} {entry_name}")
                 item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
