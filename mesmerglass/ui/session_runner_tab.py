@@ -252,118 +252,118 @@ class SessionRunnerTab(QWidget):
         # Session mode: Show dialog with session cuelists
         if self.session_data:
             from PyQt6.QtWidgets import QDialog, QVBoxLayout, QListWidget, QDialogButtonBox
-            
+
             available_cuelists = self.session_data.get("cuelists", {})
             if not available_cuelists:
                 self.logger.warning("No cuelists in session")
                 self.status_label.setText("⚠️ No cuelists in session")
                 return
-            
-            # Show selection dialog
+
             dialog = QDialog(self)
             dialog.setWindowTitle("Select Cuelist")
             dialog.setMinimumWidth(400)
-            
+
             layout = QVBoxLayout(dialog)
-            
+
             list_widget = QListWidget()
             for cuelist_key, cuelist_data in available_cuelists.items():
                 name = cuelist_data.get("name", cuelist_key)
                 num_cues = len(cuelist_data.get("cues", []))
                 list_widget.addItem(f"{name} ({num_cues} cues) [{cuelist_key}]")
             layout.addWidget(list_widget)
-            
+
             buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
             buttons.accepted.connect(dialog.accept)
             buttons.rejected.connect(dialog.reject)
             layout.addWidget(buttons)
-            
+
             if dialog.exec() != QDialog.DialogCode.Accepted or not list_widget.currentItem():
                 return
-            
-            # Extract cuelist key from selection
+
             selected_text = list_widget.currentItem().text()
             cuelist_key = selected_text.split("[")[-1].split("]")[0]
-            
-            try:
-                from mesmerglass.session.cuelist import Cuelist
-                
-                # Load from session dict
-                cuelist_data = available_cuelists[cuelist_key]
-                self.cuelist = Cuelist.from_dict(cuelist_data)
-                self.cuelist_path = None  # No file path in session mode
-                
-                # Validate
-                is_valid, error = self.cuelist.validate()
-                if not is_valid:
-                    self.logger.error(f"Cuelist validation failed: {error}")
-                    self.status_label.setText(f"❌ Validation failed: {error}")
-                    self.cuelist = None
-                    return
-                
-                # Update UI
-                self._display_cuelist_info()
-                self._populate_cue_list()
-                
-                # Enable controls
-                self.btn_save.setEnabled(True)
-                self.btn_edit.setEnabled(True)
-                self.btn_start.setEnabled(True)
-                
-                self.status_label.setText(f"✅ Loaded: {self.cuelist.name} (from session)")
-                prefetch_msg = self._prefetch_audio_for_loaded_cuelist()
-                if prefetch_msg:
-                    self.status_label.setText(f"{self.status_label.text()} • {prefetch_msg}")
-                self.cuelist_loaded.emit(self.cuelist)
-                
-            except Exception as e:
-                self.logger.error(f"Failed to load cuelist from session: {e}", exc_info=True)
-                self.status_label.setText(f"❌ Error: {e}")
-        
+            self.load_cuelist_from_session(cuelist_key)
+            return
+
         # File mode: Use file browser
-        else:
-            file_path, _ = QFileDialog.getOpenFileName(
-                self,
-                "Load Cuelist",
-                "",
-                "Cuelist Files (*.cuelist.json *.json);;All Files (*)"
-            )
-            
-            if not file_path:
-                return
-            
-            try:
-                from mesmerglass.session.cuelist import Cuelist
-                
-                self.cuelist_path = Path(file_path)
-                self.cuelist = Cuelist.load(self.cuelist_path)
-                
-                # Validate
-                is_valid, error = self.cuelist.validate()
-                if not is_valid:
-                    self.logger.error(f"Cuelist validation failed: {error}")
-                    self.status_label.setText(f"❌ Validation failed: {error}")
-                    self.cuelist = None
-                    return
-                
-                # Update UI
-                self._display_cuelist_info()
-                self._populate_cue_list()
-                
-                # Enable controls
-                self.btn_save.setEnabled(True)
-                self.btn_edit.setEnabled(True)
-                self.btn_start.setEnabled(True)
-                
-                self.status_label.setText(f"✅ Loaded: {self.cuelist.name}")
-                prefetch_msg = self._prefetch_audio_for_loaded_cuelist()
-                if prefetch_msg:
-                    self.status_label.setText(f"{self.status_label.text()} • {prefetch_msg}")
-                self.cuelist_loaded.emit(self.cuelist)
-                
-            except Exception as e:
-                self.logger.error(f"Failed to load cuelist: {e}", exc_info=True)
-                self.status_label.setText(f"❌ Error: {e}")
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Load Cuelist",
+            "",
+            "Cuelist Files (*.cuelist.json *.json);;All Files (*)"
+        )
+
+        if not file_path:
+            return
+
+        try:
+            from mesmerglass.session.cuelist import Cuelist
+
+            self.cuelist_path = Path(file_path)
+            self.cuelist = Cuelist.load(self.cuelist_path)
+
+            if not self._finalize_loaded_cuelist("from file"):
+                self.cuelist = None
+        except Exception as e:
+            self.logger.error(f"Failed to load cuelist: {e}", exc_info=True)
+            self.status_label.setText(f"❌ Error: {e}")
+
+    def load_cuelist_from_session(self, cuelist_key: str) -> bool:
+        """Programmatically load a cuelist by key from the current session."""
+        if not self.session_data:
+            self.logger.error("Cannot load session cuelist: no session data bound")
+            return False
+
+        available_cuelists = self.session_data.get("cuelists", {})
+        cuelist_data = available_cuelists.get(cuelist_key)
+        if not cuelist_data:
+            self.logger.error("Session does not contain cuelist '%s'", cuelist_key)
+            self.status_label.setText(f"❌ Missing cuelist: {cuelist_key}")
+            return False
+
+        try:
+            from mesmerglass.session.cuelist import Cuelist
+
+            self.cuelist = Cuelist.from_dict(cuelist_data)
+            self.cuelist_path = None
+            if self._finalize_loaded_cuelist(f"from session ({cuelist_key})"):
+                return True
+            self.cuelist = None
+            return False
+        except Exception as exc:
+            self.logger.error("Failed to load cuelist '%s' from session: %s", cuelist_key, exc, exc_info=True)
+            self.status_label.setText(f"❌ Error: {exc}")
+            self.cuelist = None
+            return False
+
+    def start_session_programmatically(self) -> bool:
+        """Wrapper that allows programmatic session start with success feedback."""
+        return self._on_start_session()
+
+    def _finalize_loaded_cuelist(self, source_label: str) -> bool:
+        """Finalize UI state after loading a cuelist from any source."""
+        if not self.cuelist:
+            return False
+
+        is_valid, error = self.cuelist.validate()
+        if not is_valid:
+            self.logger.error("Cuelist validation failed: %s", error)
+            self.status_label.setText(f"❌ Validation failed: {error}")
+            return False
+
+        self._display_cuelist_info()
+        self._populate_cue_list()
+
+        self.btn_save.setEnabled(True)
+        self.btn_edit.setEnabled(True)
+        self.btn_start.setEnabled(True)
+
+        self.status_label.setText(f"✅ Loaded: {self.cuelist.name} ({source_label})")
+        prefetch_msg = self._prefetch_audio_for_loaded_cuelist()
+        if prefetch_msg:
+            self.status_label.setText(f"{self.status_label.text()} • {prefetch_msg}")
+        self.cuelist_loaded.emit(self.cuelist)
+        return True
     
     def _on_save_cuelist(self):
         """Save current cuelist to file."""
@@ -494,19 +494,19 @@ class SessionRunnerTab(QWidget):
         self.logger.info(summary)
         return summary
     
-    def _on_start_session(self):
+    def _on_start_session(self) -> bool:
         """Start session execution."""
         if not self.cuelist:
             self.status_label.setText("❌ No cuelist loaded")
-            return
+            return False
         
         if not self.visual_director or not self.audio_engine or not self.compositor:
             self.status_label.setText("❌ Missing dependencies (visual_director/audio/compositor)")
             self.logger.error("Cannot start session: missing dependencies")
-            return
+            return False
 
         if not self._check_theme_bank_ready():
-            return
+            return False
         
         try:
             from mesmerglass.session.runner import SessionRunner
@@ -586,10 +586,11 @@ class SessionRunnerTab(QWidget):
             self.update_timer.start()
             
             self.session_started.emit()
-            
+            return True
         except Exception as e:
             self.logger.error(f"Failed to start session: {e}", exc_info=True)
             self.status_label.setText(f"❌ Start error: {e}")
+            return False
     
     def _on_pause_session(self):
         """Pause/resume session."""

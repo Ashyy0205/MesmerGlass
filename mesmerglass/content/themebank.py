@@ -202,6 +202,11 @@ class ThemeBank:
         self._max_preload_ms = max(0.0, self._throttle.max_preload_ms)
         self._sync_warning_ms = max(1.0, self._throttle.sync_warning_ms)
         self._background_warning_ms = max(1.0, self._throttle.background_warning_ms)
+        self._base_batch_size = self._lookahead_batch_size
+        self._base_sleep_sec = self._lookahead_sleep_sec
+        self._adaptive_batch_size = self._base_batch_size
+        self._adaptive_sleep_sec = self._base_sleep_sec
+        self._slow_preload_strikes = 0
         
         # Background preload thread management
         self._preload_thread: Optional[threading.Thread] = None
@@ -847,6 +852,10 @@ class ThemeBank:
             # Get EXACT next indices from shuffler's deterministic queue (100% accurate!)
             next_indices = shuffler.peek_next(lookahead_count)
             batch_limit = self._lookahead_batch_size if self._lookahead_batch_size > 0 else len(next_indices)
+            if self._adaptive_batch_size and self._adaptive_batch_size > 0:
+                batch_limit = min(batch_limit, self._adaptive_batch_size)
+            batch_limit = min(batch_limit, len(next_indices))
+            sleep_interval = self._adaptive_sleep_sec if self._adaptive_sleep_sec > 0 else self._lookahead_sleep_sec
             
             preloaded = 0
             with span:
@@ -895,8 +904,8 @@ class ThemeBank:
                         break
                     if self._max_preload_ms and elapsed_ms >= self._max_preload_ms:
                         break
-                    if self._lookahead_sleep_sec > 0:
-                        time.sleep(self._lookahead_sleep_sec)
+                    if sleep_interval > 0:
+                        time.sleep(sleep_interval)
                 
                 if preloaded > 0:
                     preload_duration = (time.perf_counter() - preload_start) * 1000.0
@@ -907,10 +916,63 @@ class ThemeBank:
                         logger.warning(
                             f"[perf] SLOW background preload: {preload_duration:.2f}ms (loaded {preloaded} images)"
                         )
+                    self._apply_preload_adaptive_feedback(preload_duration, preloaded)
                 span.annotate(preloaded=preloaded, cache_fill=len(cache._cache), cache_limit=cache._cache_size)
         finally:
             with self._preload_lock:
                 self._preloading_in_progress = False
+
+    def _apply_preload_adaptive_feedback(self, duration_ms: float, preloaded: int) -> None:
+        """Adjust background preload aggressiveness based on runtime."""
+
+        if self._base_batch_size <= 2:
+            self._adaptive_batch_size = self._base_batch_size
+            self._adaptive_sleep_sec = self._base_sleep_sec
+            return
+
+        slow = duration_ms > self._background_warning_ms
+        fast = duration_ms < (self._background_warning_ms * 0.6)
+        prev_batch = self._adaptive_batch_size or self._base_batch_size
+        prev_sleep = self._adaptive_sleep_sec
+
+        if slow:
+            self._slow_preload_strikes = min(5, self._slow_preload_strikes + 1)
+            new_batch = max(2, int(prev_batch * 0.75)) if prev_batch > 0 else prev_batch
+            new_batch = min(new_batch, self._base_batch_size)
+            new_sleep = min(self._base_sleep_sec + 0.05, prev_sleep + 0.002) if prev_sleep >= 0 else prev_sleep
+
+            if new_batch != self._adaptive_batch_size or abs(new_sleep - self._adaptive_sleep_sec) > 1e-9:
+                logger.warning(
+                    "[perf] ThemeBank auto-throttle: batch=%d->%d sleep=%.1f->%.1fms (duration=%.1fms)",
+                    self._adaptive_batch_size,
+                    new_batch,
+                    self._adaptive_sleep_sec * 1000.0,
+                    new_sleep * 1000.0,
+                    duration_ms,
+                )
+            self._adaptive_batch_size = new_batch
+            self._adaptive_sleep_sec = new_sleep
+            return
+
+        if self._adaptive_batch_size >= self._base_batch_size and self._adaptive_sleep_sec <= self._base_sleep_sec:
+            self._slow_preload_strikes = max(0, self._slow_preload_strikes - 1)
+            return
+
+        if fast and preloaded > 0:
+            self._slow_preload_strikes = max(0, self._slow_preload_strikes - 1)
+            new_batch = min(self._base_batch_size, self._adaptive_batch_size + 2)
+            new_sleep = max(self._base_sleep_sec, self._adaptive_sleep_sec - 0.001)
+
+            if new_batch != self._adaptive_batch_size or abs(new_sleep - self._adaptive_sleep_sec) > 1e-9:
+                logger.info(
+                    "[perf] ThemeBank throttle relaxed: batch=%d->%d sleep=%.1f->%.1fms",
+                    self._adaptive_batch_size,
+                    new_batch,
+                    self._adaptive_sleep_sec * 1000.0,
+                    new_sleep * 1000.0,
+                )
+            self._adaptive_batch_size = new_batch
+            self._adaptive_sleep_sec = new_sleep
     
     def _preload_lookahead(self, theme_idx: int, shuffler: 'Shuffler', cache: 'ImageCache', current_index: int) -> None:
         """Preload next N EXACT images in the shuffle sequence.

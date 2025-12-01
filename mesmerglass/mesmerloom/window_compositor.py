@@ -109,7 +109,8 @@ class LoomWindowCompositor(QOpenGLWindow):
         self._zoom_start_time = time.time()  # Real time start (for consistent speed)
         self._zoom_enabled = True  # Can be disabled for video focus mode
         self._zoom_mode = "exponential"  # Zoom animation mode
-        self._zoom_rate = 0.42  # Zoom rate for exponential mode
+        self._zoom_rate_default = 0.42
+        self._zoom_rate = self._zoom_rate_default  # Zoom rate for exponential mode
 
         # Text rendering support
         self._text_opacity = 1.0  # Global text opacity multiplier
@@ -1043,7 +1044,7 @@ class LoomWindowCompositor(QOpenGLWindow):
         self._zoom_current = 1.0
         self._zoom_frame = 0
         self._background_zoom = 1.0
-        self._zoom_rate = 0.0  # CRITICAL: Reset zoom rate to prevent carryover
+        self._zoom_rate = getattr(self, '_zoom_rate_default', 0.42)
         self._zoom_start_time = 0.0
         logger.debug(f"[compositor] Zoom animation reset to 1.0 (stopped, rate cleared)")
     

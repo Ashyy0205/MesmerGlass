@@ -353,6 +353,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--vr-safe-mode", action="store_true", help="Use offscreen FBO tap inside compositor to mirror frames to VR (safer on some drivers)")
     p_run.add_argument("--vr-minimal", action="store_true", help="Disable media/text/video subsystems; stream spiral only for maximum stability")
     p_run.add_argument("--vr-allow-media", action="store_true", help="Do not auto-mute media components when running in VR (may be unstable)")
+    p_run.add_argument("--session-file", type=str, default=None, help="Path to .session.json to auto-load on startup")
+    p_run.add_argument("--session-cuelist", type=str, default=None, help="Cuelist key within the session to load after startup")
+    p_run.add_argument("--auto-duration", type=float, default=None, help="Auto-stop the session after N seconds (optional)")
+    p_run.add_argument("--auto-exit", action="store_true", help="Quit the app automatically after autorun completes")
 
     run_theme = p_run.add_argument_group("ThemeBank throttles")
     run_theme.add_argument("--theme-lookahead", type=int, metavar="N", help="Cap ThemeBank lookahead queue (default 32)")
@@ -3217,6 +3221,21 @@ def main(argv: Optional[list[str]] = None) -> int:
                 _os_run.environ["MESMERGLASS_THEME_PRELOAD_ALL"] = "1"
             elif getattr(args, "theme_no_preload", False):
                 _os_run.environ["MESMERGLASS_THEME_PRELOAD_ALL"] = "0"
+            session_file = getattr(args, "session_file", None)
+            if session_file:
+                try:
+                    session_path = Path(session_file).expanduser().resolve()
+                except Exception:
+                    session_path = Path(session_file)
+                _os_run.environ["MESMERGLASS_SESSION_FILE"] = str(session_path)
+            session_cuelist = getattr(args, "session_cuelist", None)
+            if session_cuelist:
+                _os_run.environ["MESMERGLASS_SESSION_CUELIST"] = session_cuelist
+            auto_duration = getattr(args, "auto_duration", None)
+            if auto_duration is not None and auto_duration > 0:
+                _os_run.environ["MESMERGLASS_AUTORUN_DURATION"] = str(float(auto_duration))
+            if getattr(args, "auto_exit", False):
+                _os_run.environ["MESMERGLASS_AUTORUN_EXIT"] = "1"
         except Exception:
             pass
         # Import app lazily so that commands like 'session' don't trigger pygame/audio init

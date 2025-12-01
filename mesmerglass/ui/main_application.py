@@ -6,15 +6,16 @@ Replaces the legacy Launcher with a cleaner, session-focused design.
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Any
 
 from PyQt6.QtCore import Qt, QSettings, QTimer
 from PyQt6.QtGui import QAction, QIcon
 from PyQt6.QtWidgets import (
-    QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QTabWidget,
+    QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QTabWidget,
     QStatusBar, QMenuBar, QMenu, QMessageBox, QFileDialog, QInputDialog, QLabel
 )
 
@@ -52,6 +53,11 @@ class MainApplication(QMainWindow):
         # Session management
         self.session_manager = SessionManager()
         self.session_data: Optional[dict] = None
+        self.autorun_config: Optional[dict[str, Any]] = self._read_autorun_env()
+        self.autorun_timer: Optional[QTimer] = None
+        self.autorun_active = False
+        self._autorun_session_hooked = False
+        self._autorun_wait_deadline: float | None = None
         self._media_scan_thread: Optional[threading.Thread] = None
         
         # Auto-save timer (debounce saves to avoid excessive file I/O)
@@ -76,6 +82,9 @@ class MainApplication(QMainWindow):
         self._setup_ui()
         self._restore_window_state()
         self.logger.info("MainApplication initialized")
+
+        if self.autorun_config:
+            QTimer.singleShot(0, self._start_autorun_if_configured)
     
     def _initialize_engines(self):
         """Initialize all rendering engines and directors.
@@ -676,6 +685,245 @@ class MainApplication(QMainWindow):
         
         self.logger.info("Session data propagated to all tabs")
         self._schedule_media_bank_refresh()
+
+    # === Autorun helpers ===
+
+    def _read_autorun_env(self) -> Optional[dict[str, Any]]:
+        """Capture autorun instructions from CLI-provided environment variables."""
+        session_file = os.environ.get("MESMERGLASS_SESSION_FILE")
+        if not session_file:
+            return None
+
+        path = Path(session_file).expanduser()
+        try:
+            path = path if path.is_absolute() else (Path.cwd() / path)
+            path = path.resolve()
+        except Exception:
+            path = path
+
+        cuelist_key = os.environ.get("MESMERGLASS_SESSION_CUELIST")
+        duration_val: Optional[float] = None
+        raw_duration = os.environ.get("MESMERGLASS_AUTORUN_DURATION")
+        if raw_duration:
+            try:
+                parsed = float(raw_duration)
+                if parsed > 0:
+                    duration_val = parsed
+                else:
+                    self.logger.warning("Autorun duration must be positive (got %s)", raw_duration)
+            except ValueError:
+                self.logger.warning("Autorun duration is not a number: %s", raw_duration)
+
+        auto_exit = os.environ.get("MESMERGLASS_AUTORUN_EXIT", "0").lower() in {"1", "true", "yes", "on"}
+        config: dict[str, Any] = {
+            "session_path": path,
+            "requested_cuelist": cuelist_key,
+            "duration": duration_val,
+            "auto_exit": auto_exit,
+        }
+        self.logger.info(
+            "Autorun configured: session=%s cuelist=%s duration=%s auto_exit=%s",
+            path,
+            cuelist_key or "<first>",
+            duration_val or "<none>",
+            auto_exit,
+        )
+        return config
+
+    def _start_autorun_if_configured(self) -> None:
+        """Kick off autorun after the UI is built."""
+        if not self.autorun_config:
+            return
+
+        config = self.autorun_config
+        session_path: Path = config["session_path"]
+        if not session_path.exists():
+            self.logger.error("Autorun session file not found: %s", session_path)
+            self._complete_autorun(failed=True)
+            return
+
+        if not self.open_session_from_path(session_path, skip_dirty_check=True):
+            self.logger.error("Autorun failed to open session: %s", session_path)
+            self._complete_autorun(failed=True)
+            return
+
+        self._prepare_theme_bank_for_autorun()
+
+        # Wait for ThemeBank if available, otherwise proceed immediately
+        wait_timeout_s = 20.0
+        self._autorun_wait_deadline = time.monotonic() + wait_timeout_s
+        if self._theme_bank_ready_for_autorun():
+            self._kickoff_autorun_playback()
+        else:
+            self.logger.info("Autorun waiting for ThemeBank readiness (timeout %.0fs)", wait_timeout_s)
+            self.autorun_timer = QTimer(self)
+            self.autorun_timer.setInterval(500)
+            self.autorun_timer.timeout.connect(self._poll_autorun_theme_bank)
+            self.autorun_timer.start()
+
+    def _prepare_theme_bank_for_autorun(self) -> None:
+        if self.session_data is None:
+            return
+        # Ensure active media bank gets scheduled ASAP
+        try:
+            self._schedule_media_bank_refresh()
+        except Exception as exc:
+            self.logger.warning("Unable to schedule media refresh for autorun: %s", exc)
+
+    def _theme_bank_ready_for_autorun(self) -> bool:
+        theme_bank = getattr(self, "theme_bank", None)
+        if theme_bank is None or not hasattr(theme_bank, "ensure_ready"):
+            return True
+        try:
+            status = theme_bank.ensure_ready(timeout_s=0.0)
+        except Exception as exc:  # pragma: no cover - readiness probe failures
+            self.logger.warning("ThemeBank readiness check failed: %s", exc)
+            return True
+        if status.ready:
+            return True
+        return False
+
+    def _poll_autorun_theme_bank(self) -> None:
+        if self._theme_bank_ready_for_autorun():
+            if self.autorun_timer:
+                self.autorun_timer.stop()
+                self.autorun_timer = None
+            self.logger.info("Autorun ThemeBank ready; starting playback")
+            self._kickoff_autorun_playback()
+            return
+
+        if time.monotonic() > getattr(self, "_autorun_wait_deadline", 0):
+            if self.autorun_timer:
+                self.autorun_timer.stop()
+                self.autorun_timer = None
+            self.logger.error("Autorun timed out waiting for ThemeBank readiness")
+            self._complete_autorun(failed=True)
+
+    def _kickoff_autorun_playback(self) -> None:
+        config = self.autorun_config
+        if not config:
+            return
+
+        session_path = config.get("session_path")
+        runner_tab = getattr(getattr(self, "home_tab", None), "session_runner_tab", None)
+        if runner_tab is None:
+            self.logger.error("Autorun aborted: SessionRunnerTab unavailable")
+            self._complete_autorun(failed=True)
+            return
+
+        cuelist_key = self._resolve_autorun_cuelist_key(config.get("requested_cuelist"))
+        if not cuelist_key:
+            self.logger.error("Autorun aborted: session has no cuelists to run")
+            self._complete_autorun(failed=True)
+            return
+
+        if not runner_tab.load_cuelist_from_session(cuelist_key):
+            self.logger.error("Autorun failed to load cuelist '%s'", cuelist_key)
+            self._complete_autorun(failed=True)
+            return
+
+        if not runner_tab.start_session_programmatically():
+            self.logger.error("Autorun failed to start cuelist '%s'", cuelist_key)
+            self._complete_autorun(failed=True)
+            return
+
+        session_path_str = str(session_path) if session_path is not None else "<unknown>"
+        self.logger.info("Autorun started cuelist '%s' from %s", cuelist_key, session_path_str)
+        self.autorun_active = True
+        config["resolved_cuelist"] = cuelist_key
+        runner_tab.session_stopped.connect(self._handle_autorun_session_stopped)
+        self._autorun_session_hooked = True
+
+        duration = config.get("duration")
+        if duration:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(self._handle_autorun_duration_elapsed)
+            timer.start(int(duration * 1000))
+            self.autorun_timer = timer
+            self.logger.info("Autorun will stop after %.1f seconds", duration)
+
+    def _resolve_autorun_cuelist_key(self, requested: Optional[str]) -> Optional[str]:
+        """Resolve the target cuelist key, falling back to the first entry when needed."""
+        if not self.session_data:
+            return None
+
+        cuelists = self.session_data.get("cuelists") or {}
+        if not cuelists:
+            return None
+
+        if requested:
+            if requested in cuelists:
+                return requested
+            requested_lower = requested.lower()
+            for key, payload in cuelists.items():
+                name = str(payload.get("name", "")).lower()
+                if name and name == requested_lower:
+                    self.logger.info("Autorun resolved cuelist name '%s' to key '%s'", requested, key)
+                    return key
+            self.logger.warning("Autorun cuelist '%s' not found; falling back to first entry", requested)
+
+        fallback_key = next(iter(cuelists.keys()))
+        self.logger.info("Autorun defaulting to first cuelist '%s'", fallback_key)
+        return fallback_key
+
+    def _handle_autorun_duration_elapsed(self) -> None:
+        if not self.autorun_active:
+            return
+        self.logger.info("Autorun duration elapsed; stopping session")
+        self._request_session_stop("duration elapsed")
+
+    def _handle_autorun_session_stopped(self) -> None:
+        if not self.autorun_active:
+            return
+        self.logger.info("Autorun session stopped")
+        self._complete_autorun(failed=False)
+
+    def _request_session_stop(self, reason: str) -> None:
+        runner_tab = getattr(getattr(self, "home_tab", None), "session_runner_tab", None)
+        if runner_tab is None:
+            self.logger.warning("Autorun could not stop session (%s): runner tab missing", reason)
+            self._complete_autorun(failed=True)
+            return
+        try:
+            runner_tab._on_stop_session()
+        except Exception as exc:  # pragma: no cover - defensive guard
+            self.logger.error("Autorun stop failed: %s", exc, exc_info=True)
+            self._complete_autorun(failed=True)
+
+    def _complete_autorun(self, *, failed: bool) -> None:
+        config = self.autorun_config or {}
+        auto_exit = bool(config.get("auto_exit"))
+
+        if self.autorun_timer:
+            self.autorun_timer.stop()
+            self.autorun_timer = None
+
+        if self._autorun_session_hooked:
+            runner_tab = getattr(getattr(self, "home_tab", None), "session_runner_tab", None)
+            if runner_tab is not None:
+                try:
+                    runner_tab.session_stopped.disconnect(self._handle_autorun_session_stopped)
+                except Exception:
+                    pass
+            self._autorun_session_hooked = False
+
+        self.autorun_active = False
+        self.autorun_config = None
+        self._autorun_wait_deadline = None
+
+        if auto_exit:
+            state = "failure" if failed else "completion"
+            delay_ms = 250 if failed else 750
+            self.logger.info("Autorun exiting application after %s", state)
+            QTimer.singleShot(delay_ms, self._quit_after_autorun)
+
+    def _quit_after_autorun(self) -> None:
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()
+        else:  # pragma: no cover - fallback path
+            self.close()
     
     def _get_media_bank_entries(self) -> List[dict]:
         """Return session-defined media bank entries."""

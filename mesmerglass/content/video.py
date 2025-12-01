@@ -25,6 +25,31 @@ from collections import deque
 import numpy as np
 
 logger = logging.getLogger(__name__)
+VIDEO_IO_LOCK = threading.Lock()
+
+
+def _read_env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _read_env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+VIDEO_PREFILL_FRAME_LIMIT = max(0, _read_env_int("MESMERGLASS_VIDEO_PREFILL_FRAMES", 48))
+VIDEO_PREFILL_BUDGET_MS = max(0.0, _read_env_float("MESMERGLASS_VIDEO_PREFILL_MAX_MS", 12.0))
 
 
 @dataclass
@@ -101,10 +126,11 @@ class VideoDecoder:
         """
         try:
             import cv2
-            cap = cv2.VideoCapture(str(self.path))
-            if not cap.isOpened():
-                logger.error(f"Failed to open GIF: {self.path}")
-                return
+            with VIDEO_IO_LOCK:
+                cap = cv2.VideoCapture(str(self.path))
+                if not cap.isOpened():
+                    logger.error(f"Failed to open GIF: {self.path}")
+                    return
             
             self.width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             self.height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -114,14 +140,14 @@ class VideoDecoder:
             # Load all frames into memory
             frame_idx = 0
             while True:
-                ret, frame = cap.read()
+                with VIDEO_IO_LOCK:
+                    ret, frame = cap.read()
                 if not ret:
                     break
-                
-                # Convert BGR to RGB
+
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 timestamp = frame_idx / self.fps
-                
+
                 self.gif_frames.append(VideoFrame(
                     data=rgb,
                     width=self.width,
@@ -130,7 +156,8 @@ class VideoDecoder:
                 ))
                 frame_idx += 1
             
-            cap.release()
+            with VIDEO_IO_LOCK:
+                cap.release()
             
             if self.gif_frames:
                 self.success = True
@@ -149,16 +176,17 @@ class VideoDecoder:
         """
         try:
             import cv2
-            self.cap = cv2.VideoCapture(str(self.path))
+            with VIDEO_IO_LOCK:
+                self.cap = cv2.VideoCapture(str(self.path))
+                if not self.cap.isOpened():
+                    logger.error(f"[Video] Failed to open: {self.path}")
+                    return
             
-            if not self.cap.isOpened():
-                logger.error(f"[Video] Failed to open: {self.path}")
-                return
-            
-            self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            self.fps = float(self.cap.get(cv2.CAP_PROP_FPS) or 30.0)
-            self.frame_count = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            with VIDEO_IO_LOCK:
+                self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                self.fps = float(self.cap.get(cv2.CAP_PROP_FPS) or 30.0)
+                self.frame_count = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
             
             self.success = True
             logger.info(f"[Video] Opened {self.path.name} - {self.width}x{self.height} @ {self.fps}fps, {self.frame_count} frames")
@@ -196,7 +224,8 @@ class VideoDecoder:
             
             try:
                 import cv2
-                ret, frame = self.cap.read()
+                with VIDEO_IO_LOCK:
+                    ret, frame = self.cap.read()
                 
                 if not ret:
                     # End of video reached
@@ -245,7 +274,8 @@ class VideoDecoder:
             
             try:
                 import cv2
-                self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                with VIDEO_IO_LOCK:
+                    self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
                 self.current_frame_idx = frame_idx
                 return True
             except Exception as e:
@@ -260,7 +290,8 @@ class VideoDecoder:
         """Close video file and release resources."""
         if self.cap is not None:
             try:
-                self.cap.release()
+                with VIDEO_IO_LOCK:
+                    self.cap.release()
             except Exception:
                 pass
             self.cap = None
@@ -321,6 +352,7 @@ class VideoStreamer:
         self._lock = threading.Lock()
         self._loader_thread: Optional[threading.Thread] = None
         self._loader_running = False
+        self._loader_done = threading.Event()
         
         # Cleanup
         self._old_decoder: Optional[VideoDecoder] = None
@@ -348,8 +380,15 @@ class VideoStreamer:
                 return False
             
             target_buffer = self._next if preload else self._current
-            
+
             max_prefill = self.buffer_size if prefill_frames is None else max(1, min(prefill_frames, self.buffer_size))
+            env_prefill_limit = VIDEO_PREFILL_FRAME_LIMIT
+            env_limit_active = env_prefill_limit > 0 and env_prefill_limit < max_prefill
+            prefill_cap = min(max_prefill, env_prefill_limit) if env_limit_active else max_prefill
+            prefill_cap = max(1, prefill_cap)
+            prefill_budget_ms = VIDEO_PREFILL_BUDGET_MS
+            prefill_start = time.perf_counter()
+            clipped_by_budget = False
 
             with self._lock:
                 # Store old decoder for cleanup
@@ -363,16 +402,36 @@ class VideoStreamer:
                 target_buffer.end = False
                 
                 # Pre-fill limited number of frames on caller thread to avoid UI stalls
-                while not target_buffer.end and target_buffer.size < max_prefill:
+                while not target_buffer.end and target_buffer.size < prefill_cap:
                     frame = decoder.next_frame()
                     if frame is not None:
                         target_buffer.frames.append(frame)
                         target_buffer.size += 1
                     else:
                         target_buffer.end = True
+                        break
+
+                    if prefill_budget_ms > 0:
+                        elapsed_ms = (time.perf_counter() - prefill_start) * 1000.0
+                        if elapsed_ms >= prefill_budget_ms:
+                            clipped_by_budget = True
+                            break
                 
                 logger.info(f"[VideoStreamer] Loaded {path.name if isinstance(path, Path) else Path(path).name} - "
-                           f"buffered {target_buffer.size} frames (prefill cap={max_prefill}), end={target_buffer.end}")
+                           f"buffered {target_buffer.size} frames (prefill cap={prefill_cap}), end={target_buffer.end}")
+
+                elapsed_ms = (time.perf_counter() - prefill_start) * 1000.0
+                frame_limit_hit = env_limit_active and not target_buffer.end and target_buffer.size >= prefill_cap
+                if clipped_by_budget or frame_limit_hit:
+                    reason = "budget" if clipped_by_budget else "frame_limit"
+                    logger.warning(
+                        "[visual.perf] video.prefill clipped (%s): %.2fms, frames=%d, limit=%s, budget=%s",
+                        reason,
+                        elapsed_ms,
+                        target_buffer.size,
+                        str(env_prefill_limit) if env_prefill_limit > 0 else "n/a",
+                        f"{prefill_budget_ms:.1f}ms" if prefill_budget_ms > 0 else "disabled",
+                    )
             
             # Start async loader thread if not running
             if not self._loader_running:
@@ -497,6 +556,7 @@ class VideoStreamer:
             return
         
         self._loader_running = True
+        self._loader_done.clear()
         self._loader_thread = threading.Thread(target=self._async_loader, daemon=True)
         self._loader_thread.start()
         logger.info("[VideoStreamer] Started async loader thread")
@@ -506,67 +566,85 @@ class VideoStreamer:
         
         Mimics Trance's async_update() behavior.
         """
-        while self._loader_running:
-            try:
-                # Cleanup old decoder/frames
-                with self._lock:
-                    if self._old_decoder is not None:
-                        self._old_decoder.close()
-                        self._old_decoder = None
+        try:
+            while self._loader_running:
+                try:
+                    # Cleanup old decoder/frames
+                    with self._lock:
+                        if self._old_decoder is not None:
+                            self._old_decoder.close()
+                            self._old_decoder = None
+                        
+                        if self._old_frames:
+                            self._old_frames.popleft()  # Gradual cleanup
+
+                    if not self._loader_running:
+                        break
                     
-                    if self._old_frames:
-                        self._old_frames.popleft()  # Gradual cleanup
+                    # Fill current buffer if not full
+                    with self._lock:
+                        if (self._current.decoder is not None and 
+                            not self._current.end and 
+                            self._current.size < self.buffer_size):
+                            
+                            frame = self._current.decoder.next_frame()
+                            if frame is not None:
+                                self._current.frames.append(frame)
+                                self._current.size += 1
+                            else:
+                                self._current.end = True
+
+                    if not self._loader_running:
+                        break
+                    
+                    # Fill next buffer if not full
+                    with self._lock:
+                        if (self._next.decoder is not None and 
+                            not self._next.end and 
+                            self._next.size < self.buffer_size):
+                            
+                            frame = self._next.decoder.next_frame()
+                            if frame is not None:
+                                self._next.frames.append(frame)
+                                self._next.size += 1
+                            else:
+                                self._next.end = True
+                    
+                    # Sleep to avoid spinning (Trance uses 1ms)
+                    time.sleep(0.001)
                 
-                # Fill current buffer if not full
-                with self._lock:
-                    if (self._current.decoder is not None and 
-                        not self._current.end and 
-                        self._current.size < self.buffer_size):
-                        
-                        frame = self._current.decoder.next_frame()
-                        if frame is not None:
-                            self._current.frames.append(frame)
-                            self._current.size += 1
-                        else:
-                            self._current.end = True
-                
-                # Fill next buffer if not full
-                with self._lock:
-                    if (self._next.decoder is not None and 
-                        not self._next.end and 
-                        self._next.size < self.buffer_size):
-                        
-                        frame = self._next.decoder.next_frame()
-                        if frame is not None:
-                            self._next.frames.append(frame)
-                            self._next.size += 1
-                        else:
-                            self._next.end = True
-                
-                # Sleep to avoid spinning (Trance uses 1ms)
-                time.sleep(0.001)
-            
-            except Exception as e:
-                logger.error(f"[VideoStreamer] Async loader error: {e}")
-                time.sleep(0.1)
+                except Exception as e:
+                    logger.error(f"[VideoStreamer] Async loader error: {e}")
+                    time.sleep(0.1)
+        finally:
+            self._loader_done.set()
     
     def stop(self) -> None:
         """Stop async loader and cleanup resources."""
         self._loader_running = False
         if self._loader_thread is not None:
-            self._loader_thread.join(timeout=1.0)
+            if not self._loader_done.wait(timeout=3.0):
+                logger.warning("[VideoStreamer] Loader thread did not exit within 3s; skipping aggressive cleanup")
+            self._loader_thread.join(timeout=0.5)
+        thread_alive = self._loader_thread is not None and self._loader_thread.is_alive()
         
         with self._lock:
-            if self._current.decoder is not None:
-                self._current.decoder.close()
-            if self._next.decoder is not None:
-                self._next.decoder.close()
-            if self._old_decoder is not None:
-                self._old_decoder.close()
+            if not thread_alive:
+                if self._current.decoder is not None:
+                    self._current.decoder.close()
+                if self._next.decoder is not None:
+                    self._next.decoder.close()
+                if self._old_decoder is not None:
+                    self._old_decoder.close()
+            else:
+                logger.warning("[VideoStreamer] Skipping decoder close while loader thread is still alive")
             
             self._current.frames.clear()
             self._next.frames.clear()
             self._old_frames.clear()
+
+        if self._loader_thread is not None and not thread_alive:
+            self._loader_thread = None
         
         logger.info("[VideoStreamer] Stopped")
     
