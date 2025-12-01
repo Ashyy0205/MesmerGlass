@@ -215,6 +215,7 @@ class AudioEngine:
         self._slow_decode_threshold_ms = 0.0
         self._decode_time_ms: dict[str, float] = {}
         self._stream_executor: Optional[ThreadPoolExecutor] = None
+        self._paused = False
 
     def _normalize_path(self, file_path: str) -> str:
         """Return absolute string path for caching consistency."""
@@ -827,6 +828,57 @@ class AudioEngine:
         for i in range(self.num_channels):
             self.stop_channel(i)
         self.stop_streaming_track(fade_ms=0)
+        self._paused = False
+
+    def pause_all(self) -> bool:
+        """Pause active channels and streaming audio so playback can resume seamlessly."""
+        if not self.init_ok or self._paused:
+            return False
+
+        any_paused = False
+        for channel in range(self.num_channels):
+            pygame_channel = self._channels[channel]
+            if pygame_channel and pygame_channel.get_busy():
+                try:
+                    pygame_channel.pause()
+                    any_paused = True
+                except Exception as exc:
+                    self.logger.error(f"Failed to pause channel {channel}: {exc}")
+
+        try:
+            if pygame.mixer.music.get_busy():
+                pygame.mixer.music.pause()
+                any_paused = True
+        except Exception as exc:
+            self.logger.error(f"Failed to pause streaming track: {exc}")
+
+        if any_paused:
+            self._paused = True
+        return any_paused
+
+    def resume_all(self) -> bool:
+        """Resume audio previously paused via pause_all."""
+        if not self.init_ok or not self._paused:
+            return False
+
+        any_resumed = False
+        for channel in range(self.num_channels):
+            pygame_channel = self._channels[channel]
+            if pygame_channel:
+                try:
+                    pygame_channel.unpause()
+                    any_resumed = True
+                except Exception as exc:
+                    self.logger.error(f"Failed to resume channel {channel}: {exc}")
+
+        try:
+            pygame.mixer.music.unpause()
+            any_resumed = True
+        except Exception:
+            pass
+
+        self._paused = False
+        return any_resumed
     
     def update(self):
         """

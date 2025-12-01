@@ -638,6 +638,39 @@ class SessionRunnerTab(QWidget):
         
         self.status_label.setText("⏹️ Session stopped")
         self.session_stopped.emit()
+
+    # === Shortcut Helpers ===
+
+    def shortcut_play_or_resume(self) -> None:
+        """Start the session or resume if paused (used by global shortcuts)."""
+        if self.session_runner:
+            try:
+                from mesmerglass.session.runner import SessionState
+                if self.session_runner.state == SessionState.PAUSED:
+                    self._on_pause_session()
+                    return
+                if self.session_runner.state == SessionState.RUNNING:
+                    # Already running; nothing to do
+                    return
+            except Exception:
+                pass
+        self._on_start_session()
+
+    def shortcut_pause(self) -> None:
+        """Pause the session if running (used by global shortcuts)."""
+        if not self.session_runner:
+            return
+        try:
+            from mesmerglass.session.runner import SessionState
+            if self.session_runner.state in (SessionState.RUNNING, SessionState.PAUSED):
+                self._on_pause_session()
+        except Exception:
+            self._on_pause_session()
+
+    def shortcut_stop(self) -> None:
+        """Stop the session if active (used by global shortcuts)."""
+        if self.session_runner:
+            self._on_stop_session()
     
     def _on_skip_next_cue(self):
         """Skip to next cue."""

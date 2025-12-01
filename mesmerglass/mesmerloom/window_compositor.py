@@ -7,10 +7,10 @@ import logging
 import time
 import os
 import sys
-from typing import Any, Optional, Dict, Union
+from typing import Any, Optional, Dict, Union, Tuple
 from PyQt6.QtCore import QTimer, Qt, pyqtSignal
 from PyQt6.QtOpenGL import QOpenGLWindow, QOpenGLBuffer, QOpenGLShaderProgram, QOpenGLVertexArrayObject
-from PyQt6.QtGui import QSurfaceFormat, QColor, QGuiApplication, QOpenGLContext
+from PyQt6.QtGui import QSurfaceFormat, QColor, QGuiApplication, QOpenGLContext, QScreen
 from OpenGL import GL
 import numpy as np
 from mesmerglass.logging_utils import BurstSampler
@@ -126,6 +126,10 @@ class LoomWindowCompositor(QOpenGLWindow):
         self._video_upload_sampler = BurstSampler(interval_s=1.5)
         self._video_upload_next_log = 0.0
         self._video_perf_last: Optional[dict[str, Any]] = None
+        self._target_screen: Optional[QScreen] = None
+        self._last_screen_geometry: Optional[tuple[int, int, int, int]] = None
+        self._last_native_geometry: Optional[tuple[int, int, int, int]] = None
+        self._last_physical_size: Optional[tuple[int, int]] = None
 
         # Animation timer
         self.timer = QTimer()
@@ -233,7 +237,8 @@ class LoomWindowCompositor(QOpenGLWindow):
             logger.info(f"[spiral.trace] _initial_transparent_swap: makeCurrent failed: {e}")
             return
         try:
-            GL.glViewport(0, 0, max(1, self.width()), max(1, self.height()))
+            phys_w, phys_h = self._physical_window_size()
+            GL.glViewport(0, 0, phys_w, phys_h)
             GL.glClearColor(0.0, 0.0, 0.0, 0.0)
             GL.glClear(GL.GL_COLOR_BUFFER_BIT)
             try:
@@ -274,6 +279,166 @@ class LoomWindowCompositor(QOpenGLWindow):
             except Exception as e:
                 logger.warning(f"[spiral.trace] Failed to force topmost using Win32 API: {e}")
         return False
+
+    def _apply_native_geometry(self, rect: Optional[tuple[int, int, int, int]]):
+        """Apply geometry via the native window manager when Qt hints are ignored."""
+        if rect is None:
+            return
+        if sys.platform == "win32" and ctypes:
+            x, y, w, h = rect
+            try:
+                hwnd = int(self.winId())
+                if hwnd:
+                    ctypes.windll.user32.SetWindowPos(
+                        hwnd,
+                        HWND_TOPMOST,
+                        int(x),
+                        int(y),
+                        int(max(1, w)),
+                        int(max(1, h)),
+                        SWP_SHOWWINDOW | SWP_FRAMECHANGED,
+                    )
+                    logger.info(
+                        f"[spiral.trace] Native geometry applied via SetWindowPos: {w}x{h} at ({x},{y})"
+                    )
+                    return
+            except Exception as exc:
+                logger.warning(f"[spiral.trace] Native geometry application failed: {exc}")
+        # Non-Windows platforms fall back to Qt-managed geometry
+
+    def _get_native_geometry(self) -> Optional[tuple[int, int, int, int]]:
+        """Return current native window rect as (x, y, w, h)."""
+        if sys.platform == "win32" and ctypes:
+            try:
+                hwnd = int(self.winId())
+                if not hwnd:
+                    return None
+                rect = ctypes.wintypes.RECT()
+                if ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                    width = rect.right - rect.left
+                    height = rect.bottom - rect.top
+                    return (int(rect.left), int(rect.top), int(width), int(height))
+            except Exception as exc:
+                logger.warning(f"[spiral.trace] Failed to query native geometry: {exc}")
+        return None
+
+    @staticmethod
+    def _screen_native_rect(screen: Optional[QScreen]) -> Optional[tuple[int, int, int, int]]:
+        """Return native (physical pixel) geometry for a QScreen if available."""
+        if screen is None:
+            return None
+        try:
+            geom = screen.geometry()
+            # Prefer Qt's nativeGeometry when available; otherwise compute using DPI scale
+            if hasattr(screen, "nativeGeometry"):
+                native = screen.nativeGeometry()
+                return (native.x(), native.y(), native.width(), native.height())
+
+            dpr = getattr(screen, 'devicePixelRatio', lambda: 1.0)()
+            # Fallback using DPI scale since devicePixelRatio for QScreen may be missing
+            if dpr in (0.0, 1.0):
+                # Try logical DPI vs base 96
+                logical_dpi = getattr(screen, 'logicalDotsPerInch', lambda: 96.0)()
+                dpr = max(1.0, logical_dpi / 96.0)
+            width = int(round(geom.width() * dpr))
+            height = int(round(geom.height() * dpr))
+            return (geom.x(), geom.y(), width, height)
+        except Exception as exc:
+            logger.warning(f"[spiral.trace] Failed to compute native rect: {exc}")
+            return None
+
+    @staticmethod
+    def _screen_physical_size(screen: Optional[QScreen]) -> Optional[tuple[int, int]]:
+        """Return (width, height) in physical pixels for the provided screen."""
+        if screen is None:
+            return None
+        try:
+            size = screen.size()
+            if hasattr(screen, "nativeGeometry"):
+                native = screen.nativeGeometry()
+                return (native.width(), native.height())
+            dpr = getattr(screen, "devicePixelRatio", lambda: 1.0)()
+            if dpr in (0.0, 1.0):
+                logical_dpi = getattr(screen, "logicalDotsPerInch", lambda: 96.0)()
+                dpr = max(1.0, logical_dpi / 96.0)
+            return (
+                int(max(1, round(size.width() * dpr))),
+                int(max(1, round(size.height() * dpr))),
+            )
+        except Exception as exc:
+            logger.warning(f"[spiral.trace] Failed to compute physical screen size: {exc}")
+            return None
+
+    def _physical_window_size(self) -> tuple[int, int]:
+        """Return current window size in physical pixels (logical * DPR)."""
+        try:
+            dpr = float(getattr(self, "devicePixelRatioF", lambda: 1.0)())
+        except Exception:
+            dpr = 1.0
+        width = int(max(1, round(self.width() * dpr)))
+        height = int(max(1, round(self.height() * dpr)))
+        physical = (width, height)
+        self._last_physical_size = physical
+        return physical
+
+
+    def fit_to_screen(self, screen: Optional[QScreen] = None):
+        """Resize/move the compositor so it fully covers the requested screen.
+
+        Returns the QRect that was applied, or None if no screen was available.
+        """
+        try:
+            if screen is None:
+                screen = self._target_screen or self.screen() or QGuiApplication.primaryScreen()
+        except Exception:
+            screen = None
+
+        if screen is None:
+            logger.warning("[spiral.trace] fit_to_screen called without an available screen; skipping")
+            return None
+
+        self._target_screen = screen
+        geometry = screen.geometry()
+        logical_rect = (geometry.x(), geometry.y(), geometry.width(), geometry.height())
+        native_target = self._screen_native_rect(screen) or logical_rect
+        physical_size = self._screen_physical_size(screen)
+
+        try:
+            if hasattr(self, "setScreen"):
+                self.setScreen(screen)
+        except Exception as exc:
+            logger.warning(f"[spiral.trace] Failed to bind compositor to screen '{screen.name()}': {exc}")
+
+        try:
+            self.setGeometry(geometry)
+            self._last_screen_geometry = logical_rect
+            self._last_native_geometry = native_target
+            logger.info(
+                f"[spiral.trace] fit_to_screen logical geometry {geometry.width()}x{geometry.height()} "
+                f"at ({geometry.x()}, {geometry.y()}) on '{screen.name()}', physical={physical_size}"
+            )
+        except Exception as exc:
+            logger.error(f"[spiral.trace] Failed to set geometry for screen '{screen.name()}': {exc}")
+
+        # Ensure the OS-level window matches these coordinates even if Qt hints are ignored.
+        self._apply_native_geometry(native_target)
+        self._force_topmost_windows()
+
+        native_rect = self._get_native_geometry()
+        if native_rect:
+            x, y, w, h = native_rect
+            logger.info(
+                f"[spiral.trace] Native window rect now {w}x{h} at ({x},{y}); native_target={native_target}"
+            )
+            if (x, y, w, h) != native_target:
+                logger.warning(
+                    f"[spiral.trace] Native rect mismatch detected (native={(x,y,w,h)}); reapplying "
+                    f"geometry {native_target}"
+                )
+                self._apply_native_geometry(native_target)
+        else:
+            logger.info("[spiral.trace] Native geometry unavailable (non-Windows or handle missing)")
+        return geometry
     
     def initializeGL(self):
         """Initialize OpenGL resources"""
@@ -323,7 +488,8 @@ class LoomWindowCompositor(QOpenGLWindow):
             
             # One-time transparent clear/swap before any regular paint to avoid initial black
             try:
-                GL.glViewport(0, 0, max(1, self.width()), max(1, self.height()))
+                phys_w, phys_h = self._physical_window_size()
+                GL.glViewport(0, 0, phys_w, phys_h)
                 GL.glClearColor(0.0, 0.0, 0.0, 0.0)
                 GL.glClear(GL.GL_COLOR_BUFFER_BIT)
                 ctx = self.context()
@@ -535,9 +701,12 @@ class LoomWindowCompositor(QOpenGLWindow):
             
         self.frame_count += 1
         
-        # Setup viewport and optional VR FBO
-        w_px, h_px = self.width(), self.height()
-        dpr = self.devicePixelRatioF()
+        # Setup viewport and optional VR FBO (physical pixels)
+        w_px, h_px = self._physical_window_size()
+        try:
+            dpr = float(self.devicePixelRatioF())
+        except Exception:
+            dpr = 1.0
         
         # DEBUG: Log window dimensions and DPI scaling (first 20 frames only)
         if self.frame_count <= 20 and (self._text_trace or logger.isEnabledFor(logging.DEBUG)):
@@ -561,8 +730,6 @@ class LoomWindowCompositor(QOpenGLWindow):
         GL.glClear(GL.GL_COLOR_BUFFER_BIT)
         
         # Get window size for rendering
-        w_px, h_px = self.width(), self.height()
-
         try:
             self._render_background(w_px, h_px)
             self._last_background_error = None
@@ -580,8 +747,12 @@ class LoomWindowCompositor(QOpenGLWindow):
             # Get actual screen resolution for fullscreen overlay
             screen = self.screen()
             if screen:
-                screen_size = screen.size()
-                screen_w, screen_h = screen_size.width(), screen_size.height()
+                physical_screen = self._screen_physical_size(screen)
+                if physical_screen:
+                    screen_w, screen_h = physical_screen
+                else:
+                    screen_size = screen.size()
+                    screen_w, screen_h = screen_size.width(), screen_size.height()
                 # Use screen resolution for director (ensures proper fullscreen coverage)
                 self.director.set_resolution(screen_w, screen_h)
                 if self._trace and self.frame_count <= 3:
@@ -641,8 +812,12 @@ class LoomWindowCompositor(QOpenGLWindow):
         # Use the same resolution logic as director for consistency
         screen = self.screen()
         if screen:
-            screen_size = screen.size()
-            screen_w, screen_h = screen_size.width(), screen_size.height()
+            physical_screen = self._screen_physical_size(screen)
+            if physical_screen:
+                screen_w, screen_h = physical_screen
+            else:
+                screen_size = screen.size()
+                screen_w, screen_h = screen_size.width(), screen_size.height()
             _set2('uResolution', (float(screen_w), float(screen_h)))
         else:
             # Fallback to window size if screen detection fails
@@ -747,9 +922,37 @@ class LoomWindowCompositor(QOpenGLWindow):
     
     def resizeGL(self, width, height):
         """Handle window resize"""
-        GL.glViewport(0, 0, width, height)
-        if self._trace:
-            logger.info(f"[spiral.trace] LoomWindowCompositor.resizeGL: {width}x{height}")
+        ctx = self.context()
+        if ctx is None:
+            logger.warning("[spiral.trace] resizeGL called without a valid context; skipping viewport update")
+            return
+
+        made_current = False
+        try:
+            if QOpenGLContext.currentContext() is not ctx:
+                try:
+                    self.makeCurrent()
+                    made_current = True
+                except Exception as exc:
+                    logger.warning(f"[spiral.trace] resizeGL failed to make context current: {exc}")
+                    return
+
+            phys_w, phys_h = self._physical_window_size()
+            try:
+                GL.glViewport(0, 0, phys_w, phys_h)
+            except Exception as exc:
+                logger.error(f"[spiral.trace] glViewport failed during resize: {exc}")
+                return
+            if self._trace:
+                logger.info(
+                    f"[spiral.trace] LoomWindowCompositor.resizeGL: logical={width}x{height} physical={phys_w}x{phys_h}"
+                )
+        finally:
+            if made_current:
+                try:
+                    ctx.doneCurrent()
+                except Exception:
+                    pass
     
     def set_active(self, active: bool):
         """Enable/disable rendering"""
@@ -1791,6 +1994,23 @@ void main() {
     
     def showEvent(self, event):
         """Handle window show - ensure it appears on top immediately"""
+        if self._target_screen is not None:
+            try:
+                self.fit_to_screen(self._target_screen)
+            except Exception as exc:
+                logger.warning(f"[spiral.trace] fit_to_screen during showEvent failed: {exc}")
+        elif self._last_screen_geometry is not None:
+            try:
+                x, y, w, h = self._last_screen_geometry
+                self.setGeometry(x, y, w, h)
+            except Exception:
+                pass
+            self._apply_native_geometry(self._last_native_geometry or self._last_screen_geometry)
+            native_rect = self._get_native_geometry()
+            logger.info(
+                f"[spiral.trace] showEvent reapplied cached logical={self._last_screen_geometry} "
+                f"native_target={self._last_native_geometry}, native_current={native_rect}"
+            )
         logger.info("[spiral.trace] ===== COMPOSITOR SHOWEVENT TRIGGERED =====")
         logger.info(f"[spiral.trace] Event accepted: {event.isAccepted()}")
         logger.info(f"[spiral.trace] Window visible: {self.isVisible()}")

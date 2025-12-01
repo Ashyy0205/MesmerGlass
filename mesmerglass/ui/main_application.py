@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Optional, List, Any
 
 from PyQt6.QtCore import Qt, QSettings, QTimer
-from PyQt6.QtGui import QAction, QIcon
+from PyQt6.QtGui import QAction, QIcon, QShortcut, QKeySequence
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QTabWidget,
     QStatusBar, QMenuBar, QMenu, QMessageBox, QFileDialog, QInputDialog, QLabel
@@ -295,6 +295,7 @@ class MainApplication(QMainWindow):
         
         # Add tabs
         self._create_tabs()
+        self._install_shortcuts()
         
         # === Status Bar ===
         self.status_bar = QStatusBar()
@@ -362,11 +363,71 @@ class MainApplication(QMainWindow):
         
         # Do initial refresh after 1 second
         QTimer.singleShot(1000, self._refresh_vr_displays)
+
+    def _install_shortcuts(self) -> None:
+        """Register global keyboard shortcuts for playback control and exit."""
+        self._shortcut_play = QShortcut(QKeySequence("Ctrl+Space"), self)
+        self._shortcut_play.activated.connect(self._handle_play_shortcut)
+
+        self._shortcut_pause = QShortcut(QKeySequence("Ctrl+Shift+Space"), self)
+        self._shortcut_pause.activated.connect(self._handle_pause_shortcut)
+
+        self._shortcut_stop = QShortcut(QKeySequence("Ctrl+Alt+Space"), self)
+        self._shortcut_stop.activated.connect(self._handle_stop_shortcut)
+
+        self._shortcut_exit = QShortcut(QKeySequence("Ctrl+1"), self)
+        self._shortcut_exit.activated.connect(self._handle_exit_shortcut)
+        self.logger.info("Global shortcuts registered (play/pause/stop/exit)")
+
+    def _get_session_runner_tab(self):
+        home = getattr(self, "home_tab", None)
+        if home and hasattr(home, "session_runner_tab"):
+            return home.session_runner_tab
+        return None
+
+    def _handle_play_shortcut(self) -> None:
+        runner = self._get_session_runner_tab()
+        if runner:
+            runner.shortcut_play_or_resume()
+
+    def _handle_pause_shortcut(self) -> None:
+        runner = self._get_session_runner_tab()
+        if runner:
+            runner.shortcut_pause()
+
+    def _handle_stop_shortcut(self) -> None:
+        runner = self._get_session_runner_tab()
+        if runner:
+            runner.shortcut_stop()
+
+    def _handle_exit_shortcut(self) -> None:
+        self._shutdown_compositor_window()
+        self.close()
     
     def _refresh_vr_displays(self):
         """Refresh VR devices in Display tab."""
         if hasattr(self, 'display_tab') and hasattr(self.display_tab, '_refresh_vr_displays'):
             self.display_tab._refresh_vr_displays()
+
+    def _shutdown_compositor_window(self) -> None:
+        """Stop sessions and close the compositor window cleanly."""
+        runner = self._get_session_runner_tab()
+        if runner:
+            runner.shortcut_stop()
+        compositor = getattr(self, "compositor", None)
+        if compositor:
+            try:
+                compositor.set_active(False)
+            except Exception:
+                pass
+            try:
+                compositor.hide()
+            except Exception:
+                pass
+            try:
+                compositor.close()
+            except Exception:
+                pass
     
     def _on_tab_changed(self, index: int):
         """Handle tab change to call lifecycle hooks."""
@@ -476,6 +537,7 @@ class MainApplication(QMainWindow):
                 event.ignore()
                 return
         
+        self._shutdown_compositor_window()
         self._save_window_state()
 
         # Ensure background streaming threads tear down cleanly

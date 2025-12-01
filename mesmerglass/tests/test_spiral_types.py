@@ -125,18 +125,6 @@ class TestSpiralTypes:
         assert len(uniforms['acolour']) == 4
         assert len(uniforms['bcolour']) == 4
 
-    def test_flip_wave_uniforms(self):
-        """Flip wave exports radius and width within expected ranges."""
-        director = SpiralDirector()
-        director.state.flip_state = 1
-        director.state.flip_radius = 0.5
-        director.state.flip_width = 0.03
-
-        uniforms = director.export_uniforms()
-        assert uniforms['uFlipWaveRadius'] == pytest.approx(0.5)
-        assert uniforms['uFlipWaveWidth'] == pytest.approx(0.03)
-
-
 class TestRotationFormula:
     """Detailed tests for the RPM-based rotation integrator."""
 

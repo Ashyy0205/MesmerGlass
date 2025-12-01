@@ -671,9 +671,15 @@ class SessionRunner:
             # First monitor: Use primary compositor
             first_screen = monitor_displays[0].get("screen")
             if first_screen:
-                screen_geometry = first_screen.geometry()
-                self.compositor.setGeometry(screen_geometry)
-                self.logger.info(f"[session] [Display 1/{len(monitor_displays)}] Primary compositor on '{first_screen.name()}': {screen_geometry.width()}x{screen_geometry.height()}")
+                applied_geometry = self.compositor.fit_to_screen(first_screen)
+                if applied_geometry is None:
+                    applied_geometry = first_screen.geometry()
+                self.logger.info(
+                    f"[session] [Display 1/{len(monitor_displays)}] Primary compositor on '{first_screen.name()}': "
+                    f"{applied_geometry.width()}x{applied_geometry.height()}"
+                )
+            else:
+                self.compositor.fit_to_screen(None)
             
             self.compositor.set_active(True)
             self.compositor.showFullScreen()
@@ -708,9 +714,13 @@ class SessionRunner:
                         )
                         
                         # Position on target screen
-                        screen_geometry = screen.geometry()
-                        secondary_compositor.setGeometry(screen_geometry)
-                        self.logger.info(f"[session] [Display {i}/{len(monitor_displays)}] Secondary compositor on '{screen.name()}': {screen_geometry.width()}x{screen_geometry.height()}")
+                        applied_geometry = secondary_compositor.fit_to_screen(screen)
+                        if applied_geometry is None:
+                            applied_geometry = screen.geometry()
+                        self.logger.info(
+                            f"[session] [Display {i}/{len(monitor_displays)}] Secondary compositor on '{screen.name()}': "
+                            f"{applied_geometry.width()}x{applied_geometry.height()}"
+                        )
                         
                         # Activate and show
                         secondary_compositor.set_active(True)
@@ -859,6 +869,11 @@ class SessionRunner:
         # If paused, resume first to ensure clean state transition
         if prev_state == SessionState.PAUSED:
             self.logger.debug("[session] Resuming from pause before stop")
+            if self.audio_engine:
+                try:
+                    self.audio_engine.resume_all()
+                except Exception as exc:
+                    self.logger.warning(f"[session] Audio resume before stop failed: {exc}")
             self.visual_director.resume()
         
         # End current cue if running
@@ -964,10 +979,11 @@ class SessionRunner:
         
         # Pause visual director
         self.visual_director.pause()
-        
-        # NOTE: pygame.mixer.Sound doesn't support pause/resume for individual channels
-        # Audio will continue playing during pause. Future enhancement: track volumes
-        # and fade to 0 on pause, restore on resume.
+        if self.audio_engine:
+            try:
+                self.audio_engine.pause_all()
+            except Exception as exc:
+                self.logger.warning(f"[session] Audio pause failed: {exc}")
         
         # Emit pause event
         self.event_emitter.emit(SessionEvent(
@@ -996,6 +1012,12 @@ class SessionRunner:
         self._state = SessionState.RUNNING
         
         self.logger.info("[session] Session resumed")
+        
+        if self.audio_engine:
+            try:
+                self.audio_engine.resume_all()
+            except Exception as exc:
+                self.logger.warning(f"[session] Audio resume failed: {exc}")
         
         # Resume visual director
         self.visual_director.resume()

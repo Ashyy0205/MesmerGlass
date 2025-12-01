@@ -30,9 +30,6 @@ uniform float uSpiralOpacity;
 uniform float uContrast;
 uniform float uVignette;
 uniform float uChromaticShift;
-uniform float uFlipWaveRadius;
-uniform float uFlipWaveWidth;
-uniform int uFlipState;
 uniform float uIntensity;
 uniform int uSafetyClamped;
 uniform int uArms;
@@ -206,23 +203,6 @@ void main(void) {
     // Apply MesmerGlass enhancements (optional compatibility layer)
     
     // Apply flip wave effect if active (MesmerGlass feature)
-    if (uFlipState == 1) {
-        vec2 p = screen_uv * 2.0 - 1.0;
-        p.x *= aspect_ratio;
-        float r = length(p);
-
-        float band = max(0.001, uFlipWaveWidth);
-        float band_dist = abs(r - uFlipWaveRadius);
-        float flipEffect = smoothstep(1.5 * band, 0.5 * band, band_dist);
-        float arm_v = finalColor.a > 0.5 ? 1.0 : 0.0;
-        arm_v = mix(arm_v, 1.0 - arm_v, flipEffect);
-
-        finalColor = mix(
-            (acolour + bcolour) / 2.0,
-            mix(acolour, bcolour, arm_v),
-            clamp(radius * 1024.0 / (360.0 / width), 0.0, 1.0)
-        );
-    }
     
     // Apply intensity scaling (MesmerGlass feature)
     float intensityFactor = clamp(uIntensity, 0.0, 1.0);

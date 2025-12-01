@@ -52,7 +52,8 @@ class HomeTab(BaseTab):
         layout.setSpacing(0)
         
         # Use splitter for resizable sections
-        splitter = QSplitter(Qt.Orientation.Horizontal)
+        self._splitter = QSplitter(Qt.Orientation.Horizontal)
+        self._splitter.setChildrenCollapsible(False)
         
         # === LEFT: Session Info + Session Runner Controls ===
         left_panel = QWidget()
@@ -79,7 +80,7 @@ class HomeTab(BaseTab):
         quick_actions_group = self._create_quick_actions()
         left_layout.addWidget(quick_actions_group)
         
-        splitter.addWidget(left_panel)
+        self._splitter.addWidget(left_panel)
         
         # === RIGHT: Live Preview + Media Bank ===
         right_panel = QWidget()
@@ -95,14 +96,43 @@ class HomeTab(BaseTab):
         media_bank_group = self._create_media_bank_section()
         right_layout.addWidget(media_bank_group)
         
-        splitter.addWidget(right_panel)
+        self._splitter.addWidget(right_panel)
         
         # Set initial sizes (60% session runner, 40% preview)
-        splitter.setSizes([600, 400])
+        self._splitter.setStretchFactor(0, 3)
+        self._splitter.setStretchFactor(1, 2)
+        self._splitter.setSizes([600, 400])
         
-        layout.addWidget(splitter)
+        layout.addWidget(self._splitter)
+        self._update_splitter_orientation()
         
         self.logger.info("HomeTab initialized with SessionRunner integration")
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._update_splitter_orientation()
+
+    def _update_splitter_orientation(self):
+        """Flip splitter orientation when width is constrained."""
+        if not hasattr(self, "_splitter") or self._splitter is None:
+            return
+        width = self.width()
+        threshold = 1300
+        desired_orientation = Qt.Orientation.Horizontal if width >= threshold else Qt.Orientation.Vertical
+        if self._splitter.orientation() != desired_orientation:
+            logger = getattr(self, "logger", None)
+            if logger:
+                logger.info(
+                    "[home] Switching splitter orientation: %s -> %s (width=%d)",
+                    "horizontal" if self._splitter.orientation() == Qt.Orientation.Horizontal else "vertical",
+                    "horizontal" if desired_orientation == Qt.Orientation.Horizontal else "vertical",
+                    width,
+                )
+            # Preserve ratios when toggling orientation
+            sizes = self._splitter.sizes()
+            self._splitter.setOrientation(desired_orientation)
+            if sizes and len(sizes) == 2:
+                self._splitter.setSizes(sizes)
     
     def _create_session_info_section(self) -> QGroupBox:
         """Create session information display section."""

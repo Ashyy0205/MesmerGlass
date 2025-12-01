@@ -35,9 +35,6 @@ class SpiralState:
     opacity: float = 0.85
     vignette: float = 0.22
     chromatic_shift: float = 0.0
-    flip_state: int = 0  # 0 idle,1 active
-    flip_radius: float = -0.2
-    flip_width: float = 0.08
     safety_clamped: bool = False
 
 class SpiralDirector:
@@ -49,10 +46,6 @@ class SpiralDirector:
     VIGNETTE_MIN = 0.0; VIGNETTE_MAX = 0.0  # Disabled to prevent background darkening
     CHROMA_MAX = 0.3
     # Flip ranges
-    FLIP_PERIOD_MIN = 120.0; FLIP_PERIOD_MAX = 240.0  # intensity 0→1 maps 240→120 (invert later)
-    FLIP_WAVE_MIN = 22.0; FLIP_WAVE_MAX = 40.0
-    FLIP_RADIUS_START = 0.0; FLIP_RADIUS_END = 1.2
-    FLIP_WIDTH_MIN = 0.02; FLIP_WIDTH_MAX = 0.05
     # Safety clamps
     SPEED_CAP = 0.18
     BAR_WIDTH_MIN = 0.36; BAR_WIDTH_MAX = 0.62
@@ -69,8 +62,6 @@ class SpiralDirector:
         self.state = SpiralState()
         self._pending_intensity = 0.0
         self._last_update = time.time()
-        self._flip_elapsed = 0.0
-        self._next_flip_in = self._schedule_next_flip(0.0)
         self._intensity_slew_cooldown = 0.0  # while >0 use half slew caps
         self._lock_opacity = False  # When True, prevent automatic opacity evolution (for custom modes)
         
@@ -118,11 +109,6 @@ class SpiralDirector:
     def set_wobble(self, amp: float, cycle_s: float):
         self.WOBBLE_MIN = max(0.0, min(amp * 0.3, 1.0))
         self.WOBBLE_MAX = max(self.WOBBLE_MIN + 0.0001, min(amp, 1.0))
-    def set_flip_cadence(self, cadence_s: float, wave_duration_s: float):
-        self.FLIP_PERIOD_MIN = max(5.0, min(cadence_s * 0.6, 7200.0))
-        self.FLIP_PERIOD_MAX = max(self.FLIP_PERIOD_MIN + 1.0, min(cadence_s * 1.4, 7200.0))
-        self.FLIP_WAVE_MIN = max(1.0, min(wave_duration_s * 0.5, 600.0))
-        self.FLIP_WAVE_MAX = max(self.FLIP_WAVE_MIN + 1.0, min(wave_duration_s * 1.5, 600.0))
     def set_vignette(self, v: float):
         self.VIGNETTE_MIN = max(0.0, min(v * 0.5, 2.0))
         self.VIGNETTE_MAX = max(self.VIGNETTE_MIN + 0.001, min(v * 1.5, 2.0))
@@ -263,19 +249,6 @@ class SpiralDirector:
         # Note: state.phase is updated by update() method which reads from _phase_accumulator
         # This separation ensures a single source of truth for the phase value
 
-    # ---------------- Flip scheduling ----------------
-    def _schedule_next_flip(self, intensity: float) -> float:
-        # intensity 0 -> long period (240s), intensity 1 -> short (120s)
-        base_period = self.FLIP_PERIOD_MAX - (self.FLIP_PERIOD_MAX - self.FLIP_PERIOD_MIN) * intensity
-        jitter = self.rng.uniform(-45.0, 45.0)
-        return max(30.0, base_period + jitter)  # guard against too small
-
-    def force_flip(self):
-        if self.state.flip_state == 0:
-            self.state.flip_state = 1
-            self.state.flip_radius = self.FLIP_RADIUS_START
-            self._flip_elapsed = 0.0
-
     # ---------------- Update loop ----------------
     def update(self, dt: float | None = None) -> SpiralState:
         now = time.time()
@@ -319,30 +292,9 @@ class SpiralDirector:
         st.vignette = self._lerp(st.vignette, vignette_target, min(1.0, dt * 0.5))
         st.chromatic_shift = self._slew(st.chromatic_shift, chroma_target, 0.01 * scale)
 
-        # Flip FSM scheduling
-        if st.flip_state == 0:
-            self._next_flip_in -= dt
-            if self._next_flip_in <= 0.0:
-                self.force_flip()
-                # Pre-schedule next period (will start counting after flip completes)
-                self._next_flip_in = self._schedule_next_flip(intensity)
-        if st.flip_state == 1:
-            wave_duration = self.FLIP_WAVE_MAX - (self.FLIP_WAVE_MAX - self.FLIP_WAVE_MIN) * intensity
-            flip_width_target = self.FLIP_WIDTH_MIN + (self.FLIP_WIDTH_MAX - self.FLIP_WIDTH_MIN) * (1.0 - intensity)
-            st.flip_width = self._slew(st.flip_width, flip_width_target, 0.01)
-            self._flip_elapsed += dt
-            prog = min(1.0, self._flip_elapsed / wave_duration)
-            st.flip_radius = self.FLIP_RADIUS_START + (self.FLIP_RADIUS_END - self.FLIP_RADIUS_START) * prog
-            if prog >= 1.0:
-                st.flip_state = 0
-                st.flip_radius = self.FLIP_RADIUS_START
-                self._flip_elapsed = 0.0
-        else:
-            st.flip_width = self._slew(st.flip_width, self.FLIP_WIDTH_MIN, 0.01)
-        # Speed wobble + flip local boost (simplified: uniform boost while active)
+        # Speed wobble only (legacy flip wave removed)
         wobble = math.sin(now * 2.0 * math.pi * 0.5) * wobble_amp  # 0.5 cps wobble
-        flip_boost = 0.03 if st.flip_state == 1 else 0.0
-        st.effective_speed = min(self.SPEED_CAP, st.base_speed + wobble + flip_boost)
+        st.effective_speed = min(self.SPEED_CAP, st.base_speed + wobble)
         
         # Rotate spiral using rotation_speed (RPM) and actual dt
         self.rotate_spiral(0.0, dt=dt)  # Pass dt to use measured frame time
@@ -395,9 +347,6 @@ class SpiralDirector:
             "uContrast": s.contrast,
             "uVignette": s.vignette,
             "uChromaticShift": s.chromatic_shift,
-            "uFlipWaveRadius": s.flip_radius,
-            "uFlipWaveWidth": s.flip_width,
-            "uFlipState": s.flip_state,
             "uIntensity": 1.0,  # Always 1.0 - intensity removed from system (spiral uses full color)
             "uSafetyClamped": 1 if s.safety_clamped else 0,
             
