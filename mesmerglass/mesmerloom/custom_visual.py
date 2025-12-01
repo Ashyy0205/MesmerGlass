@@ -673,7 +673,7 @@ class CustomVisual(Visual):
         
         self.logger.info(f"[CustomVisual] Text application complete: mode={text_mode}, enabled={enabled}, opacity={opacity}")
     
-    def _restart_zoom_animation(self) -> None:
+    def _restart_zoom_animation(self, duration_override: Optional[int] = None) -> None:
         """Restart zoom animation from 1.0 (called on each media change)."""
         zoom_config = self.config.get("zoom", {})
         zoom_mode = zoom_config.get("mode", "none")
@@ -687,7 +687,8 @@ class CustomVisual(Visual):
             return
         
         # Get media cycle duration for zoom animation (matches cycle speed exactly)
-        duration_frames = getattr(self, '_frames_per_cycle', 127)
+        duration_frames = duration_override or getattr(self, '_frames_per_cycle', 127)
+        duration_frames = max(1, int(duration_frames))
         duration_seconds = duration_frames / 60.0  # Convert to seconds at 60fps
         
         # For exponential/falling modes, calculate rate from duration
@@ -718,7 +719,14 @@ class CustomVisual(Visual):
                     rate=zoom_rate
                 )
         
-        self.logger.debug(f"[CustomVisual] Restarted zoom animation on {len(all_compositors)} compositor(s): mode={zoom_mode}, rate={zoom_rate:.4f}, duration={duration_frames} frames ({duration_seconds:.2f}s)")
+        self.logger.debug(
+            "[CustomVisual] Restarted zoom animation on %d compositor(s): mode=%s, rate=%.4f, duration=%d frames (%.2fs)",
+            len(all_compositors),
+            zoom_mode,
+            zoom_rate,
+            duration_frames,
+            duration_seconds,
+        )
     
     def _apply_zoom_settings(self) -> None:
         """Apply zoom animation settings to all compositors."""
@@ -931,6 +939,15 @@ class CustomVisual(Visual):
         self._accelerate_last_applied_speed = smoothed
 
         frames, _interval_ms = self._cycle_speed_to_frames(int(round(smoothed)))
+        base_frames = max(1, int(getattr(self, '_frames_per_cycle', 300)))
+        if frames > base_frames:
+            if self.logger.isEnabledFor(logging.DEBUG):
+                self.logger.debug(
+                    "[CustomVisual][accelerate] clamped interval: requested=%d frames base=%d",
+                    frames,
+                    base_frames,
+                )
+            frames = base_frames
         interval_s = frames / 60.0  # Remove ACCEL_MIN_DURATION clamp to allow true high speeds
         self._accelerate_media_interval_s = interval_s
         
@@ -993,6 +1010,35 @@ class CustomVisual(Visual):
             interval = self._frames_per_cycle / 60.0
         # Remove ACCEL_MIN_DURATION clamp to allow true high speeds
         self._accelerate_next_media_time = time.perf_counter() + interval
+
+    def get_expected_media_cycle_frames(self) -> int:
+        """Expose the current media interval as frames for zoom alignment."""
+        base_frames = max(1, int(getattr(self, '_frames_per_cycle', 300)))
+        source = "base"
+        frames_result = base_frames
+        if self._accelerate_enabled:
+            interval_s = self._accelerate_media_interval_s
+            if interval_s is not None:
+                frames_result = max(1, int(round(interval_s * 60.0)))
+                source = "interval"
+            else:
+                # Fall back to current accelerate speed hints when interval is not set yet
+                speed_hint = self._accelerate_media_speed_smoothed or self._accelerate_media_speed_current
+                if speed_hint is not None:
+                    frames_hint, _ = self._cycle_speed_to_frames(int(round(speed_hint)))
+                    frames_result = max(1, frames_hint)
+                    source = "speed_hint"
+                else:
+                    frames_result = base_frames
+                    source = "fallback"
+        if self.logger.isEnabledFor(logging.DEBUG):
+            self.logger.debug(
+                "[CustomVisual][accelerate] expected frames (%s): %d",
+                source,
+                frames_result,
+            )
+        return frames_result
+        # Default to the configured frames-per-cycle for non-accelerate modes
     
     # ===== Cycler Interface (Required by Visual base class) =====
     

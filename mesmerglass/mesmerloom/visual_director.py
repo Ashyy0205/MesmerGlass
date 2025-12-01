@@ -86,6 +86,12 @@ class VisualDirector:
         self._video_frame_miss_logged = False
         self._video_first_upload_logged = False
         self._perf_sampler = BurstSampler(interval_s=2.0)
+        self._video_zoom_duration_override: Optional[int] = None
+        self._last_video_zoom_restart_frame: Optional[int] = None
+        self._image_zoom_duration_override: Optional[int] = None
+        self._last_image_zoom_restart_frame: Optional[int] = None
+        self._last_image_zoom_restart_ts: Optional[float] = None
+        self._global_image_zoom_duration: Optional[int] = None
     
     # ===== Multi-Display Support =====
     
@@ -244,6 +250,13 @@ class VisualDirector:
             
             self.logger.info(f"[CustomVisual] Loading playback from: {playback_path.name}")
             
+            # Reset compositor zoom BEFORE instantiating CustomVisual so its zoom settings take effect
+            if self.compositor and hasattr(self.compositor, 'reset_zoom'):
+                self.compositor.reset_zoom()
+                self.logger.debug("[CustomVisual] Reset compositor zoom animation (pre-load)")
+            else:
+                self.logger.debug("[CustomVisual] Skipped zoom reset (compositor missing or lacks API)")
+
             # Create CustomVisual instance
             custom_visual = CustomVisual(
                 playback_path=playback_path,
@@ -270,6 +283,9 @@ class VisualDirector:
             self._paused = False
             self._pause_saved_rotation_speed = None  # Clear saved rotation speed on new visual
             self._frame_count = 0
+            self._image_zoom_duration_override = None
+            self._last_image_zoom_restart_frame = None
+            self._last_image_zoom_restart_ts = None
             
             # CRITICAL FIX: Do NOT reset _last_cycle_marker during playback switches
             # The old code reset cycle tracking here, which prevented cycle boundaries
@@ -280,13 +296,6 @@ class VisualDirector:
             self._cycle_count = 0
             # NOTE: _last_cycle_marker is NOT reset here - preserves cycle boundary detection
             # across playback switches (critical for session transitions)
-            
-            # CRITICAL: Reset compositor zoom animation to prevent carryover from previous playback
-            # When switching playbacks, the old zoom animation would continue until first image loads
-            # This ensures zoom starts fresh at 1.0 with no animation
-            if self.compositor and hasattr(self.compositor, 'reset_zoom'):
-                self.compositor.reset_zoom()
-                self.logger.debug("[CustomVisual] Reset compositor zoom animation")
             
             # CRITICAL: Reset text director scroll state to prevent carousel offset carryover
             # This must happen AFTER CustomVisual creation (so text_director exists)
@@ -463,13 +472,24 @@ class VisualDirector:
                             # This will overwrite any static image background
                             # Use current background zoom (respects zoom animation state)
                             current_zoom = getattr(self.compositor, '_background_zoom', 1.0)
+                            is_first_frame = self._video_first_frame
+                            frame_zoom = 1.0 if is_first_frame else current_zoom
                             self.compositor.set_background_video_frame(
                                 frame.data,
                                 width=frame.width,
                                 height=frame.height,
-                                zoom=current_zoom,
-                                new_video=self._video_first_frame  # Trigger fade on first frame
+                                zoom=frame_zoom,
+                                new_video=is_first_frame  # Trigger fade on first frame
                             )
+
+                            # Restart zoom only once the new video frame is actually visible to avoid pre-cycle stalls
+                            if is_first_frame:
+                                duration_override = self._capture_video_zoom_duration()
+                                self._restart_video_zoom_animation(
+                                    start_zoom=frame_zoom,
+                                    duration_override=duration_override,
+                                )
+
                             # Clear first frame flag after upload
                             self._video_first_frame = False
 
@@ -702,6 +722,9 @@ class VisualDirector:
         if self.current_visual:
             self.current_visual.reset()
             self._frame_count = 0
+            self._image_zoom_duration_override = None
+            self._last_image_zoom_restart_frame = None
+            self._last_image_zoom_restart_ts = None
     
     # ===== Callbacks (connect visual programs → theme bank → compositor) =====
     
@@ -768,11 +791,15 @@ class VisualDirector:
                 
                 # Upload to ALL compositors and store each texture_id with its compositor
                 compositor_texture_map = {}  # Map compositor -> texture_id
-                
+
+                # Track current zoom per compositor so we can avoid snapping when media switches
+                compositor_zoom_map: dict[Any, float] = {}
+
                 # Upload to PRIMARY compositor
                 texture_id = self.compositor.upload_image_to_gpu(image_data, generate_mipmaps=False)
                 self.logger.debug(f"[visual] Uploaded to GPU (primary): texture_id={texture_id}")
                 compositor_texture_map[self.compositor] = texture_id
+                compositor_zoom_map[self.compositor] = getattr(self.compositor, '_background_zoom', 1.0)
                 
                 # Upload to all SECONDARY compositors (each gets its own texture_id)
                 for i, secondary in enumerate(self._secondary_compositors, start=1):
@@ -780,6 +807,7 @@ class VisualDirector:
                         secondary_texture_id = secondary.upload_image_to_gpu(image_data, generate_mipmaps=False)
                         self.logger.debug(f"[visual] Uploaded to GPU (secondary {i}): texture_id={secondary_texture_id}")
                         compositor_texture_map[secondary] = secondary_texture_id
+                        compositor_zoom_map[secondary] = getattr(secondary, '_background_zoom', 1.0)
                     except Exception as e:
                         self.logger.error(f"[visual] Failed to upload to secondary compositor {i}: {e}")
                 
@@ -790,15 +818,23 @@ class VisualDirector:
                 for comp in compositor_texture_map.keys():
                     try:
                         comp_texture_id = compositor_texture_map[comp]
+                        comp_zoom = compositor_zoom_map.get(comp, 1.0)
                         comp.set_background_texture(
                             comp_texture_id,  # Use THIS compositor's texture_id
-                            zoom=1.0,
+                            zoom=comp_zoom,
                             image_width=image_data.width,
                             image_height=image_data.height
                         )
                     except Exception as e:
                         self.logger.error(f"[visual] Failed to set background on compositor: {e}")
                 
+                image_duration_override = self._capture_image_zoom_duration()
+                duration_override = image_duration_override
+                video_override_used = False
+                if duration_override is None and self._video_zoom_duration_override is not None:
+                    duration_override = self._video_zoom_duration_override
+                    video_override_used = True
+
                 # Start zoom-in animation (48 frames for images) - BUT skip if custom mode handles its own zoom
                 should_start_zoom = True
                 if self.is_custom_mode_active():
@@ -806,7 +842,21 @@ class VisualDirector:
                     should_start_zoom = False
                     # Notify custom visual that new image was uploaded so it can restart zoom
                     if self.current_visual and hasattr(self.current_visual, '_restart_zoom_animation'):
-                        self.current_visual._restart_zoom_animation()
+                        if duration_override is not None:
+                            try:
+                                frames_per_cycle = int(max(1, getattr(self.current_visual, '_frames_per_cycle', 0)))
+                            except Exception:
+                                frames_per_cycle = None
+                            if video_override_used and frames_per_cycle and duration_override < frames_per_cycle:
+                                self.logger.debug(
+                                    "[visual.image] Dropping short video-derived zoom override (%d < %d)",
+                                    duration_override,
+                                    frames_per_cycle,
+                                )
+                                duration_override = None  # Avoid shortening zoom to a stale video span
+                        self.current_visual._restart_zoom_animation(
+                            duration_override=duration_override,
+                        )
                         self.logger.debug("[visual] Background texture applied (custom visual restarted zoom)")
                     else:
                         self.logger.debug("[visual] Background texture applied (custom mode manages zoom)")
@@ -816,7 +866,8 @@ class VisualDirector:
                     self.logger.debug("[visual] Background texture applied (zoom disabled)")
                 
                 if should_start_zoom and hasattr(self.compositor, 'start_zoom_animation'):
-                    self.compositor.start_zoom_animation(target_zoom=1.5, start_zoom=1.0, duration_frames=48)
+                    current_zoom = getattr(self.compositor, '_background_zoom', 1.0)
+                    self.compositor.start_zoom_animation(target_zoom=1.5, start_zoom=current_zoom, duration_frames=48)
                     self.logger.debug("[visual] Background texture applied with zoom animation")
                 
                 # Notify text director of media change (for CENTERED_SYNC mode)
@@ -1100,10 +1151,6 @@ class VisualDirector:
                     # Mark that next frame is first frame of new video (for fade transition)
                     self._video_first_frame = True
                     
-                    # Start zoom-in animation for video (300 frames for videos)
-                    if hasattr(self.compositor, 'start_zoom_animation'):
-                        self.compositor.start_zoom_animation(target_zoom=1.5, start_zoom=1.0, duration_frames=300)
-                    
                     # Notify text director of media change (for CENTERED_SYNC mode)
                     if self.text_director and hasattr(self.text_director, 'on_media_change'):
                         self.text_director.on_media_change()
@@ -1118,6 +1165,164 @@ class VisualDirector:
             except Exception as e:
                 self.logger.error(f"Failed to change video: {e}", exc_info=True)
     
+    def _capture_image_zoom_duration(self) -> Optional[int]:
+        """Measure the previous image span so early cycles keep zoom synced."""
+        expected_frames = max(1, self._get_expected_media_cycle_frames())
+        base_default = self._derive_visual_cycle_frames()
+        measured_span: Optional[int] = None
+        if self._last_image_zoom_restart_frame is not None:
+            measured_span = max(1, self._frame_count - self._last_image_zoom_restart_frame)
+
+        elapsed_frames: Optional[int] = None
+        now_ts = perf_counter()
+        if self._last_image_zoom_restart_ts is not None:
+            elapsed_s = max(0.0, now_ts - self._last_image_zoom_restart_ts)
+            elapsed_frames = max(1, int(round(elapsed_s * 60.0)))
+
+        self._last_image_zoom_restart_frame = self._frame_count
+        self._last_image_zoom_restart_ts = now_ts
+
+        chosen_source = "expected"
+        selected_duration: Optional[int] = None
+
+        if measured_span is not None:
+            selected_duration = measured_span
+            chosen_source = "measured"
+
+        if elapsed_frames is not None and (selected_duration is None or elapsed_frames > selected_duration):
+            selected_duration = elapsed_frames
+            chosen_source = "elapsed"
+
+        use_cached = (
+            selected_duration is None
+            and self._global_image_zoom_duration is not None
+            and expected_frames <= base_default
+        )
+
+        if use_cached:
+            selected_duration = self._global_image_zoom_duration
+            chosen_source = "cached"
+            self.logger.debug(
+                "[visual.image] Using cached zoom duration fallback: %d frames",
+                self._global_image_zoom_duration,
+            )
+
+        if selected_duration is None:
+            selected_duration = expected_frames
+            chosen_source = "expected"
+
+        final_duration = max(expected_frames, selected_duration)
+        self._image_zoom_duration_override = final_duration
+
+        if chosen_source in {"measured", "elapsed"}:
+            self._global_image_zoom_duration = final_duration
+
+        if self.logger.isEnabledFor(logging.DEBUG):
+            self.logger.debug(
+                "[visual.image] zoom capture: expected=%d measured=%s elapsed=%s cached=%s final=%d source=%s",
+                expected_frames,
+                measured_span,
+                elapsed_frames,
+                self._global_image_zoom_duration,
+                final_duration,
+                chosen_source,
+            )
+
+        return self._image_zoom_duration_override
+
+    def _capture_video_zoom_duration(self) -> Optional[int]:
+        """Measure the previous zoom span so the next clip can use a matching duration."""
+        frames_per_cycle = None
+        if self.current_visual and hasattr(self.current_visual, '_frames_per_cycle'):
+            try:
+                frames_per_cycle = int(max(1, getattr(self.current_visual, '_frames_per_cycle', 0)))
+            except Exception:
+                frames_per_cycle = None
+
+        measured_span: Optional[int] = None
+        if self._last_video_zoom_restart_frame is not None:
+            measured_span = max(1, self._frame_count - self._last_video_zoom_restart_frame)
+
+        # Update baseline for the next measurement (current frame marks new clip start)
+        self._last_video_zoom_restart_frame = self._frame_count
+
+        if measured_span is not None and frames_per_cycle:
+            measured_span = max(measured_span, frames_per_cycle)
+
+        if measured_span is not None:
+            self.logger.debug(
+                "[visual.video] Measured previous zoom duration: %d frames (min=%s)",
+                measured_span,
+                frames_per_cycle,
+            )
+        elif frames_per_cycle:
+            self.logger.debug(
+                "[visual.video] No prior zoom duration measured; defaulting to %d frames",
+                frames_per_cycle,
+            )
+
+        self._video_zoom_duration_override = measured_span or frames_per_cycle
+        return self._video_zoom_duration_override
+
+    def _restart_video_zoom_animation(
+        self,
+        start_zoom: float = 1.0,
+        duration_override: Optional[int] = None,
+    ) -> None:
+        """Restart zoom animation for the current visual's video clip."""
+        handled = False
+
+        default_duration = self._video_zoom_duration_override or self._derive_visual_cycle_frames()
+        effective_duration = duration_override or default_duration
+        if effective_duration is None:
+            effective_duration = self._derive_visual_cycle_frames()
+        self._video_zoom_duration_override = effective_duration
+
+        if self.current_visual and hasattr(self.current_visual, '_restart_zoom_animation'):
+            try:
+                self.current_visual._restart_zoom_animation(
+                    duration_override=effective_duration,
+                )
+                handled = True
+            except Exception as exc:
+                self.logger.warning(f"[visual] Custom visual zoom restart failed: {exc}")
+
+        if handled:
+            return
+
+        duration_frames = effective_duration or self._derive_visual_cycle_frames()
+
+        if self.compositor and hasattr(self.compositor, 'start_zoom_animation'):
+            try:
+                self.compositor.start_zoom_animation(
+                    target_zoom=1.5,
+                    start_zoom=start_zoom,
+                    duration_frames=duration_frames
+                )
+            except Exception as exc:
+                self.logger.warning(f"[visual] Fallback zoom restart failed: {exc}")
+
+    def _derive_visual_cycle_frames(self) -> int:
+        """Return the configured frames-per-cycle for the active visual (defaults to 300)."""
+        duration_frames = 300
+        if self.current_visual and hasattr(self.current_visual, '_frames_per_cycle'):
+            try:
+                duration_frames = int(max(1, getattr(self.current_visual, '_frames_per_cycle', 300)))
+            except Exception:
+                duration_frames = 300
+        return duration_frames
+
+    def _get_expected_media_cycle_frames(self) -> int:
+        """Return the expected media cycle duration, accounting for accelerate overrides."""
+        if self.current_visual and hasattr(self.current_visual, 'get_expected_media_cycle_frames'):
+            try:
+                frames = int(self.current_visual.get_expected_media_cycle_frames())
+                if frames > 0:
+                    return frames
+            except Exception as exc:  # pragma: no cover - defensive guard
+                self.logger.debug("[visual] custom expected cycle failed: %s", exc)
+        return self._derive_visual_cycle_frames()
+
     # ===== Helper Methods =====
     
     def _get_image_paths(self) -> list[Path]:
