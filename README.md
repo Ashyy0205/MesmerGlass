@@ -1,4 +1,6 @@
-# MesmerGlass 🌟
+<img width="1024" height="1024" alt="mesmerglass_aperture_solar" src="https://github.com/user-attachments/assets/f95bcaf5-f21e-4364-bd93-c736410b545a" />
+
+# MesmerGlass
 
 **MesmerGlass** is a sophisticated desktop overlay application that creates hypnotic visual experiences with synchronized device control. Built with PyQt6, it provides real-time video effects (via the **MesmerLoom** visuals engine), text animations, and seamless device synchronization through our pure Python **MesmerIntiface** system.
 
