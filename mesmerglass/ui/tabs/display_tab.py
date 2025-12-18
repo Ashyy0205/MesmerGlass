@@ -29,6 +29,7 @@ class DisplayTab(BaseTab):
         super().__init__(parent)
         self.logger = logging.getLogger(__name__)
         self._last_vr_refresh = 0  # Timestamp of last VR refresh to prevent spam
+        self._suppress_item_changed = False
         
         # Store reference to MainApplication (parent becomes QStackedWidget after addTab)
         self._main_app = parent
@@ -53,8 +54,10 @@ class DisplayTab(BaseTab):
         
         # === DISPLAY LIST ===
         self.list_displays = QListWidget()
+        self.list_displays.itemChanged.connect(self._on_display_item_changed)
         
         # Add physical monitors (default: check first one = primary)
+        self._suppress_item_changed = True
         primary_screen = QGuiApplication.primaryScreen()
         for idx, screen in enumerate(QGuiApplication.screens()):
             geometry = screen.geometry()
@@ -82,6 +85,9 @@ class DisplayTab(BaseTab):
         
         # Refresh VR devices
         self._refresh_vr_displays()
+
+        self._suppress_item_changed = False
+        self._push_selection_to_status_bar()
         
         layout.addWidget(self.list_displays, 1)
         
@@ -120,11 +126,65 @@ class DisplayTab(BaseTab):
         layout.addWidget(info_label)
         
         self.logger.info("DisplayTab initialized")
+
+    def _push_selection_to_status_bar(self) -> None:
+        summary = self._get_selected_displays_summary()
+        setter = getattr(self._main_app, "set_status_display", None)
+        if callable(setter):
+            setter(summary)
+
+    def _get_selected_displays_summary(self) -> str:
+        monitors: list[str] = []
+        vrs: list[str] = []
+
+        for i in range(self.list_displays.count()):
+            item = self.list_displays.item(i)
+            if not item:
+                continue
+            if not (item.flags() & Qt.ItemFlag.ItemIsUserCheckable):
+                continue
+            if item.checkState() != Qt.CheckState.Checked:
+                continue
+
+            data = item.data(Qt.ItemDataRole.UserRole)
+            if not isinstance(data, dict):
+                continue
+
+            if data.get("type") == "monitor":
+                screen = data.get("screen")
+                name = getattr(screen, "name", lambda: "Monitor")()
+                monitors.append(str(name))
+            elif data.get("type") == "vr":
+                client = data.get("client") or {}
+                label = client.get("name") or client.get("ip") or "VR"
+                vrs.append(str(label))
+
+        if not monitors and not vrs:
+            return "No display selected"
+
+        parts: list[str] = []
+        if monitors:
+            parts.append(f"Monitors: {len(monitors)}")
+        if vrs:
+            parts.append(f"VR: {len(vrs)}")
+        return " | ".join(parts)
+
+    def _on_display_item_changed(self, item: QListWidgetItem) -> None:
+        if self._suppress_item_changed:
+            return
+        if not item or not (item.flags() & Qt.ItemFlag.ItemIsUserCheckable):
+            return
+
+        self._push_selection_to_status_bar()
+        self.mark_dirty()
     
     
     def _refresh_vr_displays(self):
         """Refresh the VR devices section in the displays list."""
         import time
+
+        if self.list_displays is None:
+            return
         
         # Prevent rapid repeated refreshes (cooldown: 2 seconds)
         current_time = time.time()
@@ -135,6 +195,8 @@ class DisplayTab(BaseTab):
         self._last_vr_refresh = current_time
         self.logger.debug("Starting VR display refresh")
         
+        self._suppress_item_changed = True
+
         # Save the checked state of existing VR items (by client IP)
         checked_ips = set()
         for i in range(self.list_displays.count()):
@@ -241,19 +303,27 @@ class DisplayTab(BaseTab):
         total_items = self.list_displays.count()
         self.logger.info(f"VR refresh complete: {len(discovered_clients)} devices found, total list items: {total_items}")
 
+        self._suppress_item_changed = False
+        self._push_selection_to_status_bar()
+
     
     def _select_all_displays(self):
         """Select all displays (monitors and VR)."""
+        self._suppress_item_changed = True
         for i in range(self.list_displays.count()):
             item = self.list_displays.item(i)
             if item and item.flags() & Qt.ItemFlag.ItemIsUserCheckable:
                 item.setCheckState(Qt.CheckState.Checked)
+
+        self._suppress_item_changed = False
+        self._push_selection_to_status_bar()
         
         self.logger.info("Selected all displays")
         self.mark_dirty()
     
     def _select_primary_display(self):
         """Select only the primary monitor."""
+        self._suppress_item_changed = True
         # Uncheck all
         for i in range(self.list_displays.count()):
             item = self.list_displays.item(i)
@@ -266,6 +336,9 @@ class DisplayTab(BaseTab):
             if first_item and first_item.flags() & Qt.ItemFlag.ItemIsUserCheckable:
                 first_item.setCheckState(Qt.CheckState.Checked)
         
+        self._suppress_item_changed = False
+        self._push_selection_to_status_bar()
+
         self.logger.info("Selected primary display only")
         self.mark_dirty()
     

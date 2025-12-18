@@ -110,7 +110,7 @@ class CuelistEditor(QDialog):
         
         # Loop Mode
         self.loop_mode_combo = QComboBox()
-        self.loop_mode_combo.addItems(["once", "loop", "loop_cues"])
+        self.loop_mode_combo.addItems(["once", "loop"])
         self.loop_mode_combo.currentTextChanged.connect(self._mark_modified)
         metadata_layout.addRow("Loop Mode:", self.loop_mode_combo)
         
@@ -227,7 +227,8 @@ class CuelistEditor(QDialog):
         self.description_edit.setPlainText(self.cuelist_data.get("description", ""))
         self.author_edit.setText(self.cuelist_data.get("author", ""))
         
-        loop_mode = self.cuelist_data.get("loop_mode", "once")
+        loop_mode = self._normalize_loop_mode(self.cuelist_data.get("loop_mode", "once"))
+        self.cuelist_data["loop_mode"] = loop_mode
         index = self.loop_mode_combo.findText(loop_mode)
         if index >= 0:
             self.loop_mode_combo.setCurrentIndex(index)
@@ -261,7 +262,7 @@ class CuelistEditor(QDialog):
         self.cuelist_data["name"] = self.name_edit.text()
         self.cuelist_data["description"] = self.description_edit.toPlainText()
         self.cuelist_data["author"] = self.author_edit.text()
-        self.cuelist_data["loop_mode"] = self.loop_mode_combo.currentText()
+        self.cuelist_data["loop_mode"] = self._normalize_loop_mode(self.loop_mode_combo.currentText())
         self.cuelist_data["transition_mode"] = self.transition_mode_combo.currentText()
         self.cuelist_data["transition_duration_ms"] = float(self.transition_duration_spin.value())
         self.cuelist_data["version"] = "1.0"
@@ -287,6 +288,13 @@ class CuelistEditor(QDialog):
         """Enable/disable transition duration spinbox based on mode."""
         # Duration spinbox only enabled for fade mode
         self.transition_duration_spin.setEnabled(mode == "fade")
+
+    def _normalize_loop_mode(self, value: str) -> str:
+        """Return a UI-safe loop mode string (only once/loop)."""
+        normalized = (value or "once").strip().lower()
+        if normalized in ("loop", "loop_cues", "loop-count", "loop_count", "ping_pong", "ping-pong"):
+            return "loop"
+        return "once"
     
     def _add_cue(self):
         """Add a new cue."""

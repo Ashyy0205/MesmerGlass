@@ -798,8 +798,15 @@ class SessionRunnerTab(QWidget):
         theme_bank = getattr(self.visual_director, "theme_bank", None) if self.visual_director else None
         if theme_bank is None or not hasattr(theme_bank, "ensure_ready"):
             return True
+        timeout = 0.25
+        if getattr(theme_bank, "network_sources_detected", False):
+            timeout = 3.0
+            self.logger.info(
+                "ThemeBank using network media; extending readiness wait to %.2fs",
+                timeout,
+            )
         try:
-            status = theme_bank.ensure_ready(timeout_s=0.25)
+            status = theme_bank.ensure_ready(timeout_s=timeout)
         except Exception as exc:
             self.logger.warning(f"ThemeBank readiness probe failed: {exc}")
             return True

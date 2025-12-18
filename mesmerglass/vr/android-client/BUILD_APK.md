@@ -19,7 +19,7 @@ You need Android SDK installed. You have two options:
    - Path: `app\build\outputs\apk\debug\app-debug.apk`
 6. **Copy to Distribution**:
    ```powershell
-   Copy-Item "app\build\outputs\apk\debug\app-debug.apk" "..\..\MEDIA\vr-client\mesmervisor-client.apk"
+   Copy-Item "app\build\outputs\apk\release\app-release-unsigned.apk" "..\..\MEDIA\vr-client\MesmerVisor.apk"
    ```
 
 ### Option 2: Command Line (SDK Required)
@@ -43,7 +43,7 @@ If you have Android SDK installed separately:
 
 3. **Copy to Distribution**:
    ```powershell
-   Copy-Item "app\build\outputs\apk\debug\app-debug.apk" "..\..\MEDIA\vr-client\mesmervisor-client.apk"
+   Copy-Item "app\build\outputs\apk\release\app-release-unsigned.apk" "..\..\MEDIA\vr-client\MesmerVisor.apk"
    ```
 
 ## What Changed
@@ -144,7 +144,7 @@ adb shell dumpsys package com.hypnotic.vrreceiver | Select-String -Pattern "appl
 
 For a smaller, optimized APK:
 
-1. **Generate Signing Key** (one-time):
+1. **Generate Signing Key** (one-time, optional):
    ```powershell
    keytool -genkey -v -keystore mesmervisor-release.keystore -alias mesmervisor -keyalg RSA -keysize 2048 -validity 10000
    ```
@@ -161,7 +161,7 @@ For a smaller, optimized APK:
 
 4. **Optimize APK**:
    ```powershell
-   zipalign -v 4 app\build\outputs\apk\release\app-release-unsigned.apk MEDIA\vr-client\mesmervisor-client-signed.apk
+   zipalign -v 4 app\build\outputs\apk\release\app-release-unsigned.apk MEDIA\vr-client\MesmerVisor-signed.apk
    ```
 
 Release APK will be ~5-8 MB (ProGuard optimized).
@@ -170,7 +170,7 @@ Release APK will be ~5-8 MB (ProGuard optimized).
 
 After building successfully:
 
-1. ✅ Copy APK to `MEDIA\vr-client\mesmervisor-client.apk`
+1. ✅ Copy APK to `MEDIA\vr-client\MesmerVisor.apk`
 2. ✅ Install on VR device via ADB or SideQuest
 3. ✅ Start MesmerGlass: `python -m mesmerglass vr-stream`
 4. ✅ Launch "MesmerVisor Client" on VR device

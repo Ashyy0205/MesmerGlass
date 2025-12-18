@@ -68,7 +68,7 @@ class CueEditor(QDialog):
         self._duration_manual_override = False
         self._updating_duration_spin = False
         self._reset_audio_state(preserve_widgets=False)
-        
+
         self.setWindowTitle("Cue Editor")
         self.setModal(True)
         self.setSizeGripEnabled(True)
@@ -252,7 +252,7 @@ class CueEditor(QDialog):
             "Ambient loop that automatically repeats to cover the hypno track."
         )
         layout.addWidget(audio_group)
-        
+
         # === TEXT MESSAGES ===
         text_group = QGroupBox("Custom Text Messages (optional)")
         text_layout = QVBoxLayout(text_group)
@@ -471,6 +471,10 @@ class CueEditor(QDialog):
             self._apply_hypno_duration_suggestion(suggestion, force=True)
         else:
             self._apply_hypno_duration_suggestion(None, force=True)
+        # Remove legacy video audio fields so they do not persist when editing
+        self.cue_data.pop("video_audio", None)
+        self.cue_data.pop("enable_video_audio", None)
+        self.cue_data.pop("video_audio_volume", None)
     
     def _hydrate_audio_state_from_data(self) -> None:
         """Load audio configuration from cue_data into UI state."""
@@ -632,7 +636,7 @@ class CueEditor(QDialog):
         """Update intensity label when slider changes."""
         self.intensity_label.setText(f"{value}%")
         self._mark_modified()
-    
+
     def _update_vibration_controls_state(self) -> None:
         """Enable/disable vibration controls based on device connection status."""
         # Check if any devices are connected via MesmerIntifaceServer
@@ -731,6 +735,10 @@ class CueEditor(QDialog):
         else:
             self.cue_data.pop("audio_tracks", None)
             self.cue_data.pop("audio", None)
+
+        self.cue_data.pop("video_audio", None)
+        self.cue_data.pop("enable_video_audio", None)
+        self.cue_data.pop("video_audio_volume", None)
         
         # Text messages
         text_content = self.text_edit.toPlainText().strip()

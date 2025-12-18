@@ -30,6 +30,13 @@ mesmerglass_launcher.*
 build_launcher.ps1
 LAUNCHER_README.md
 
+# Android SDK platform-tools (local only)
+platform-tools/
+platform-tools-*.zip
+
+# One-off local diagnostics
+scripts/find_token_error.py
+
 # Jupyter
 .ipynb_checkpoints/
 
@@ -58,3 +65,8 @@ MEDIA/Videos/*.mkv
 
 Test Media/
 mesmerglass/sessions/
+
+# Android signing material (local only)
+keystore.properties
+*.keystore
+*.jks

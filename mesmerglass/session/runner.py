@@ -188,6 +188,7 @@ class SessionRunner:
         self._vr_streaming_active = False
         self._vr_last_frame = None
         self._vr_frame_lock = None
+        self._vr_frame_handler = None
 
         # Audio runtime tracking
         self._audio_role_channels: dict[AudioRole, int] = {}
@@ -799,21 +800,29 @@ class SessionRunner:
                     
                     # Connect compositor's frame_ready signal to cache frames
                     if hasattr(streaming_compositor, 'frame_ready'):
-                        def on_frame_ready(frame):
-                            """Cache frame from compositor (called from Qt main thread with GL context active)"""
-                            if self._vr_streaming_active and frame is not None and frame.size > 0:
-                                try:
-                                    # Cache frame for streaming thread (thread-safe)
-                                    with self._vr_frame_lock:
-                                        self._vr_last_frame = frame.copy()  # Copy to avoid race conditions
-                                except Exception as e:
-                                    self.logger.error(f"[session] VR frame cache error: {e}")
-                        
-                        # Enable VR frame capture in compositor
-                        streaming_compositor._vr_capture_enabled = True
-                        
-                        # Connect the signal
-                        streaming_compositor.frame_ready.connect(on_frame_ready)
+                        if self._vr_frame_handler is None:
+                            def on_frame_ready(frame):
+                                """Cache frame from compositor (called from Qt main thread with GL context active)"""
+                                if self._vr_streaming_active and frame is not None and frame.size > 0:
+                                    try:
+                                        with self._vr_frame_lock:
+                                            self._vr_last_frame = frame.copy()
+                                    except Exception as e:  # pragma: no cover - defensive
+                                        self.logger.error(f"[session] VR frame cache error: {e}")
+
+                            self._vr_frame_handler = on_frame_ready
+
+                        if hasattr(streaming_compositor, 'set_vr_capture_enabled'):
+                            try:
+                                streaming_compositor.set_vr_capture_enabled(True, max_fps=30)
+                            except Exception:
+                                pass
+                        else:
+                            streaming_compositor._vr_capture_enabled = True
+                        try:
+                            streaming_compositor.frame_ready.connect(self._vr_frame_handler)
+                        except Exception:
+                            pass
                         self.logger.info("[session] VR streaming connected to compositor frame_ready signal")
                         self.logger.info(f"[session] VR streaming: compositor size={streaming_compositor.width()}x{streaming_compositor.height()}")
                         
@@ -912,6 +921,21 @@ class SessionRunner:
         if self.vr_streaming_server:
             try:
                 self._vr_streaming_active = False
+                with self._vr_frame_lock:
+                    self._vr_last_frame = None
+                if self.compositor and hasattr(self.compositor, 'frame_ready') and self._vr_frame_handler:
+                    try:
+                        self.compositor.frame_ready.disconnect(self._vr_frame_handler)
+                    except Exception:
+                        pass
+                    self._vr_frame_handler = None
+                if self.compositor and hasattr(self.compositor, 'set_vr_capture_enabled'):
+                    try:
+                        self.compositor.set_vr_capture_enabled(False)
+                    except Exception:
+                        pass
+                elif self.compositor and hasattr(self.compositor, '_vr_capture_enabled'):
+                    self.compositor._vr_capture_enabled = False
                 self.vr_streaming_server.stop_server()
                 self.vr_streaming_server = None
                 self.logger.info("[session] VR streaming server stopped")
@@ -1316,7 +1340,11 @@ class SessionRunner:
         # Update visual director with current cue settings (for vibration on text cycle)
         cue_settings = {
             'vibrate_on_text_cycle': cue.vibrate_on_text_cycle,
-            'vibration_intensity': cue.vibration_intensity
+            'vibration_intensity': cue.vibration_intensity,
+            'video_audio': {
+                'enabled': cue.enable_video_audio,
+                'volume': cue.video_audio_volume,
+            },
         }
         self.visual_director.set_current_cue_settings(cue_settings)
         
@@ -1632,16 +1660,15 @@ class SessionRunner:
         self.logger.info(f"[session] Ending cue {self._current_cue_index}: '{cue.name}' (duration={cue_duration:.1f}s)")
         
         # === AUDIO INTEGRATION: Stop audio tracks with fade-out ===
+        fade_ms_audio = cue.transition_out.duration_ms if cue.transition_out else 500
         if self.audio_engine:
             # Use transition_out fade duration if specified
-            fade_ms = cue.transition_out.duration_ms if cue.transition_out else 500
-            
             for i in range(self.audio_engine.num_channels):
                 if self.audio_engine.is_playing(i):
-                    self.audio_engine.fade_out_and_stop(i, fade_ms=fade_ms)
-                    self.logger.debug(f"[session] Fading out audio channel {i} ({fade_ms}ms)")
+                    self.audio_engine.fade_out_and_stop(i, fade_ms=fade_ms_audio)
+                    self.logger.debug(f"[session] Fading out audio channel {i} ({fade_ms_audio}ms)")
             if self._active_stream_role is not None:
-                self.audio_engine.stop_streaming_track(fade_ms=fade_ms)
+                self.audio_engine.stop_streaming_track(fade_ms=fade_ms_audio)
                 self.logger.debug(
                     "[session] Fading out streaming %s audio", self._active_stream_role.value
                 )
@@ -1649,6 +1676,12 @@ class SessionRunner:
             self._audio_role_channels.clear()
             self._active_hypno_duration = None
             self._release_audio_buffers_for_cue(self._current_cue_index)
+
+        if self.visual_director and hasattr(self.visual_director, "stop_video_audio"):
+            try:
+                self.visual_director.stop_video_audio(fade_ms=fade_ms_audio if self.audio_engine else 200)
+            except Exception as exc:
+                self.logger.debug("[session] Failed to stop video audio cleanly: %s", exc)
         
         # Emit cue end event
         self.event_emitter.emit(SessionEvent(

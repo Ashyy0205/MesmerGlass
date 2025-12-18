@@ -16,6 +16,8 @@ import sys
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
+from mesmerglass.session.cuelist import Cuelist, CuelistLoopMode
+
 
 # Get path to Python interpreter in venv
 PYTHON_EXE = sys.executable
@@ -347,6 +349,22 @@ class TestCLICuelistHelp:
         assert "--validate" in result.stdout
         assert "--print" in result.stdout
         assert "--execute" in result.stdout
+
+
+class TestLoopModeNormalization:
+    """Ensure legacy loop modes remain supported on load."""
+
+    def test_legacy_loop_cues_maps_to_loop(self):
+        data = {
+            "name": "Legacy Loop",
+            "version": "1.0",
+            "loop_mode": "loop_cues",
+            "cues": [],
+        }
+
+        cuelist = Cuelist.from_dict(data)
+
+        assert cuelist.loop_mode is CuelistLoopMode.LOOP
 
 
 if __name__ == "__main__":

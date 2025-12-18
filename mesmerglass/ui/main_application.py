@@ -248,14 +248,14 @@ class MainApplication(QMainWindow):
             }
             QTabBar::tab:selected {
                 background-color: #1e1e1e;
-                border-left: 3px solid #0e639c;
+                border-left: 3px solid #FF8A00;
                 color: #ffffff;
             }
             QTabBar::tab:hover {
                 background-color: #2a2d2e;
             }
             QStatusBar {
-                background-color: #007acc;
+                background-color: #094771;
                 color: #ffffff;
                 font-size: 11px;
             }
@@ -265,7 +265,7 @@ class MainApplication(QMainWindow):
                 padding: 4px;
             }
             QMenuBar::item:selected {
-                background-color: #094771;
+                background-color: rgba(14, 99, 156, 0.45);
             }
             QMenu {
                 background-color: #252526;
@@ -273,7 +273,7 @@ class MainApplication(QMainWindow):
                 border: 1px solid #454545;
             }
             QMenu::item:selected {
-                background-color: #094771;
+                background-color: rgba(14, 99, 156, 0.45);
             }
         """)
         
@@ -304,7 +304,7 @@ class MainApplication(QMainWindow):
         
         # Status bar sections
         self.status_session = "No session loaded"
-        self.status_display = "No display selected"
+        self.status_display = getattr(self, "status_display", "No display selected")
         self._update_status_bar()
     
     def _create_tabs(self):
@@ -497,11 +497,25 @@ class MainApplication(QMainWindow):
     
     def _update_status_bar(self):
         """Update status bar with current state."""
+        if not hasattr(self, "status_bar") or self.status_bar is None:
+            return
         session_name = self.session_manager.get_session_name() or "No session loaded"
         dirty_indicator = " *" if self.session_manager.dirty else ""
         self.status_bar.showMessage(
             f"Status: Ready | Session: {session_name}{dirty_indicator} | Display: {self.status_display}"
         )
+
+    def set_status_display(self, display_summary: str) -> None:
+        """Update the display summary shown in the status bar."""
+        display_summary = (display_summary or "").strip() or "No display selected"
+        current = getattr(self, "status_display", "No display selected")
+        if display_summary == current:
+            return
+        self.status_display = display_summary
+
+        # During early startup, DisplayTab may call this before the status bar exists.
+        if hasattr(self, "status_bar") and self.status_bar is not None:
+            self._update_status_bar()
     
     def _restore_window_state(self):
         """Restore window position, size, and last active tab."""
@@ -1015,6 +1029,7 @@ class MainApplication(QMainWindow):
             self.logger.info("🔄 Starting background media scan...")
 
             themes = []
+            network_media_detected = False
             font_paths: list[str] = []
             for entry in entries:
                 theme_name = entry.get('name', 'Unnamed')
@@ -1022,10 +1037,10 @@ class MainApplication(QMainWindow):
                 media_type = entry.get('type', 'images')
 
                 if media_dir.drive and media_dir.drive.upper() in ['U:', 'Z:', 'Y:', 'X:', 'W:', 'V:']:
+                    network_media_detected = True
                     self.logger.warning(
-                        f"⚠️  Skipping network drive '{theme_name}': {media_dir} (use local drives for performance)"
+                        f"⚠️  Network drive '{theme_name}': {media_dir} may stream slowly—local SSDs are recommended"
                     )
-                    continue
 
                 if not media_dir.exists():
                     self.logger.warning(f"⚠️  Skipping '{theme_name}': {media_dir} doesn't exist")
@@ -1068,6 +1083,7 @@ class MainApplication(QMainWindow):
                 self.theme_bank._themes = [t for t in themes if t.enabled]
                 self.theme_bank._preload_theme_images()
                 self.theme_bank.set_active_themes(primary_index=1)
+                self.theme_bank.network_sources_detected = network_media_detected
                 total_images = sum(len(t.image_path) for t in themes)
                 self.logger.info(
                     f"✅ Media scan complete: {len(themes)} theme(s) loaded, {total_images} total images"

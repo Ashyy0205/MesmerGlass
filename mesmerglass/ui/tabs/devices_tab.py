@@ -37,7 +37,7 @@ class DevicesTab(BaseTab):
         
         # Title
         title = QLabel("🔗 Device Control")
-        title.setStyleSheet("font-size: 24px; font-weight: bold; color: #0e639c;")
+        title.setStyleSheet("font-size: 24px; font-weight: bold; color: #569cd6;")
         layout.addWidget(title)
         
         # Description
@@ -108,7 +108,7 @@ class DevicesTab(BaseTab):
                 background-color: #1177bb;
             }
             QPushButton:pressed {
-                background-color: #0d5a8f;
+                background-color: #094771;
             }
             QPushButton:disabled {
                 background-color: #3c3c3c;
@@ -141,7 +141,8 @@ class DevicesTab(BaseTab):
                 border-left: 3px solid transparent;
             }
             QListWidget::item:selected {
-                background-color: #094771;
+                background-color: rgba(14, 99, 156, 0.45);
+                border-left: 3px solid #FF8A00;
                 color: white;
             }
             QListWidget::item:hover {
@@ -339,7 +340,7 @@ class DevicesTab(BaseTab):
                     self._is_scanning = True
                     self.scan_button.setText("⏹️ Stop Scanning")
                     self.scan_status.setText("Scanning for devices...")
-                    self.scan_status.setStyleSheet("color: #0e639c; font-style: italic;")
+                    self.scan_status.setStyleSheet("color: #569cd6; font-style: italic;")
                     self._log("✅ Scanning started successfully")
                     
                     # Start periodic device list refresh

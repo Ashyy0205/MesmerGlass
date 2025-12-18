@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Optional, Dict, Any, List
 from enum import Enum
 import json
+import logging
 
 from .cue import Cue
 
@@ -27,6 +28,9 @@ class CuelistTransitionMode(Enum):
     """How to transition between cues in a cuelist."""
     SNAP = "snap"  # Instant change at next media cycle boundary
     FADE = "fade"  # Smooth fade over specified duration
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -168,6 +172,38 @@ class Cuelist:
             "metadata": self.metadata
         }
     
+    @staticmethod
+    def _normalize_loop_mode(value: Any) -> CuelistLoopMode:
+        """Return a supported loop mode, coercing legacy strings when needed."""
+        if isinstance(value, CuelistLoopMode):
+            return value
+
+        normalized = str(value or "once").strip().lower()
+        alias_map = {
+            "loop": CuelistLoopMode.LOOP,
+            "loop_cues": CuelistLoopMode.LOOP,
+            "loop-count": CuelistLoopMode.LOOP,
+            "loop_count": CuelistLoopMode.LOOP,
+            "ping_pong": CuelistLoopMode.PING_PONG,
+            "ping-pong": CuelistLoopMode.PING_PONG,
+            "once": CuelistLoopMode.ONCE,
+        }
+
+        result = alias_map.get(normalized)
+        if result:
+            if normalized not in ("once", "loop", "ping_pong", "ping-pong"):
+                logger.info("[cuelist] Rewriting legacy loop mode '%s' -> '%s'", normalized, result.value)
+            return result
+
+        try:
+            return CuelistLoopMode(normalized)
+        except ValueError:
+            logger.warning(
+                "[cuelist] Unknown loop mode '%s'; defaulting to 'once'",
+                normalized,
+            )
+            return CuelistLoopMode.ONCE
+
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> Cuelist:
         """Deserialize from dict."""
@@ -177,7 +213,7 @@ class Cuelist:
             version=data.get("version", "1.0"),
             author=data.get("author", ""),
             cues=[Cue.from_dict(cue_data) for cue_data in data.get("cues", [])],
-            loop_mode=CuelistLoopMode(data.get("loop_mode", "once")),
+            loop_mode=cls._normalize_loop_mode(data.get("loop_mode", "once")),
             transition_mode=CuelistTransitionMode(data.get("transition_mode", "snap")),
             transition_duration_ms=data.get("transition_duration_ms", 2000.0),
             metadata=data.get("metadata", {})

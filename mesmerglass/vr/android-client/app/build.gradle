@@ -1,18 +1,27 @@
+import java.util.Properties
+import java.io.FileInputStream
+
 plugins {
     id 'com.android.application'
     id 'kotlin-android'
 }
 
+def keystorePropertiesFile = rootProject.file("keystore.properties")
+def keystoreProperties = new Properties()
+if (keystorePropertiesFile.exists()) {
+    keystoreProperties.load(new FileInputStream(keystorePropertiesFile))
+}
+
 android {
     namespace 'com.hypnotic.vrreceiver'
-    compileSdk 33
+    compileSdk 34
     
     ndkVersion "25.1.8937393"
 
     defaultConfig {
         applicationId "com.hypnotic.vrreceiver"
         minSdk 21  // Android 5.0 (Oculus Go minimum)
-        targetSdk 29  // Oculus Go optimal target
+        targetSdk 34  // Required for current Play Store policies
         versionCode 1
         versionName "1.0"
 
@@ -21,10 +30,24 @@ android {
         }
     }
 
+    signingConfigs {
+        release {
+            if (keystorePropertiesFile.exists()) {
+                storeFile file(keystoreProperties['storeFile'])
+                storePassword keystoreProperties['storePassword']
+                keyAlias keystoreProperties['keyAlias']
+                keyPassword keystoreProperties['keyPassword']
+            }
+        }
+    }
+
     buildTypes {
         release {
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            if (keystorePropertiesFile.exists()) {
+                signingConfig signingConfigs.release
+            }
         }
         debug {
             debuggable true

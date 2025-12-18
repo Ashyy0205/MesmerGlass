@@ -117,14 +117,14 @@ If you need to rebuild the APK:
 1. Open Android Studio
 2. Open project: `mesmerglass/vr/android-client/`
 3. Build → Build Bundle(s) / APK(s) → Build APK(s)
-4. APK location: `app/build/outputs/apk/debug/app-debug.apk`
-5. Copy to this folder and rename to `MesmerGlass-VR-Client.apk`
+4. APK location (release build): `app/build/outputs/apk/release/app-release-unsigned.apk`
+5. Copy to this folder and rename to `MesmerVisor.apk`
 
 Or via command line:
 ```bash
 cd mesmerglass/vr/android-client
-./gradlew assembleDebug
-cp app/build/outputs/apk/debug/app-debug.apk ../../../MEDIA/vr-client/MesmerGlass-VR-Client.apk
+./gradlew assembleRelease
+cp app/build/outputs/apk/release/app-release-unsigned.apk ../../../MEDIA/vr-client/MesmerVisor.apk
 ```
 
 ## Technical Details

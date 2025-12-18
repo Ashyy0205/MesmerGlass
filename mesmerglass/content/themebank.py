@@ -220,6 +220,10 @@ class ThemeBank:
         # Diagnostics
         self._last_image_path: Optional[str] = None
         self._last_video_path: Optional[str] = None
+
+        # Flag when any network-backed media directories are in use so
+        # callers can adjust readiness timeouts for slower scans.
+        self.network_sources_detected: bool = False
         
         # Preload images for theme paths
         self._preload_theme_images()

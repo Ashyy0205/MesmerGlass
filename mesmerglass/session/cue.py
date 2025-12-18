@@ -307,6 +307,8 @@ class Cue:
     text_messages: Optional[List[str]] = None
     vibrate_on_text_cycle: bool = False
     vibration_intensity: float = 0.5  # 0.0 to 1.0
+    enable_video_audio: bool = False
+    video_audio_volume: float = 1.0
     
     def validate(self) -> tuple[bool, str]:
         """
@@ -362,6 +364,12 @@ class Cue:
             role_counts[role] = role_counts.get(role, 0) + 1
             if role != AudioRole.GENERIC and role_counts[role] > 1:
                 return False, f"Only one '{role.value}' track allowed per cue"
+
+        if not isinstance(self.enable_video_audio, bool):
+            return False, f"enable_video_audio must be a boolean, got {type(self.enable_video_audio)}"
+
+        if not (0.0 <= float(self.video_audio_volume) <= 1.0):
+            return False, f"video_audio_volume must be 0.0-1.0, got {self.video_audio_volume}"
         
         return True, ""
     
@@ -400,6 +408,13 @@ class Cue:
         
         if self.vibration_intensity != 0.5:  # Only save if non-default
             data["vibration_intensity"] = self.vibration_intensity
+
+        # Video audio settings (only persist when non-default)
+        if self.enable_video_audio or not (0.99 <= self.video_audio_volume <= 1.01):
+            data["video_audio"] = {
+                "enabled": bool(self.enable_video_audio),
+                "volume": float(self.video_audio_volume),
+            }
         
         return data
     
@@ -449,6 +464,23 @@ class Cue:
                     legacy_tracks[1].role = AudioRole.BACKGROUND
             tracks = legacy_tracks
 
+        video_audio_block = data.get("video_audio", {})
+        enable_video_audio = bool(
+            video_audio_block.get(
+                "enabled",
+                data.get("enable_video_audio", data.get("video_audio_enabled", False)),
+            )
+        )
+        volume_raw = video_audio_block.get(
+            "volume",
+            data.get("video_audio_volume", 1.0),
+        )
+        try:
+            video_audio_volume = float(volume_raw)
+        except (TypeError, ValueError):
+            video_audio_volume = 1.0
+        video_audio_volume = max(0.0, min(1.0, video_audio_volume))
+
         return cls(
             name=data["name"],
             duration_seconds=duration,
@@ -463,7 +495,9 @@ class Cue:
             audio_tracks=tracks,
             text_messages=data.get("text_messages"),
             vibrate_on_text_cycle=data.get("vibrate_on_text_cycle", False),
-            vibration_intensity=data.get("vibration_intensity", 0.5)
+            vibration_intensity=data.get("vibration_intensity", 0.5),
+            enable_video_audio=enable_video_audio,
+            video_audio_volume=video_audio_volume,
         )
 
     # Convenience helpers -------------------------------------------------

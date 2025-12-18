@@ -21,6 +21,8 @@ from .gpu_utils import EncoderType, select_encoder
 
 logger = logging.getLogger(__name__)
 
+_WIN_ABORT_ERRNOS = {995, 10038}
+
 
 class DiscoveryService:
     """UDP discovery service for automatic VR headset detection"""
@@ -257,12 +259,15 @@ class VRStreamingServer:
         self.server_socket: Optional[socket.socket] = None
         self.discovery_service: Optional[DiscoveryService] = None
         self.clients = []
+        self._client_tasks: set[asyncio.Task] = set()
         self.running = False
         
         # Frame timing
         self.frame_delay = 1.0 / fps
         self.frames_sent = 0
         self.start_time = time.time()
+        self._last_callback_warn = 0.0
+        self._callback_warn_count = 0
         
         # Performance tracking
         self.total_bytes_sent = 0
@@ -291,6 +296,16 @@ class VRStreamingServer:
             """Run async server in background thread"""
             self._server_loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self._server_loop)
+
+            def _loop_exception_handler(loop, context):
+                exc = context.get("exception")
+                err = getattr(exc, "winerror", getattr(exc, "errno", None)) if exc else None
+                if isinstance(exc, OSError) and err in _WIN_ABORT_ERRNOS:
+                    logger.info("VR streaming server ignored WinError %s during shutdown", err)
+                    return
+                asyncio.default_exception_handler(context)
+
+            self._server_loop.set_exception_handler(_loop_exception_handler)
             try:
                 self._server_loop.run_until_complete(self.start())
             except Exception as e:
@@ -379,7 +394,15 @@ class VRStreamingServer:
                 else:
                     frame = self.frame_callback()
                     if frame is None:
-                        logger.warning("Frame callback returned None")
+                        self._callback_warn_count += 1
+                        now = time.time()
+                        if now - self._last_callback_warn >= 1.0:
+                            if self._callback_warn_count > 5:
+                                logger.warning("Frame callback returned None x%d (last %.1fs)", self._callback_warn_count, now - self._last_callback_warn)
+                            else:
+                                logger.warning("Frame callback returned None")
+                            self._last_callback_warn = now
+                            self._callback_warn_count = 0
                         await asyncio.sleep(0.1)
                         continue
                 
@@ -523,8 +546,14 @@ class VRStreamingServer:
         
         try:
             while self.running:
-                # Accept new connections
-                client_socket, address = await loop.sock_accept(self.server_socket)
+                try:
+                    client_socket, address = await loop.sock_accept(self.server_socket)
+                except OSError as exc:
+                    err = getattr(exc, "winerror", exc.errno)
+                    if err in _WIN_ABORT_ERRNOS:
+                        logger.info("VR streaming server accept loop aborted during shutdown")
+                        break
+                    raise
                 
                 # Disable blocking
                 client_socket.setblocking(False)
@@ -532,8 +561,10 @@ class VRStreamingServer:
                 # Add to clients list
                 self.clients.append(client_socket)
                 
-                # Handle client in separate task
-                asyncio.create_task(self.handle_client(client_socket, address))
+                # Handle client in separate task and track it for clean shutdown
+                task = asyncio.create_task(self.handle_client(client_socket, address))
+                self._client_tasks.add(task)
+                task.add_done_callback(lambda t: self._client_tasks.discard(t))
         
         except KeyboardInterrupt:
             logger.info("\nShutting down server...")
@@ -554,12 +585,24 @@ class VRStreamingServer:
         for client in self.clients:
             try:
                 client.close()
-            except:
+            except Exception:
                 pass
+        self.clients.clear()
+        
+        # Cancel outstanding client tasks
+        if self._client_tasks:
+            for task in list(self._client_tasks):
+                task.cancel()
+            await asyncio.gather(*self._client_tasks, return_exceptions=True)
+            self._client_tasks.clear()
         
         # Close server socket
         if self.server_socket:
-            self.server_socket.close()
+            try:
+                self.server_socket.close()
+            except Exception:
+                pass
+            self.server_socket = None
         
         # Close encoder
         if self.encoder:

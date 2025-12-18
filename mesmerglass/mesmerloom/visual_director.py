@@ -16,6 +16,7 @@ from time import perf_counter
 from contextlib import contextmanager
 
 from ..logging_utils import BurstSampler
+from ..engine.video_audio import VideoAudioPlayer
 
 if TYPE_CHECKING:
     from ..content.themebank import ThemeBank
@@ -73,11 +74,19 @@ class VisualDirector:
         
         # Current cue settings (for vibration on text cycle)
         self._current_cue_settings: Optional[dict] = None
+        self._video_audio_player: Optional[VideoAudioPlayer] = None
+        self._video_audio_enabled: bool = False
+        self._video_audio_volume: float = 1.0
+        self._active_video_audio_path: Optional[str] = None
+        self._last_video_path: Optional[Path] = None
+        self._video_audio_disabled_notice_sent = False
         
         self.logger = logging.getLogger(__name__)
         self._image_upload_sampler = BurstSampler(interval_s=2.0)
         self._image_upload_counts = {"success": 0, "retry": 0}
         self._last_uploaded_image_path: Optional[str] = None
+
+        self._initialize_video_audio_player()
         self._image_retry_pending = 0
         self._last_image_still_loading = False
         self._image_retry_sampler = BurstSampler(interval_s=5.0)
@@ -163,14 +172,16 @@ class VisualDirector:
         try:
             yield
         finally:
-            self._record_perf_event(label, perf_counter() - start, warn_ms, info_ms)
+            duration = perf_counter() - start
+            self._record_perf_event(label, duration, warn_ms, info_ms)
 
     def _emit_image_upload_stats(self) -> None:
-        """Summarize recent image uploads to avoid per-call INFO noise."""
+        """Summarize recent image uploads and reset counters."""
 
         success = self._image_upload_counts.get("success", 0)
         if success <= 0:
             return
+
         retries = self._image_upload_counts.get("retry", 0)
         self.logger.info(
             "[visual] Applied %d images (pending retries=%d)",
@@ -213,6 +224,42 @@ class VisualDirector:
             "compositor_ready": self.compositor is not None,
             "secondary_count": len(self._secondary_compositors),
         }
+
+    def _initialize_video_audio_player(self) -> None:
+        self._video_audio_player = None
+        if not self._video_audio_disabled_notice_sent:
+            self.logger.info("[visual] Video audio playback disabled")
+            self._video_audio_disabled_notice_sent = True
+
+    def _apply_video_audio_settings(self, cue_data: dict) -> None:
+        self._video_audio_enabled = False
+        self._video_audio_volume = 1.0
+        self._stop_video_audio(fade_ms=200)
+
+    def _start_video_audio(self, video_path: Path) -> None:
+        player = self._video_audio_player
+        if player is None or not self._video_audio_enabled:
+            return
+
+        started = player.play(video_path, volume=self._video_audio_volume, loop=True)
+        if started:
+            self._active_video_audio_path = str(video_path)
+            self.logger.debug("[visual] Video audio started: %s", video_path.name)
+        else:
+            self._active_video_audio_path = None
+            self.logger.warning("[visual] Failed to start video audio for %s", video_path.name)
+
+    def _stop_video_audio(self, *, fade_ms: int = 0) -> None:
+        player = self._video_audio_player
+        self._active_video_audio_path = None
+        if player is None:
+            return
+        player.stop(fade_ms=fade_ms)
+
+    def stop_video_audio(self, *, fade_ms: int = 0) -> None:
+        """Public API to stop video audio playback."""
+        self._video_audio_enabled = False
+        self._stop_video_audio(fade_ms=fade_ms)
     
     # ===== Visual Selection =====
     
@@ -468,19 +515,22 @@ class VisualDirector:
                                 )
                                 self._video_first_upload_logged = True
 
-                            # Upload video frame as background
-                            # This will overwrite any static image background
-                            # Use current background zoom (respects zoom animation state)
-                            current_zoom = getattr(self.compositor, '_background_zoom', 1.0)
+                            # Upload video frame as background on all compositors.
+                            # This will overwrite any static image background.
                             is_first_frame = self._video_first_frame
-                            frame_zoom = 1.0 if is_first_frame else current_zoom
-                            self.compositor.set_background_video_frame(
-                                frame.data,
-                                width=frame.width,
-                                height=frame.height,
-                                zoom=frame_zoom,
-                                new_video=is_first_frame  # Trigger fade on first frame
-                            )
+                            for comp in self._get_all_compositors():
+                                try:
+                                    current_zoom = getattr(comp, '_background_zoom', 1.0)
+                                    frame_zoom = 1.0 if is_first_frame else current_zoom
+                                    comp.set_background_video_frame(
+                                        frame.data,
+                                        width=frame.width,
+                                        height=frame.height,
+                                        zoom=frame_zoom,
+                                        new_video=is_first_frame,  # Trigger fade on first frame
+                                    )
+                                except Exception as exc:
+                                    self.logger.debug("[visual.video] Failed to upload frame to compositor: %s", exc)
 
                             # Restart zoom only once the new video frame is actually visible to avoid pre-cycle stalls
                             if is_first_frame:
@@ -587,10 +637,15 @@ class VisualDirector:
             cue_data: Dictionary containing cue settings (vibrate_on_text_cycle, vibration_intensity, etc.)
         """
         self._current_cue_settings = cue_data
-        if cue_data:
-            vibrate = cue_data.get('vibrate_on_text_cycle', False)
-            intensity = cue_data.get('vibration_intensity', 0.5)
-            self.logger.debug(f"[visual] Cue settings updated: vibrate={vibrate}, intensity={intensity:.0%}")
+        if not cue_data:
+            self._video_audio_enabled = False
+            self._stop_video_audio(fade_ms=200)
+            return
+
+        vibrate = cue_data.get('vibrate_on_text_cycle', False)
+        intensity = cue_data.get('vibration_intensity', 0.5)
+        self.logger.debug(f"[visual] Cue settings updated: vibrate={vibrate}, intensity={intensity:.0%}")
+        self._apply_video_audio_settings(cue_data)
     
     def register_cycle_callback(self, callback: Callable[[], None]) -> None:
         """Register callback to fire when a media cycle completes.
@@ -1142,6 +1197,12 @@ class VisualDirector:
                         self.logger.warning(f"[visual] Video index {selection} out of range")
                         return
 
+                if not isinstance(path, Path):
+                    path = Path(path)
+
+                self._stop_video_audio(fade_ms=150)
+                self._last_video_path = path
+
                 success = self.video_streamer.load_video(path)
                     
                 if success:
@@ -1159,8 +1220,13 @@ class VisualDirector:
                     if self.current_visual and hasattr(self.current_visual, '_cycle_marker'):
                         self.current_visual._cycle_marker += 1
                         self.logger.debug(f"[visual] Cycle marker incremented (video): {self.current_visual._cycle_marker}")
+
+                    if self._video_audio_enabled:
+                        self._start_video_audio(path)
                 else:
                     self.logger.warning(f"[visual] Failed to load video: {path.name}")
+                    self._last_video_path = None
+                    self._active_video_audio_path = None
                 
             except Exception as e:
                 self.logger.error(f"Failed to change video: {e}", exc_info=True)

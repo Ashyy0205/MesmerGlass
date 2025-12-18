@@ -17,7 +17,9 @@ from PyQt6.QtWidgets import (
     QListWidget, QListWidgetItem, QSplitter, QWidget, QFileDialog,
     QMessageBox, QInputDialog
 )
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QRect
+from PyQt6.QtGui import QImage, QPixmap
+import time
 
 from .base_tab import BaseTab
 from ..session_runner_tab import SessionRunnerTab
@@ -31,6 +33,11 @@ class HomeTab(BaseTab):
         super().__init__(parent)
         self.logger = logging.getLogger(__name__)
         self.session_data: Optional[Dict[str, Any]] = None
+        self._preview_compositor = None
+        self._preview_registered = False
+        self._preview_sync_connected = False
+        self._preview_frame_connected = False
+        self._preview_last_frame_t = 0.0
         self._setup_ui()
     
     def set_session_data(self, session_data: Dict[str, Any]):
@@ -215,23 +222,119 @@ class HomeTab(BaseTab):
         """Create live preview section."""
         group = QGroupBox("🎥 Live Preview")
         layout = QVBoxLayout(group)
-        
-        # Placeholder for LoomCompositor preview
-        # TODO: Embed OpenGL widget from compositor
-        self.preview_label = QLabel("Live preview coming soon...\n\n"
-                                    "This will show the current spiral/media\n"
-                                    "rendering in real-time.")
-        self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.preview_label.setStyleSheet(
-            "background-color: #1e1e1e; "
-            "border: 2px dashed #555; "
-            "color: #888; "
-            "padding: 40px; "
-            "font-style: italic;"
-        )
-        layout.addWidget(self.preview_label, 1)
+
+        # Mirror the actual output via framebuffer capture (avoids GL-widget corruption).
+        self._preview_image_label = QLabel()
+        self._preview_image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._preview_image_label.setStyleSheet("background-color: #000; color: #bbb;")
+        self._preview_image_label.setText("Preview waiting for output…\n\nStart a session to activate rendering.")
+        self._preview_image_label.setMinimumHeight(120)
+
+        self._preview_aspect = _AspectRatioContainer(16, 9, parent=group)
+        self._preview_aspect.set_child(self._preview_image_label)
+        layout.addWidget(self._preview_aspect, 1)
         
         return group
+
+    def _register_preview_compositor(self) -> None:
+        if self._preview_registered:
+            return
+        self._preview_registered = True
+
+        primary = getattr(self.main_window, "compositor", None)
+        if primary is None:
+            return
+
+        # If the compositor is inactive (common when no session is running), we won't
+        # receive frames yet. Show a friendly placeholder rather than a black box.
+        try:
+            is_active = bool(getattr(primary, "_active", False))
+        except Exception:
+            is_active = False
+        if not is_active and hasattr(self, "_preview_image_label"):
+            self._preview_image_label.setText("Preview waiting for output…\n\nStart a session to activate rendering.")
+
+        if hasattr(primary, "set_preview_capture_enabled"):
+            try:
+                primary.set_preview_capture_enabled(True, max_fps=15)
+            except Exception:
+                pass
+        elif hasattr(primary, "set_capture_enabled"):
+            try:
+                primary.set_capture_enabled(True, max_fps=15)
+            except Exception:
+                pass
+
+        if not self._preview_frame_connected and hasattr(primary, "frame_ready"):
+            try:
+                primary.frame_ready.connect(self._on_preview_frame)
+                self._preview_frame_connected = True
+            except Exception:
+                pass
+
+    def _unregister_preview_compositor(self) -> None:
+        if not self._preview_registered:
+            return
+
+        primary = getattr(self.main_window, "compositor", None)
+        if primary is not None:
+            if self._preview_frame_connected and hasattr(primary, "frame_ready"):
+                try:
+                    primary.frame_ready.disconnect(self._on_preview_frame)
+                except Exception:
+                    pass
+                self._preview_frame_connected = False
+
+            if hasattr(primary, "set_preview_capture_enabled"):
+                try:
+                    primary.set_preview_capture_enabled(False)
+                except Exception:
+                    pass
+            # Intentionally do NOT call set_capture_enabled(False) as a fallback,
+            # because older implementations may share the VR capture flag.
+
+        self._preview_registered = False
+
+    def _on_preview_frame(self, frame) -> None:
+        # Throttle UI updates (even if capture emits faster)
+        now = time.time()
+        if (now - self._preview_last_frame_t) < (1.0 / 15.0):
+            return
+        self._preview_last_frame_t = now
+
+        try:
+            if frame is None:
+                return
+            # Defensive: ignore empty frames
+            try:
+                if getattr(frame, "size", 0) == 0:
+                    return
+            except Exception:
+                pass
+
+            # Ensure contiguous memory for QImage.
+            try:
+                import numpy as np
+                if isinstance(frame, np.ndarray) and not frame.flags["C_CONTIGUOUS"]:
+                    frame = np.ascontiguousarray(frame)
+            except Exception:
+                pass
+            h, w, _c = frame.shape
+            img = QImage(frame.data, w, h, 3 * w, QImage.Format.Format_RGB888).copy()
+            pix = QPixmap.fromImage(img)
+            try:
+                self._preview_image_label.setText("")
+            except Exception:
+                pass
+            self._preview_image_label.setPixmap(
+                pix.scaled(
+                    self._preview_image_label.size(),
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+            )
+        except Exception:
+            return
     
     def _create_media_bank_section(self) -> QGroupBox:
         """Create media bank shortcuts section."""
@@ -474,7 +577,51 @@ class HomeTab(BaseTab):
             self.session_runner_tab.audio_engine = self.audio_engine
         if self.compositor:
             self.session_runner_tab.compositor = self.compositor
+
+        self._register_preview_compositor()
     
     def on_hide(self):
         """Called when tab becomes hidden."""
         self.logger.debug("HomeTab hidden")
+
+        self._unregister_preview_compositor()
+
+
+class _AspectRatioContainer(QWidget):
+    """A simple letterboxing container that keeps its single child at a fixed aspect ratio."""
+
+    def __init__(self, aspect_w: int, aspect_h: int, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._aspect = float(aspect_w) / float(aspect_h)
+        self._child: QWidget | None = None
+
+    def set_child(self, child: QWidget) -> None:
+        self._child = child
+        child.setParent(self)
+        child.show()
+        self._layout_child()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._layout_child()
+
+    def _layout_child(self) -> None:
+        if self._child is None:
+            return
+
+        w = max(1, self.width())
+        h = max(1, self.height())
+        container_aspect = w / h
+
+        if container_aspect > self._aspect:
+            # Too wide -> pillarbox
+            target_h = h
+            target_w = int(round(target_h * self._aspect))
+        else:
+            # Too tall -> letterbox
+            target_w = w
+            target_h = int(round(target_w / self._aspect))
+
+        x = int((w - target_w) / 2)
+        y = int((h - target_h) / 2)
+        self._child.setGeometry(QRect(x, y, target_w, target_h))

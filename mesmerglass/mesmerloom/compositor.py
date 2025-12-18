@@ -87,102 +87,41 @@ class LoomCompositor(QOpenGLWidget):  # type: ignore[misc]
         if not sid:
             raise RuntimeError("glCreateShader returned 0 / None")
         sid = int(sid)
-        GL.glShaderSource(sid, src)
-        GL.glCompileShader(sid)
-        if not GL.glGetShaderiv(sid, GL.GL_COMPILE_STATUS):
-            log = GL.glGetShaderInfoLog(sid).decode("utf-8", "ignore")
-            raise RuntimeError(f"Shader compile failed: {log}")
-        return sid
-    def _build_program(self) -> int:
-        from OpenGL import GL
-        vs_src = self._load_text("fullscreen_quad.vert")
-        fs_src = self._load_text("spiral.frag")
-        vs = self._compile_shader(vs_src, GL.GL_VERTEX_SHADER)
-        fs = self._compile_shader(fs_src, GL.GL_FRAGMENT_SHADER)
-        prog = GL.glCreateProgram()
-        if not prog:
-            raise RuntimeError("glCreateProgram returned 0 / None")
-        prog = int(prog)
-        GL.glAttachShader(prog, vs); GL.glAttachShader(prog, fs); GL.glLinkProgram(prog)
-        if not GL.glGetProgramiv(prog, GL.GL_LINK_STATUS):
-            log = GL.glGetProgramInfoLog(prog).decode("utf-8", "ignore")
-            raise RuntimeError(f"Program link failed: {log}")
-        GL.glDeleteShader(vs); GL.glDeleteShader(fs)
-        return prog
-    def _setup_geometry(self) -> None:
-        from OpenGL import GL
-        import array, ctypes, logging
-        logging.getLogger(__name__).info("[spiral.trace] _setup_geometry called")
-        verts = array.array("f", [
-            -1.0, -1.0, 0.0, 0.0,
-             1.0, -1.0, 1.0, 0.0,
-             1.0,  1.0, 1.0, 1.0,
-            -1.0,  1.0, 0.0, 1.0,
-        ])
-        idx = array.array("I", [0, 1, 2, 2, 3, 0])
-        self._vao = GL.glGenVertexArrays(1)
-        self._vbo = GL.glGenBuffers(1)
-        self._ebo = GL.glGenBuffers(1)
-        GL.glBindVertexArray(self._vao)
-        GL.glBindBuffer(GL.GL_ARRAY_BUFFER, self._vbo)
-        GL.glBufferData(GL.GL_ARRAY_BUFFER, len(verts)*4, verts.tobytes(), GL.GL_STATIC_DRAW)
-        GL.glBindBuffer(GL.GL_ELEMENT_ARRAY_BUFFER, self._ebo)
-        GL.glBufferData(GL.GL_ELEMENT_ARRAY_BUFFER, len(idx)*4, idx.tobytes(), GL.GL_STATIC_DRAW)
-        stride = 4*4
-        GL.glEnableVertexAttribArray(0); GL.glVertexAttribPointer(0, 2, GL.GL_FLOAT, False, stride, ctypes.c_void_p(0))
-        GL.glEnableVertexAttribArray(1); GL.glVertexAttribPointer(1, 2, GL.GL_FLOAT, False, stride, ctypes.c_void_p(8))
-        GL.glBindVertexArray(0)
-        
-    def _setup_offscreen_fbo(self):
-        """Setup offscreen RGBA16F FBO for isolation testing"""
-        from OpenGL import GL
-        
-        # Create texture
-        self.offscreen_texture = GL.glGenTextures(1)
-        GL.glBindTexture(GL.GL_TEXTURE_2D, self.offscreen_texture)
-        GL.glTexImage2D(GL.GL_TEXTURE_2D, 0, GL.GL_RGBA16F, 
-                       self.offscreen_width, self.offscreen_height, 0,
-                       GL.GL_RGBA, GL.GL_FLOAT, None)
-        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MIN_FILTER, GL.GL_LINEAR)
-        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MAG_FILTER, GL.GL_LINEAR)
-        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_S, GL.GL_CLAMP_TO_EDGE)
-        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_T, GL.GL_CLAMP_TO_EDGE)
-        
-        # Create FBO
-        self.offscreen_fbo = GL.glGenFramebuffers(1)
-        GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, self.offscreen_fbo)
-        GL.glFramebufferTexture2D(GL.GL_FRAMEBUFFER, GL.GL_COLOR_ATTACHMENT0, 
-                                 GL.GL_TEXTURE_2D, self.offscreen_texture, 0)
-        
-        # Check FBO completeness
-        status = GL.glCheckFramebufferStatus(GL.GL_FRAMEBUFFER)
-        if status != GL.GL_FRAMEBUFFER_COMPLETE:
-            logging.getLogger(__name__).error(f"[spiral.trace] Offscreen FBO incomplete: {status}")
-        else:
-            logging.getLogger(__name__).info("[spiral.trace] Offscreen RGBA16F FBO created successfully")
-        
-        # Restore default framebuffer
-        GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, 0)
-        GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
-        
-    def _render_offscreen_png(self):
-        """Render to offscreen FBO and save PNG for isolation testing"""
-        from OpenGL import GL
-        import numpy as np
-        from PIL import Image
-        
-        if not self.offscreen_fbo:
-            return
-            
-        # Render to offscreen FBO
-        GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, self.offscreen_fbo)
-        GL.glViewport(0, 0, self.offscreen_width, self.offscreen_height)
-        
-        # Clear
-        GL.glClearColor(0.2, 0.2, 0.2, 1.0)
-        GL.glClear(GL.GL_COLOR_BUFFER_BIT)
-        
-        # Disable blending for pure shader output
+        def _build_background_program(self) -> int:
+            """Build simple shader program for background image rendering."""
+            from OpenGL import GL
+
+            version = GL.glGetString(GL.GL_VERSION)
+            version_str = version.decode('ascii', 'ignore') if version else ''
+            is_gles = 'OpenGL ES' in version_str
+
+            if is_gles:
+                vs_header = '#version 300 es\nprecision mediump float;\n'
+                fs_header = '#version 300 es\nprecision mediump float;\n'
+            else:
+                vs_header = '#version 330 core\n'
+                fs_header = '#version 330 core\n'
+
+            varying_decl_vs = 'out vec2 vTexCoord;'
+            varying_decl_fs = 'in vec2 vTexCoord;'
+            frag_out_decl = 'out vec4 FragColor;'
+
+            vs_src = f"""{vs_header}
+    layout(location = 0) in vec2 aPos;
+    layout(location = 1) in vec2 aTexCoord;
+
+    {varying_decl_vs}
+
+    void main() {{
+        gl_Position = vec4(aPos, 0.0, 1.0);
+        vTexCoord = vec2(aTexCoord.x, 1.0 - aTexCoord.y);
+    }}
+    """
+
+            fs_src = f"""{fs_header}
+    {varying_decl_fs}
+    {frag_out_decl}
+
         GL.glDisable(GL.GL_BLEND)
         
         # Set uniforms for test
@@ -190,6 +129,37 @@ class LoomCompositor(QOpenGLWidget):  # type: ignore[misc]
             GL.glUseProgram(self._program)
             # Use current director parameters
             uniforms = self.director.export_uniforms()
+
+    void main() {{
+        float windowAspect = uResolution.x / uResolution.y;
+        float imageAspect = uImageSize.x / uImageSize.y;
+        vec2 uv = vTexCoord;
+        if (imageAspect > windowAspect) {{
+            float scale = windowAspect / imageAspect;
+            uv.y = (uv.y - 0.5) / scale + 0.5;
+        }} else {{
+            float scale = imageAspect / windowAspect;
+            uv.x = (uv.x - 0.5) / scale + 0.5;
+        }}
+        uv += uOffset;
+        vec2 center = vec2(0.5, 0.5);
+        uv = center + (uv - center) / max(uZoom, 0.001);
+        uv = fract(uv);
+        if (uKaleidoscope == 1) {{
+            vec2 quadrant = floor(uv * 2.0);
+            vec2 tileUV = fract(uv * 2.0);
+            if (mod(quadrant.x, 2.0) == 1.0) {{ tileUV.x = 1.0 - tileUV.x; }}
+            if (mod(quadrant.y, 2.0) == 1.0) {{ tileUV.y = 1.0 - tileUV.y; }}
+            uv = tileUV;
+        }}
+        vec4 color = texture(uTexture, uv);
+        color.a = uOpacity;
+        FragColor = color;
+    }}
+    """
+
+            vs = self._compile_shader(vs_src, GL.GL_VERTEX_SHADER)
+            fs = self._compile_shader(fs_src, GL.GL_FRAGMENT_SHADER)
             time_val = (time.time() - self._t0) * 0.5
             
             # Set standard uniforms
@@ -277,6 +247,7 @@ class LoomCompositor(QOpenGLWidget):  # type: ignore[misc]
         self._active = False
         self._window_opacity = 1.0  # Window-level opacity control (separate from spiral opacity)
         self._virtual_screen_size = None  # Optional override for preview-to-live scaling
+        self._force_opaque_output = False
         
         # Background image support
         self._background_texture = None  # OpenGL texture ID for background image
@@ -377,7 +348,7 @@ class LoomCompositor(QOpenGLWidget):  # type: ignore[misc]
                 if not getattr(self, "_timer", None):
                     self._start_timer()
         try:
-            self.setAttribute(getattr(type(self), 'WA_TransparentForMouseEvents'))
+            self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         except Exception as e:
             logging.getLogger(__name__).warning(f"[spiral.trace] LoomCompositor.__init__ setAttribute failed: {e}")
     @staticmethod
@@ -676,7 +647,7 @@ class LoomCompositor(QOpenGLWidget):  # type: ignore[misc]
         
         This allows tests to proceed (exercising wiring & phase evolution) even on
         environments that reject the main GLSL 330 core shaders. Uses GLSL 130
-        (widely available on older drivers) and omits all spiral uniforms – it
+        (widely available on older drivers) and omits all spiral uniforms - it
         just fills with a solid gray that modulates slightly with time.
         Returns program id or None on failure.
         """
@@ -718,6 +689,26 @@ class LoomCompositor(QOpenGLWidget):  # type: ignore[misc]
         """Set global text opacity (0.0 to 1.0). Affects all text elements."""
         self._text_opacity = max(0.0, min(1.0, f))
         logging.getLogger(__name__).info(f"[Text] Global text opacity set to {self._text_opacity:.2f}")
+
+    def set_force_opaque_output(self, enabled: bool) -> None:
+        """Force fully opaque output for embedded previews.
+
+        The main overlay compositor is designed to be per-pixel transparent.
+        When embedded in the GUI (Home preview), transparency causes the GUI to
+        show through. This flag forces the framebuffer alpha to remain 1.0.
+        """
+        self._force_opaque_output = bool(enabled)
+        try:
+            if self._force_opaque_output:
+                self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
+            else:
+                self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, False)
+        except Exception:
+            pass
+        try:
+            self.update()
+        except Exception:
+            pass
     def get_text_opacity(self) -> float:
         """Get current global text opacity."""
         return getattr(self, '_text_opacity', 1.0)
@@ -1055,8 +1046,10 @@ class LoomCompositor(QOpenGLWidget):  # type: ignore[misc]
         # Ensure consistent multisampling behavior
         GL.glEnable(GL.GL_MULTISAMPLE)
         
-        # Clear the framebuffer
-        GL.glClearColor(0.0, 0.0, 0.0, 0.0)  # Transparent black
+        # Clear the framebuffer.
+        # For embedded previews we force alpha=1 to avoid Qt compositing the GUI behind us.
+        clear_alpha = 1.0 if getattr(self, "_force_opaque_output", False) else 0.0
+        GL.glClearColor(0.0, 0.0, 0.0, clear_alpha)
         GL.glClear(GL.GL_COLOR_BUFFER_BIT)
         
         # Debug GL state if requested via CLI (only on first frame)

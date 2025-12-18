@@ -34,11 +34,11 @@
 2. **Create and activate virtual environment:**
    ```bash
    python -m venv .venv
-   
+
    # Windows
    .\.venv\Scripts\activate
-   
-   # macOS/Linux  
+
+   # macOS/Linux
    source .venv/bin/activate
    ```
 
@@ -52,6 +52,21 @@
    python -m mesmerglass run
    ```
    Legacy: `python run.py` still works (deprecated; see docs/migration/run-py-deprecation.md).
+
+## 🪟 Building a standalone Windows executable
+
+You can bundle MesmerGlass (including Python and dependencies) into a portable folder using PyInstaller:
+
+1. Ensure your virtual environment is active and install the build dependency:
+   ```powershell
+   pip install pyinstaller
+   ```
+2. Run the helper script:
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File scripts/build_windows_exe.ps1 -Version 1.0.0
+   ```
+
+This creates `dist\MesmerGlass\MesmerGlass.exe` with the `mesmerglass_aperture_solar.ico` icon. Copy that folder to any Windows PC and run the `.exe` directly—no Python runtime required.
 
 ## 🎮 Device Control with MesmerIntiface
 

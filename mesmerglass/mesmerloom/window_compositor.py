@@ -44,6 +44,8 @@ class LoomWindowCompositor(QOpenGLWindow):
     """
     # Emit after a frame is drawn so duplicate/mirror windows can update
     frame_drawn = pyqtSignal()
+    # Emit captured RGB frames when VR streaming capture is enabled
+    frame_ready = pyqtSignal(object)
 
     def __init__(self, director, text_director=None, is_primary=True, parent=None):
         super().__init__(parent)
@@ -130,6 +132,12 @@ class LoomWindowCompositor(QOpenGLWindow):
         self._last_screen_geometry: Optional[tuple[int, int, int, int]] = None
         self._last_native_geometry: Optional[tuple[int, int, int, int]] = None
         self._last_physical_size: Optional[tuple[int, int]] = None
+        # Frame capture flags. VR and Home preview are independent.
+        self._vr_capture_enabled = False  # flipped on when VR streaming attaches
+        self._preview_capture_enabled = False  # flipped on when Home preview is visible
+        # Capture throttling (used by both GUI preview and VR streaming).
+        self._capture_interval_s = 1.0 / 15.0
+        self._capture_last_t = 0.0
 
         # Animation timer
         self.timer = QTimer()
@@ -901,13 +909,20 @@ class LoomWindowCompositor(QOpenGLWindow):
             except Exception:
                 pass
 
-        # Capture frame for VR streaming BEFORE swapping buffers (GL context is current here)
+        # Capture frame for VR streaming / GUI preview BEFORE swapping buffers (GL context is current here)
         try:
-            if hasattr(self, '_vr_capture_enabled') and self._vr_capture_enabled:
+            if getattr(self, '_vr_capture_enabled', False) or getattr(self, '_preview_capture_enabled', False):
+                now = time.time()
+                interval = getattr(self, '_capture_interval_s', 0.0)
+                if interval > 0.0 and (now - getattr(self, '_capture_last_t', 0.0)) < interval:
+                    raise RuntimeError("capture throttled")
+                self._capture_last_t = now
                 # Read pixels from current framebuffer
                 pixels = GL.glReadPixels(0, 0, w_px, h_px, GL.GL_RGB, GL.GL_UNSIGNED_BYTE)
                 frame = np.frombuffer(pixels, dtype=np.uint8).reshape(h_px, w_px, 3)
-                frame = np.flipud(frame)  # Flip vertically (GL origin is bottom-left)
+                # Flip vertically (GL origin is bottom-left) and force contiguous memory.
+                # A non-contiguous view (negative strides) can render as black/garbage in QImage.
+                frame = np.flipud(frame).copy()
                 # Emit frame data to VR streaming handler
                 self.frame_ready.emit(frame)
         except Exception as e:
@@ -959,6 +974,29 @@ class LoomWindowCompositor(QOpenGLWindow):
         self._active = active
         if self._trace:
             logger.info(f"[spiral.trace] LoomWindowCompositor.set_active: {active}")
+
+    def _set_capture_interval(self, max_fps: int) -> None:
+        try:
+            fps = int(max_fps)
+        except Exception:
+            fps = 15
+        fps = max(1, min(60, fps))
+        self._capture_interval_s = 1.0 / float(fps)
+        self._capture_last_t = 0.0
+
+    def set_preview_capture_enabled(self, enabled: bool, max_fps: int = 15) -> None:
+        """Enable capture for the Home tab preview (independent of VR streaming)."""
+        self._set_capture_interval(max_fps)
+        self._preview_capture_enabled = bool(enabled)
+
+    def set_vr_capture_enabled(self, enabled: bool, max_fps: int = 30) -> None:
+        """Enable capture for VR streaming (independent of Home preview)."""
+        self._set_capture_interval(max_fps)
+        self._vr_capture_enabled = bool(enabled)
+
+    def set_capture_enabled(self, enabled: bool, max_fps: int = 15) -> None:
+        """Backward compatible alias: controls Home preview capture."""
+        self.set_preview_capture_enabled(enabled, max_fps=max_fps)
     
     def set_intensity(self, intensity: float):
         """Set spiral intensity"""
@@ -1346,16 +1384,33 @@ class LoomWindowCompositor(QOpenGLWindow):
 
             previous_ctx = QOpenGLContext.currentContext()
             previous_surface = previous_ctx.surface() if previous_ctx else None
-            try:
-                self.makeCurrent()
-            except Exception as exc:
-                logger.warning("[video.upload] makeCurrent failed: %s", exc)
-                return
 
             if new_video:
                 self._pending_video_upload_log = True
 
             try:
+                if not self.isExposed():
+                    logger.debug("[video.upload] Skipping frame upload; window not exposed")
+                    return
+
+                if not self.isVisible():
+                    logger.debug("[video.upload] Skipping frame upload; window not visible")
+                    return
+
+                if not int(self.winId()):
+                    logger.debug("[video.upload] Skipping frame upload; winId not ready")
+                    return
+
+                ctx = self.context()
+                surface = ctx.surface() if ctx else None
+                if ctx is None or surface is None:
+                    logger.debug("[video.upload] Skipping frame upload; GL context missing")
+                    return
+
+                if not ctx.makeCurrent(surface):
+                    logger.warning("[video.upload] Failed to make GL context current; dropping frame")
+                    return
+
                 if new_video or (self.frame_count % 180 == 0):
                     logger.debug(
                         "[video.upload] frame=%dx%d zoom=%.2f new_video=%s background_enabled=%s",
@@ -1378,6 +1433,12 @@ class LoomWindowCompositor(QOpenGLWindow):
                 if frame_data.dtype != np.uint8:
                     logger.error(f"frame_data dtype mismatch: expected uint8, got {frame_data.dtype}")
                     return
+
+                if not frame_data.flags.c_contiguous:
+                    if not getattr(self, "_video_upload_copy_warned", False):
+                        logger.warning("[video.upload] frame_data not contiguous; copying buffer for GL upload")
+                        self._video_upload_copy_warned = True
+                    frame_data = np.ascontiguousarray(frame_data)
                 
                 # DOUBLE FLIP (matches LoomCompositor line 1276):
                 # 1. Flip data here: top-left -> bottom-left  
@@ -1424,53 +1485,59 @@ class LoomWindowCompositor(QOpenGLWindow):
                 
                 upload_mode = "reuse"
                 upload_start = time.perf_counter()
-                if needs_new_texture:
-                    # Delete old texture if it exists and is NOT currently queued for fade
-                    if (
-                        self._background_texture is not None
-                        and GL.glIsTexture(self._background_texture)
-                        and not old_texture_enqueued_for_fade
-                    ):
-                        GL.glDeleteTextures([self._background_texture])
-                    
-                    # Generate new texture
-                    self._background_texture = GL.glGenTextures(1)
-                    GL.glBindTexture(GL.GL_TEXTURE_2D, self._background_texture)
-                    
-                    # Set texture parameters
-                    GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MIN_FILTER, GL.GL_LINEAR)
-                    GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MAG_FILTER, GL.GL_LINEAR)
-                    GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_S, GL.GL_REPEAT)
-                    GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_T, GL.GL_REPEAT)
-                    
-                    # Upload initial frame data (flipped)
-                    GL.glTexImage2D(
-                        GL.GL_TEXTURE_2D,
-                        0,  # Mipmap level
-                        GL.GL_RGB,  # Internal format
-                        width,
-                        height,
-                        0,  # Border
-                        GL.GL_RGB,  # Format
-                        GL.GL_UNSIGNED_BYTE,
-                        frame_data_flipped
-                    )
-                    upload_mode = "glTexImage2D(new)"
-                    logger.debug(f"Created video texture {self._background_texture} ({width}x{height})")
-                else:
-                    # Reuse existing texture (faster)
-                    GL.glBindTexture(GL.GL_TEXTURE_2D, self._background_texture)
-                    GL.glTexSubImage2D(
-                        GL.GL_TEXTURE_2D,
-                        0,  # Mipmap level
-                        0, 0,  # Offset
-                        width,
-                        height,
-                        GL.GL_RGB,
-                        GL.GL_UNSIGNED_BYTE,
-                        frame_data_flipped
-                    )
-                    upload_mode = "glTexSubImage2D(reuse)"
+                prev_unpack_alignment = GL.glGetIntegerv(GL.GL_UNPACK_ALIGNMENT)
+                try:
+                    GL.glPixelStorei(GL.GL_UNPACK_ALIGNMENT, 1)
+
+                    if needs_new_texture:
+                        # Delete old texture if it exists and is NOT currently queued for fade
+                        if (
+                            self._background_texture is not None
+                            and GL.glIsTexture(self._background_texture)
+                            and not old_texture_enqueued_for_fade
+                        ):
+                            GL.glDeleteTextures([self._background_texture])
+                        
+                        # Generate new texture
+                        self._background_texture = GL.glGenTextures(1)
+                        GL.glBindTexture(GL.GL_TEXTURE_2D, self._background_texture)
+                        
+                        # Set texture parameters
+                        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MIN_FILTER, GL.GL_LINEAR)
+                        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MAG_FILTER, GL.GL_LINEAR)
+                        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_S, GL.GL_REPEAT)
+                        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_T, GL.GL_REPEAT)
+                        
+                        # Upload initial frame data (flipped)
+                        GL.glTexImage2D(
+                            GL.GL_TEXTURE_2D,
+                            0,  # Mipmap level
+                            GL.GL_RGB,  # Internal format
+                            width,
+                            height,
+                            0,  # Border
+                            GL.GL_RGB,  # Format
+                            GL.GL_UNSIGNED_BYTE,
+                            frame_data_flipped
+                        )
+                        upload_mode = "glTexImage2D(new)"
+                        logger.debug(f"Created video texture {self._background_texture} ({width}x{height})")
+                    else:
+                        # Reuse existing texture (faster)
+                        GL.glBindTexture(GL.GL_TEXTURE_2D, self._background_texture)
+                        GL.glTexSubImage2D(
+                            GL.GL_TEXTURE_2D,
+                            0,  # Mipmap level
+                            0, 0,  # Offset
+                            width,
+                            height,
+                            GL.GL_RGB,
+                            GL.GL_UNSIGNED_BYTE,
+                            frame_data_flipped
+                        )
+                        upload_mode = "glTexSubImage2D(reuse)"
+                finally:
+                    GL.glPixelStorei(GL.GL_UNPACK_ALIGNMENT, prev_unpack_alignment)
 
                 upload_ms = (time.perf_counter() - upload_start) * 1000.0
                 if upload_ms >= _VIDEO_UPLOAD_WARN_MS:
@@ -1493,8 +1560,8 @@ class LoomWindowCompositor(QOpenGLWindow):
                     self._pending_video_upload_log = False
             finally:
                 self._restore_previous_context(previous_ctx, previous_surface)
-        except Exception as e:
-            logger.error(f"Failed to upload video frame: {e}")
+        except Exception:
+            logger.exception("Failed to upload video frame; dropping to keep compositor alive")
     
     def set_text_opacity(self, opacity: float) -> None:
         """Set global text opacity (0.0 to 1.0). Affects all text elements."""
