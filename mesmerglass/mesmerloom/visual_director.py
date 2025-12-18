@@ -16,7 +16,6 @@ from time import perf_counter
 from contextlib import contextmanager
 
 from ..logging_utils import BurstSampler
-from ..engine.video_audio import VideoAudioPlayer
 
 if TYPE_CHECKING:
     from ..content.themebank import ThemeBank
@@ -74,7 +73,7 @@ class VisualDirector:
         
         # Current cue settings (for vibration on text cycle)
         self._current_cue_settings: Optional[dict] = None
-        self._video_audio_player: Optional[VideoAudioPlayer] = None
+        self._video_audio_player: Optional[Any] = None
         self._video_audio_enabled: bool = False
         self._video_audio_volume: float = 1.0
         self._active_video_audio_path: Optional[str] = None

@@ -11,4 +11,3 @@ def test_cli_selftest_reports_background_diag():
     combined = (proc.stdout + proc.stderr).lower()
     assert proc.returncode == 0, combined
     assert "background diagnostics" in combined
-*** End of File

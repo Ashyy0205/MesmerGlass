@@ -66,4 +66,3 @@ def test_on_change_image_defers_until_ready():
     director._on_change_image(2)
     assert len(compositor.upload_calls) == 1
     assert len(compositor.set_calls) == 1
-*** End of File
