@@ -24,10 +24,6 @@
 
 ### 2. Virtual Environment Setup
 ```powershell
-# Create project directory
-mkdir MesmerGlass
-cd MesmerGlass
-
 # Create virtual environment
 py -3.12 -m venv .venv
 
@@ -57,17 +53,7 @@ pip install numpy
 
 ### 4. Device Integration (Optional)
 
-#### Intiface Setup
-1. Download Intiface Central from [intiface.com](https://intiface.com/central/)
-2. Install and run Intiface Central
-3. Configure server:
-   - Default endpoint: `ws://127.0.0.1:12345`
-   - Click "Start Server"
-4. Device pairing:
-   - Open Device Manager
-   - Click "Start Scanning"
-   - Follow device-specific pairing instructions
-   - Verify device shows as "Connected"
+MesmerGlass v1.0 includes **MesmerIntiface** (built-in Bluetooth device control). You can scan/connect devices directly from the **Device** tab.
 
 ### 5. Media Setup
 1. Create directories:
@@ -125,7 +111,7 @@ pip install --force-reinstall -r requirements.txt
 .\.venv\Scripts\Activate.ps1
 
 # Run application
-python run.py
+python -m mesmerglass run
 
 # Run tests
 python -m pytest

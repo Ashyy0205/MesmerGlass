@@ -1,128 +1,51 @@
-# VR Display Setup Guide
+# VR Setup Guide (MesmerVisor)
 
-## Overview
+This guide covers the **wireless VR client** setup used by MesmerGlass v1.0.
 
-MesmerGlass now supports **two VR systems** with easy UI-based setup:
+MesmerGlass can stream visuals to a headset running the Android client (**MesmerVisor**). Headset discovery and connection are managed from the **Display** tab.
 
-### 1. 🥽 VR Bridge (Direct PC Headset)
-Direct rendering to PC VR headsets via OpenVR/OpenXR
+## Requirements
 
-**Supported Headsets:**
-- Meta Quest (with Link/Air Link)
-- Valve Index
-- HTC Vive / Vive Pro
-- Windows Mixed Reality headsets
-- Any SteamVR-compatible headset
+- A Windows PC running MesmerGlass
+- A VR headset (or Android device) capable of installing APKs
+- The PC and headset on the same Wi‑Fi network (recommended)
 
-### 2. 📱 VR Streaming (Wireless Android)
-Stream visuals to Android VR devices over WiFi
+## Install the VR client (MesmerVisor)
 
-**Supported Devices:**
-- Meta Quest (via Android client app)
-- Pico headsets
-- Any Android-based VR headset
+1. Download `MesmerVisor.apk` from the MesmerGlass release assets (GitHub Releases)
+2. Copy it to your headset / Android device
+3. Install the APK
+4. Launch **MesmerVisor**
 
----
+Notes:
+- If your headset requires “Unknown sources” / “Install unknown apps”, enable that in headset settings.
+- See `MEDIA/vr-client/README.md` for build/install tips if you’re compiling the client yourself.
 
-## Quick Start: Direct PC Headset (VR Bridge)
+## Connect from MesmerGlass
 
-### Setup Steps
+1. Start MesmerGlass
+2. Open the **Display** tab
+3. In the **VR Devices (Wireless)** section:
+   - Wait for your headset/device to appear (discovery)
+   - Select it and connect
+4. Once connected, choose the VR display target(s) the same way you would for monitors
 
-1. **Connect Your Headset**
-   - Plug in your PC VR headset
-   - Launch SteamVR or Oculus app
-   - Ensure headset is detected and active
+If your headset doesn’t show up:
+- Confirm the headset and PC are on the same network
+- Try temporarily disabling “AP isolation” / “client isolation” on your router
+- Restart MesmerVisor (and then refresh/re-scan in the Display tab)
 
-2. **Launch MesmerGlass**
-   ```powershell
-   .\.venv\Scripts\python.exe -m mesmerglass
-   ```
+## Firewall / Networking
 
-3. **Enable VR Bridge**
-   - Go to **Display** tab
-   - Check: **🥽 VR Bridge (Direct PC Headset)**
-   - Also check your primary monitor (for desktop preview)
+- The first time you use wireless VR, Windows may prompt for firewall access. Allow it on **Private networks**.
+- Prefer a strong 5GHz Wi‑Fi connection for stable streaming.
 
-4. **Launch Spiral**
-   - Click **Launch** button
-   - Spiral appears on monitor AND in VR headset!
+## Troubleshooting
 
-### What You'll See
+- **Discovery never finds the headset**: verify same Wi‑Fi; restart both apps; check router client isolation.
+- **Connect succeeds but video is laggy**: switch to 5GHz; reduce network load; move closer to router.
+- **Connect fails immediately**: ensure Windows Firewall allowed access; try running MesmerGlass once as admin to accept prompts.
 
-- **Desktop Monitor**: Spiral overlay (preview)
-- **VR Headset**: Same spiral rendering directly
-- **Logs**: `[vr] VR Bridge active - headset detected and ready!`
-
-### Troubleshooting
-
-**"VR Bridge in mock mode - no headset detected"**
-- Ensure SteamVR is running
-- Check headset is powered on and connected
-- Restart SteamVR if needed
-- Try setting backend: `$env:MESMERGLASS_VR_BACKEND = "openvr"`
-
-**"Failed to connect VR bridge"**
-- Update graphics drivers
-- Ensure no other app is using VR exclusively
-- Check Windows firewall isn't blocking VR runtime
-
----
-
-## Quick Start: Wireless VR (Streaming)
-
-### Setup Steps
-
-1. **Install Android VR Client** (on your headset)
-   - Install MesmerGlass VR client app (APK in `/MEDIA/vr-client/`)
-   - Ensure headset is on the same WiFi network as your PC
-
-2. **Launch MesmerGlass** (on PC)
-   ```powershell
-   .\.venv\Scripts\python.exe -m mesmerglass
-   ```
-   Discovery service starts automatically!
-
-3. **Start VR Client** (on headset)
-   - Open MesmerGlass VR client app
-   - App broadcasts "VR_HEADSET_HELLO" on network
-
-4. **Verify Discovery** (on PC)
-   - Go to **Display** tab
-   - Wait ~2 seconds
-   - Device appears under **VR Devices (Wireless)**
-   - Example: `📱 Pacific (192.168.1.57)`
-
-5. **Enable Streaming**
-   - Check your VR device in the list
-   - Also check your primary monitor
-   - Click **Launch** button
-
-6. **Start Streaming**
-   - Frames automatically stream to VR headset
-   - Monitor shows desktop preview
-
-### What You'll See
-
-- **Desktop Monitor**: Spiral overlay (preview)
-- **VR Headset**: Streamed spiral via H264/HEVC
-- **Display Tab**: Device listed with IP address
-- **Auto-refresh**: List updates every 2 seconds
-
-### Troubleshooting
-
-**"No VR devices found"**
-- Verify headset on same WiFi as PC
-- Check VR client app is running
-- Try manual refresh: Click **🔄 Refresh VR** button
-- Ensure port 5556 isn't blocked by firewall
-
-**"Device found but no stream"**
-- Check WiFi signal strength
-- Reduce other network traffic
-- Verify encoder settings in VR client app
-- Check logs for streaming errors
-
----
 
 ## Using Both Systems Simultaneously
 
@@ -325,29 +248,4 @@ $env:MESMERGLASS_VR_BACKEND = "openvr"  # or "openxr"
 ### Q: Does this work with Meta Quest standalone mode?
 **A:** Use **VR Streaming** for standalone. Use **VR Bridge** when Quest is connected to PC via Link/Air Link.
 
----
 
-## Changelog
-
-### November 19, 2025
-- ✅ Added VR Bridge to Display tab UI
-- ✅ Eliminated environment variable requirement
-- ✅ Added tooltips and status indicators
-- ✅ Improved headset detection logging
-- ✅ Preserved backward compatibility with `MESMERGLASS_VR=1`
-- ✅ Created test scripts for verification
-
----
-
-## Support
-
-**Logs Location**: Check terminal output for `[vr]` messages
-
-**Test Scripts**:
-- `scripts/vr_diagnostic.py` - Real-time status
-- `scripts/test_vr_integration.py` - Full test suite
-- `scripts/test_vr_bridge_ui.py` - UI integration tests
-
-**Common Issues**: See Troubleshooting sections above
-
-**Documentation**: `docs/technical/vr-*.md`

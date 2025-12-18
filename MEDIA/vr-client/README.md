@@ -1,26 +1,30 @@
 # VR Client Distribution
 
-This folder contains the Android VR client APK for MesmerGlass VR streaming.
+This folder contains documentation and build notes for the Android VR client used for MesmerGlass VR streaming.
+
+The built APK is distributed as a **release asset** (downloadable) and is intentionally **not** stored in the git repository.
 
 ## Files
 
-- `mesmerglass-vr-receiver.apk` - Android VR client application
 - `README.md` - Installation and usage instructions (this file)
+- `BUILD_INSTRUCTIONS.md` - Developer build notes
 
 ## Quick Start
 
 ### 1. Install APK on Android VR Device
 
+First, download `MesmerVisor.apk` from the MesmerGlass release assets (GitHub Releases).
+
 **Method A: ADB (Recommended for Developers)**
 ```bash
-adb install mesmerglass-vr-receiver.apk
+adb install MesmerVisor.apk
 ```
 
 **Method B: SideQuest (Recommended for Oculus Quest)**
 1. Enable Developer Mode on Quest
 2. Connect Quest to PC via USB
 3. Open SideQuest application
-4. Drag `mesmerglass-vr-receiver.apk` to SideQuest window
+4. Drag `MesmerVisor.apk` to SideQuest window
 5. Launch from "Unknown Sources" in Quest library
 
 **Method C: Manual Transfer**
@@ -47,7 +51,7 @@ python -m mesmerglass vr-stream --encoder jpeg --quality 25
 
 1. Put on VR headset
 2. Go to "Unknown Sources" or "Library"
-3. Launch "MesmerGlass VR Receiver"
+3. Launch "MesmerVisor"
 4. Wait for auto-discovery (blue → green → black screen)
 5. Enjoy hypnotic visuals in VR!
 
@@ -157,7 +161,7 @@ cp app/build/outputs/apk/release/app-release-unsigned.apk ../../../MEDIA/vr-clie
 ## Support
 
 For issues or questions:
-1. Check documentation: `docs/technical/mesmervisor.md`
+1. Check VR setup: `docs/user-guide/vr-setup.md`
 2. Check logs: `adb logcat | grep vrreceiver`
 3. File issue on GitHub repository
 

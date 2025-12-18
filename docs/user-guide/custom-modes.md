@@ -1,10 +1,14 @@
-# Custom Visual Modes
+# Custom Visual Modes (Playbacks)
 
-Custom visual modes are **user-created configurations** that define complete visual experiences in MesmerGlass. They are created using the **Visual Mode Creator** tool and can be loaded in the main launcher.
+In MesmerGlass v1.0, “custom visual modes” are managed as **Playbacks**.
+
+A playback is a **JSON configuration** that defines a complete visual setup (spiral, media, text, zoom). You can create/edit these either:
+- from the GUI via the **Playbacks** tab (Playback Editor), or
+- via the standalone **Visual Mode Creator** script.
 
 ## Overview
 
-Custom modes will **replace hardcoded Visual Programs** as the primary way to configure visuals. They provide:
+Playbacks provide a flexible alternative to legacy hardcoded visual presets. They provide:
 
 - ✅ **Full control** over spiral, media, text, and zoom settings
 - ✅ **Portability** - JSON files can be shared and imported
@@ -16,7 +20,7 @@ Custom modes will **replace hardcoded Visual Programs** as the primary way to co
 ### 1. Launch Visual Mode Creator
 
 ```powershell
-./.venv/bin/python scripts/visual_mode_creator.py
+python scripts/visual_mode_creator.py
 ```
 
 ### 2. Configure Settings
@@ -56,20 +60,18 @@ Click **"📦 Export Mode (JSON)"** button:
 
 ## Loading Custom Modes
 
-### In Launcher
+### In the GUI (recommended)
 
-1. Launch MesmerGlass: `./.venv/bin/python run.py`
-2. Go to **🎬 Visual Programs** tab
-3. Scroll to **📦 Custom Modes** section
-4. Click **"📂 Load Custom Mode..."**
-5. Browse to your `.json` mode file
-6. Mode loads and starts immediately
+1. Launch MesmerGlass: `python -m mesmerglass run`
+2. Go to the **Playbacks** tab
+3. Click **New Playback** (or open an existing playback)
+4. In the **Playback Editor**, use **Open…** / **Save As…** to load or save a playback JSON
 
 ### Mode File Location
 
-**Default directory**: `mesmerglass/modes/`
+You can load/save playback JSON files from anywhere on your filesystem.
 
-You can also load from anywhere on your filesystem.
+If you’re using the legacy “modes” folder (`mesmerglass/modes/`), you can still keep JSON files there, but the v1.0 GUI workflow is centered around **Playbacks**.
 
 ## Mode File Format
 
@@ -274,32 +276,12 @@ else:
 ### Validate Mode File
 
 ```powershell
-./.venv/bin/python -c "from pathlib import Path; from mesmerglass.engine.custom_visual import CustomVisual; print(CustomVisual.validate_mode_file(Path('mesmerglass/modes/example_mode.json')))"
+python -c "from pathlib import Path; from mesmerglass.engine.custom_visual import CustomVisual; print(CustomVisual.validate_mode_file(Path('mesmerglass/modes/example_mode.json')))"
 ```
 
-### Run Mode Directly (Future Enhancement)
+## Migration Notes
 
-```powershell
-# Future: Direct mode execution
-./.venv/bin/python -m mesmerglass visual-mode --file mesmerglass/modes/my_mode.json
-```
-
-## Migration Path
-
-### Phase 1 (Current)
-- CustomVisual works alongside built-in Visual Programs
-- Users can create and load custom modes
-- Built-in programs remain available
-
-### Phase 2 (Future)
-- Convert built-in Visual Programs to JSON mode files
-- Ship with curated mode library
-- Deprecation warnings for hardcoded programs
-
-### Phase 3 (Future)
-- Remove hardcoded Visual classes (SimpleVisual, SubTextVisual, etc.)
-- CustomVisual becomes the only Visual implementation
-- Complete user customization
+Some older documentation refers to “Visual Programs”. In v1.0, the user-facing workflow is centered on sessions, cuelists, and **Playbacks**.
 
 ## Troubleshooting
 

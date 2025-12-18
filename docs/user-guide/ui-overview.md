@@ -1,158 +1,52 @@
-# MesmerGlass UI Overview
+# MesmerGlass UI Overview (v1.0)
 
-## Current Tab Structure (Post-Visual Programs Integration)
+MesmerGlass v1.0 is organized around **sessions** (a `.session.json` file) that contain:
+- Playbacks (visual configurations)
+- Cuelists (timed sequences of cues)
+- Media bank entries (folders for images/videos/fonts)
 
-### 🎬 **Visual Programs** (PRIMARY TAB - Use This!)
-**What it does**: Full Trance recreation with automatic media/text/spiral coordination
+The GUI is a vertical-tab layout. The key tabs are below.
 
-**Use this for**:
-- Running complete visual programs (7 types)
-- Automatic image slideshow with spiral overlay
-- Text cycling with multiple layers
-- Video playback with spiral effects
-- Accelerating zoom effects
-- Flash synchronization
+## Tabs
 
-**How to use**:
-1. Select visual program from dropdown
-2. Click **Start** to begin
-3. Use **Pause/Resume** to control playback
-4. Watch progress bar and frame counter
+### 🖥️ Display
+Pick where visuals render:
+- Select one or more **monitors**.
+- Select any discovered **Wireless VR** devices (Android headset app) under “VR Devices (Wireless)”.
 
-**Status**: ✅ **FULLY FUNCTIONAL** (use this instead of Media/Text tabs)
+Tip: keep your primary monitor checked so you can see the desktop output.
 
----
+### 🏠 Home
+This is the main “mission control” screen:
+- Session information
+- Session Runner (load/start/pause/stop/skip)
+- Live Preview (mirrors the actual output)
+- Quick actions (create cuelist/playback, recent sessions)
 
-### 🌀 **MesmerLoom** (SPIRAL CONTROLS)
-**What it does**: Controls the spiral overlay parameters
+### 📝 Cuelists
+Manage cuelists inside the current session:
+- Create/edit cuelists
+- Add/reorder cues
+- Edit a cue’s playback pool and cue settings
 
-**Use this for**:
-- Enabling/disabling spiral overlay
-- Adjusting spiral speed, zoom, rotation
-- Changing spiral type (7 variants)
-- Setting spiral opacity
+### 🎨 Playbacks
+Create and edit playbacks:
+- Spiral settings
+- Media cycling settings
+- Text settings
+- Zoom settings
 
-**How to use**:
-1. Check "Enable Spiral" checkbox
-2. Adjust sliders for speed/zoom/rotation
-3. Select spiral type from dropdown
-4. Spiral appears when you click "Launch"
+### 🔗 Device
+Bluetooth device scanning and connection via MesmerIntiface (built-in). No external Intiface Central is required.
 
-**Status**: ✅ **FUNCTIONAL** (core spiral system)
+## Typical Workflow
 
----
+1. Open (or create) a session.
+2. In **Display**, check at least one monitor (and optionally a VR device).
+3. In **Home**, load a cuelist in the Session Runner.
+4. Press **Start**. Use **Pause/Stop/Skip** as needed.
 
-### 🎵 **Audio** (BACKGROUND MUSIC)
-**What it does**: Plays background music/ambience
+## Notes
 
-**Use this for**:
-- Loading primary background track
-- Loading secondary overlay loop
-- Adjusting volume levels
-
-**Status**: ✅ **FUNCTIONAL** (independent audio system)
-
----
-
-### 🔗 **Device Sync** (BUTTPLUG.IO)
-**What it does**: Synchronizes haptic devices with visual effects
-
-**Use this for**:
-- Scanning for Bluetooth devices
-- Connecting vibrators/toys
-- Syncing vibration to flash events
-- Configuring burst patterns
-
-**Status**: ✅ **FUNCTIONAL** (requires Bluetooth device)
-
----
-
-### 🖥️ **Displays** (MULTI-MONITOR)
-**What it does**: Select which monitors show the overlay
-
-**Use this for**:
-- Choosing primary/secondary displays
-- Multi-monitor setups
-
-**Status**: ✅ **FUNCTIONAL**
-
----
-
-### 📹 **Media** (LEGACY - DEPRECATED)
-**What it does**: Old video overlay system
-
-**Status**: ⚠️ **REPLACED BY VISUAL PROGRAMS**
-- Still functional but superseded
-- Use Visual Programs → Animation instead
-- Will be removed in future update
-
----
-
-### 📝 **Text & FX** (LEGACY - DEPRECATED)  
-**What it does**: Old text overlay system
-
-**Status**: ⚠️ **REPLACED BY VISUAL PROGRAMS**
-- Still functional but superseded  
-- Use Visual Programs → Text Cycling instead
-- Will be removed in future update
-
----
-
-## Quick Start Guide
-
-### For First-Time Users:
-
-1. **Click "MesmerLoom" tab**
-   - Check "Enable Spiral"
-   - Leave defaults
-
-2. **Click "Visual Programs" tab**
-   - Select "Simple Slideshow" from dropdown
-   - Click **Start**
-
-3. **Click "Launch" button** (bottom of window)
-   - Overlay window appears with spiral + images
-   - Visual program runs automatically
-
-4. **Click "Stop" button** to end session
-
-### For Advanced Users:
-
-1. **Load media themes** (requires theme configuration)
-2. **Select complex visual programs** (Text Cycling, Accelerating Zoom)
-3. **Enable Device Sync** for haptic feedback
-4. **Add background audio** for full experience
-
----
-
-## Troubleshooting
-
-### "Visual Programs doesn't work"
-**Cause**: ThemeBank not initialized with media
-**Fix**: Load at least one theme with images/text/videos
-
-### "Media/Text tabs confusing"
-**Solution**: Ignore them! Use **Visual Programs** tab instead
-- Media tab = old system
-- Text tab = old system  
-- Visual Programs = new integrated system
-
-### "Nothing appears when I click Launch"
-**Checklist**:
-1. MesmerLoom → Enable Spiral ✓
-2. Visual Programs → Start clicked ✓
-3. Displays → At least one selected ✓
-4. Launch button clicked ✓
-
----
-
-## Future Plans
-
-- Remove Media tab (replaced by Visual Programs)
-- Remove Text & FX tab (replaced by Visual Programs)
-- Consolidate to 5 tabs:
-  1. **Visual Programs** (main)
-  2. **MesmerLoom** (spiral)
-  3. **Audio** (music)
-  4. **Device Sync** (haptics)
-  5. **Displays** (monitors)
+- The bottom status bar shows the current session name and selected display summary.
+- VR streaming discovery starts automatically; devices appear within a couple seconds when the headset app is running.

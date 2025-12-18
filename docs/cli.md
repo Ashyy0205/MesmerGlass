@@ -29,7 +29,7 @@ Logging modes:
 - `normal` — default mix of summary INFO and occasional warnings.
 - `perf` — forces DEBUG level (unless you already requested DEBUG or lower) and reenables compositor `[spiral.trace]` lines plus ThemeBank per-image traces.
 
-See `docs/technical/logging-modes.md` for concrete examples and how these map to env vars like `MESMERGLASS_SPIRAL_TRACE`.
+Logging flags may be combined with any subcommand.
 
 ## Subcommands
 

@@ -30,6 +30,9 @@ mesmerglass_launcher.*
 build_launcher.ps1
 LAUNCHER_README.md
 
+# Android build outputs / release assets
+*.apk
+
 # Android SDK platform-tools (local only)
 platform-tools/
 platform-tools-*.zip

@@ -51,7 +51,7 @@
    ```bash
    python -m mesmerglass run
    ```
-   Legacy: `python run.py` still works (deprecated; see docs/migration/run-py-deprecation.md).
+   Legacy: `python run.py` still works (deprecated).
 
 ## 🪟 Building a standalone Windows executable
 
@@ -85,27 +85,19 @@ MesmerGlass includes **MesmerIntiface** - a pure Python implementation for direc
 ### 📡 **Quick Device Setup**
 1. Enable Bluetooth on your system
 2. Put your device in pairing mode
-3. In MesmerGlass: **Device Sync** → **Scan for devices**
+3. In MesmerGlass: open the **Device** tab → **Scan for devices**
 4. Select your device and start your session!
 
 ## 📚 Documentation
 
 ### 📖 **User Guides**
 - [📥 Installation Guide](docs/user-guide/installation.md) - Detailed setup instructions
+- [🧭 UI Overview](docs/user-guide/ui-overview.md) - Tour of the v1.0 tabs and workflow
 - [⚡ Features Overview](docs/user-guide/features.md) - Complete feature walkthrough  
 - [🎮 Device Management](docs/user-guide/device-management.md) - Device setup and control
+- [🥽 VR Setup](docs/user-guide/vr-setup.md) - Wireless VR client setup (MesmerVisor)
 
-### 🛠️ **Development**
-- [🔧 Development Setup](docs/development/dev-setup.md) - Setup development environment
-- [🧪 Testing Guide](docs/development/testing.md) - Running tests and validation
-- [📋 MesmerIntiface Technical](docs/development/mesmerintiface-complete.md) - Implementation details
-
-### 🔍 **Technical Reference**
-- [🎵 Audio Engine](docs/technical/audio-engine.md) - Audio processing system
-- [🎬 Video Engine](docs/technical/video-engine.md) - Video overlay architecture
-- [📡 Device Control](docs/technical/device-control.md) - Communication protocols
-- [🌀 Spiral Overlay](docs/technical/spiral-overlay.md) - MesmerLoom spiral parameters & rendering
-- [🥽 VR Streaming (MesmerVisor)](docs/technical/mesmervisor.md) - VR streaming system with JPEG encoding optimized for Oculus Go/Quest
+### 🛠 CLI
 - [🛠 CLI Reference](docs/cli.md)
 
 ## 🧪 Testing
@@ -167,25 +159,20 @@ MesmerGlass/
 │   ├── ui/                        # User interface
 │   └── tests/                     # Comprehensive test suite
 ├── MEDIA/                         # Media assets
-│   ├── vr-client/                 # Built VR APK for distribution
+│   ├── vr-client/                 # VR client docs/build notes (APK is a release asset)
 │   ├── Fonts/
 │   ├── Images/
 │   └── Videos/
 ├── docs/                          # Documentation
 │   ├── user-guide/               # User documentation
-│   ├── development/              # Developer guides  
-│   └── technical/                # Technical references
+│   └── cli.md                     # CLI reference
 ├── run.py                         # Deprecated shim (use python -m mesmerglass)
 └── requirements.txt              # Dependencies
 ```
 
 ## 🤝 Contributing
 
-We welcome contributions! Please see our [development documentation](docs/development/) for:
-
-- [Development Setup](docs/development/dev-setup.md)
-- [Testing Guidelines](docs/development/testing.md)
-- Code style and conventions
+We welcome contributions! (Developer notes are intentionally not included in the release docs set.)
 
 ## 🛠️ System Requirements
 
