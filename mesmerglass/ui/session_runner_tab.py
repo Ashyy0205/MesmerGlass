@@ -513,14 +513,13 @@ class SessionRunnerTab(QWidget):
             from mesmerglass.session.events import SessionEventType
             import json
             from pathlib import Path
-            import tempfile
+            from mesmerglass.platform_paths import ensure_dir, get_user_data_dir
             
             # Resolve playback names to actual JSON files
             # Session stores playbacks as dict, but SessionRunner needs file paths
             if self.session_data and "playbacks" in self.session_data:
                 playbacks_dict = self.session_data["playbacks"]
-                temp_dir = Path(tempfile.gettempdir()) / "mesmerglass_playbacks"
-                temp_dir.mkdir(exist_ok=True)
+                temp_dir = ensure_dir(get_user_data_dir() / "runtime" / "playbacks")
                 
                 # Write playback JSON files for each cue's playback_pool
                 for cue in self.cuelist.cues:
@@ -799,10 +798,19 @@ class SessionRunnerTab(QWidget):
         if theme_bank is None or not hasattr(theme_bank, "ensure_ready"):
             return True
         timeout = 0.25
-        if getattr(theme_bank, "network_sources_detected", False):
+        scan_in_progress = bool(getattr(theme_bank, "media_scan_in_progress", False))
+        is_network = bool(getattr(theme_bank, "network_sources_detected", False))
+        if is_network:
             timeout = 3.0
             self.logger.info(
                 "ThemeBank using network media; extending readiness wait to %.2fs",
+                timeout,
+            )
+        elif scan_in_progress:
+            # Local scans can still take time on large libraries; give it a moment.
+            timeout = 1.5
+            self.logger.info(
+                "ThemeBank media scan in progress; extending readiness wait to %.2fs",
                 timeout,
             )
         try:
@@ -811,6 +819,33 @@ class SessionRunnerTab(QWidget):
             self.logger.warning(f"ThemeBank readiness probe failed: {exc}")
             return True
         if not status.ready:
+            if scan_in_progress:
+                message = (
+                    f"⚠️ ThemeBank media scan still running: {status.ready_reason}. "
+                    "Playback may start with blank visuals until media is accessible. "
+                    "Run 'python -m mesmerglass themebank stats' for diagnostics."
+                )
+                self.status_label.setText(message)
+                self.logger.warning(
+                    "ThemeBank not ready (scan in progress) - continuing anyway: %s",
+                    status.ready_reason,
+                )
+                return True
+            # Network media can be slow to enumerate/open, and a strict readiness gate
+            # effectively bans network paths. Warn but allow starting if we have at
+            # least some media configured.
+            if is_network and (status.total_images > 0 or status.total_videos > 0 or status.themes_total > 0):
+                message = (
+                    f"⚠️ ThemeBank still loading network media: {status.ready_reason}. "
+                    "Playback may start with blank visuals until media is accessible. "
+                    "Run 'python -m mesmerglass themebank stats' for diagnostics."
+                )
+                self.status_label.setText(message)
+                self.logger.warning(
+                    "ThemeBank not ready (network media) - continuing anyway: %s",
+                    status.ready_reason,
+                )
+                return True
             message = (
                 f"⚠️ ThemeBank not ready: {status.ready_reason}. "
                 "Run 'python -m mesmerglass themebank stats' for diagnostics."

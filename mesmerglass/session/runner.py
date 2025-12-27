@@ -275,8 +275,16 @@ class SessionRunner:
         bank = getattr(self.visual_director, "theme_bank", None)
         if bank is None or not hasattr(bank, "ensure_ready"):
             return True
+        scan_in_progress = bool(getattr(bank, "media_scan_in_progress", False))
+        is_network = bool(getattr(bank, "network_sources_detected", False))
+        # Allow a longer readiness grace period for network media / warmup.
+        effective_wait_s = max(0.0, float(wait_s))
+        if is_network:
+            effective_wait_s = max(effective_wait_s, 3.0)
+        elif scan_in_progress:
+            effective_wait_s = max(effective_wait_s, 1.5)
         try:
-            status = bank.ensure_ready(require_videos=require_videos, timeout_s=max(0.0, wait_s))
+            status = bank.ensure_ready(require_videos=require_videos, timeout_s=effective_wait_s)
         except Exception as exc:
             self.logger.warning("[session] ThemeBank readiness check failed: %s", exc)
             return True
@@ -288,6 +296,20 @@ class SessionRunner:
                 status.total_videos,
                 status.cached_images,
                 status.last_image_path,
+            )
+            return True
+        # SMB shares can report empty/partial contents for a while after reboot.
+        # Don't abort the session: keep running and visuals will start once media loads.
+        if scan_in_progress:
+            self.logger.warning(
+                "[session] ThemeBank not ready (scan in progress) - continuing: %s",
+                status.ready_reason,
+            )
+            return True
+        if is_network and (status.total_images > 0 or status.total_videos > 0 or status.themes_total > 0):
+            self.logger.warning(
+                "[session] ThemeBank not ready (network media) - continuing: %s",
+                status.ready_reason,
             )
             return True
         self.logger.error("[session] ThemeBank not ready: %s", status.ready_reason)

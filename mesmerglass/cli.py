@@ -449,16 +449,23 @@ def build_parser() -> argparse.ArgumentParser:
     p_theme.add_argument("--diag-fail", action="store_true", help="Exit with code 3 if any span meets/exceeds --diag-threshold")
 
     p_themebank = add_subparser("themebank", help="Inspect or selftest ThemeBank media readiness")
-    p_themebank.add_argument("--media-bank", default="media_bank.json", help="Path to media_bank.json (default: %(default)s)")
-    p_themebank.add_argument("--wait", type=float, default=0.0, help="Seconds to wait for readiness before evaluating (default: 0)")
     tb_sub = p_themebank.add_subparsers(dest="themebank_cmd", required=True)
-    tb_stats = tb_sub.add_parser("stats", help="Print ThemeBank readiness summary")
+
+    # Put shared options on a parent so users can write either:
+    #   themebank --media-bank X stats
+    # or
+    #   themebank stats --media-bank X
+    tb_parent = argparse.ArgumentParser(add_help=False)
+    tb_parent.add_argument("--media-bank", default="media_bank.json", help="Path to media_bank.json (default: %(default)s)")
+    tb_parent.add_argument("--wait", type=float, default=0.0, help="Seconds to wait for readiness before evaluating (default: 0)")
+
+    tb_stats = tb_sub.add_parser("stats", parents=[tb_parent], help="Print ThemeBank readiness summary")
     tb_stats.add_argument("--require-videos", action="store_true", help="Treat missing videos as failure")
     tb_stats.add_argument("--json", action="store_true", help="Emit JSON payload instead of text")
-    tb_self = tb_sub.add_parser("selftest", help="Exit 0 when ThemeBank has accessible media")
+    tb_self = tb_sub.add_parser("selftest", parents=[tb_parent], help="Exit 0 when ThemeBank has accessible media")
     tb_self.add_argument("--require-videos", action="store_true", help="Require at least one video")
-    tb_pull_image = tb_sub.add_parser("pull-image", help="Load a single ThemeBank image and print metadata")
-    tb_pull_video = tb_sub.add_parser("pull-video", help="Select a ThemeBank video and print its path")
+    tb_pull_image = tb_sub.add_parser("pull-image", parents=[tb_parent], help="Load a single ThemeBank image and print metadata")
+    tb_pull_video = tb_sub.add_parser("pull-video", parents=[tb_parent], help="Select a ThemeBank video and print its path")
     
     # MesmerLoom spiral visual test (Phase 2 real implementation)
     p_spiral = add_subparser("spiral-test", help="Run a bounded MesmerLoom spiral render test")

@@ -44,6 +44,7 @@ class MainApplication(QMainWindow):
     
     RECENT_SESSIONS_KEY = "recent_sessions"
     MAX_RECENT_SESSIONS = 3
+    LAST_SESSION_DIR_KEY = "last_session_dir"
 
     def __init__(self):
         super().__init__()
@@ -588,10 +589,11 @@ class MainApplication(QMainWindow):
     
     def _on_open_session(self):
         """Open an existing session file."""
+        initial_dir = self.settings.value(self.LAST_SESSION_DIR_KEY, str(Path.home()))
         file_path, _ = QFileDialog.getOpenFileName(
             self, 
             "Open Session",
-            str(self.session_manager.session_dir),
+            str(initial_dir),
             "Session Files (*.session.json);;All Files (*)"
         )
         
@@ -627,7 +629,8 @@ class MainApplication(QMainWindow):
             return False
         
         default_name = self.session_data["metadata"]["name"].lower().replace(" ", "_")
-        default_path = str(self.session_manager.session_dir / f"{default_name}.session.json")
+        last_dir = self.settings.value(self.LAST_SESSION_DIR_KEY, str(Path.home()))
+        default_path = str(Path(last_dir) / f"{default_name}.session.json")
         
         file_path, _ = QFileDialog.getSaveFileName(
             self, 
@@ -734,6 +737,10 @@ class MainApplication(QMainWindow):
         if filepath is None:
             return
         path_str = str(Path(filepath).resolve())
+        try:
+            self.settings.setValue(self.LAST_SESSION_DIR_KEY, str(Path(path_str).parent))
+        except Exception:
+            pass
         current = self.get_recent_sessions()
         deduped = [entry for entry in current if entry.lower() != path_str.lower()]
         deduped.insert(0, path_str)
@@ -1025,58 +1032,224 @@ class MainApplication(QMainWindow):
     def _load_media_bank_async(self):
         """Build ThemeBank themes from the active session's media directories."""
         try:
+            # Let session start logic know a scan is underway.
+            if hasattr(self, "theme_bank") and self.theme_bank:
+                setattr(self.theme_bank, "media_scan_in_progress", True)
+                setattr(self.theme_bank, "last_media_scan_error", None)
+
             entries = self._get_media_bank_entries()
             self.logger.info("🔄 Starting background media scan...")
 
-            themes = []
-            network_media_detected = False
-            font_paths: list[str] = []
-            for entry in entries:
-                theme_name = entry.get('name', 'Unnamed')
-                media_dir = Path(entry.get('path', ''))
-                media_type = entry.get('type', 'images')
+            def _scan_once() -> tuple[list[ThemeConfig], bool, list[str]]:
+                import difflib
 
-                if media_dir.drive and media_dir.drive.upper() in ['U:', 'Z:', 'Y:', 'X:', 'W:', 'V:']:
-                    network_media_detected = True
-                    self.logger.warning(
-                        f"⚠️  Network drive '{theme_name}': {media_dir} may stream slowly—local SSDs are recommended"
+                def _resolve_directory_path(raw: Path) -> Path:
+                    """Best-effort correction for missing path segments.
+
+                    SMB/mapped drives sometimes end up with typos or stale folder names
+                    stored in sessions. If the path doesn't exist, try to walk from the
+                    nearest existing parent and fix missing segments using close matches.
+                    """
+
+                    candidate = raw
+                    if candidate.exists():
+                        return candidate
+
+                    # Find the highest existing prefix.
+                    parts = list(candidate.parts)
+                    if not parts:
+                        return candidate
+
+                    # Determine starting root (drive anchor like 'V:\\' or UNC like '\\\\server\\share').
+                    anchor = Path(parts[0])
+                    start_index = 1
+                    if len(parts) >= 2 and parts[0].startswith('\\\\'):
+                        # UNC path: \\server\share\...
+                        anchor = Path('\\\\' + parts[0].lstrip('\\'))
+                        if len(parts) >= 2:
+                            anchor = Path('\\\\' + parts[0].lstrip('\\')) / parts[1]
+                            start_index = 2
+
+                    current = anchor
+                    # If anchor doesn't exist, we can't resolve further.
+                    try:
+                        if not current.exists():
+                            return candidate
+                    except Exception:
+                        return candidate
+
+                    remaining = parts[start_index:]
+                    for segment in remaining:
+                        next_path = current / segment
+                        try:
+                            if next_path.exists():
+                                current = next_path
+                                continue
+                        except Exception:
+                            # Treat as missing.
+                            pass
+
+                        # Try to close-match this segment among directories under current.
+                        try:
+                            siblings = [p.name for p in current.iterdir() if p.is_dir()]
+                        except Exception:
+                            return candidate
+                        matches = difflib.get_close_matches(segment, siblings, n=1, cutoff=0.75)
+                        if not matches:
+                            # Heuristic: handle combined folder names like "Image&Video" by
+                            # falling back to the parent folder when its parts exist.
+                            try:
+                                import re
+
+                                if any(ch in segment for ch in ("&", "+")):
+                                    parts_guess = [p.strip() for p in re.split(r"[&+]", segment) if p.strip()]
+                                    if parts_guess:
+                                        existing_parts = [p for p in parts_guess if (current / p).exists()]
+                                        if existing_parts:
+                                            self.logger.warning(
+                                                "⚠️  Media bank folder '%s' not found under %s; using parent (found subfolders: %s)",
+                                                segment,
+                                                current,
+                                                ", ".join(existing_parts),
+                                            )
+                                            return current
+                            except Exception:
+                                pass
+                            return candidate
+                        corrected = matches[0]
+                        self.logger.warning(
+                            "⚠️  Media bank path segment '%s' not found under %s; using '%s'",
+                            segment,
+                            current,
+                            corrected,
+                        )
+                        current = current / corrected
+
+                    return current
+
+                themes: list[ThemeConfig] = []
+                network_media_detected = False
+                font_paths: list[str] = []
+                for entry in entries:
+                    theme_name = entry.get('name', 'Unnamed')
+                    raw_path_value = entry.get('path', '')
+                    media_dir = Path(raw_path_value)
+                    media_type = entry.get('type', 'images')
+
+                    try:
+                        exists_now = media_dir.exists()
+                    except Exception:
+                        exists_now = False
+                    self.logger.info(
+                        "[MediaScan] entry name=%s type=%s path=%r exists=%s",
+                        theme_name,
+                        media_type,
+                        str(raw_path_value),
+                        exists_now,
                     )
 
-                if not media_dir.exists():
-                    self.logger.warning(f"⚠️  Skipping '{theme_name}': {media_dir} doesn't exist")
-                    continue
+                    # Heuristic network drive detection (drive letter mapping).
+                    if media_dir.drive and media_dir.drive.upper() in ['U:', 'Z:', 'Y:', 'X:', 'W:', 'V:']:
+                        network_media_detected = True
+                        # Set this immediately (scan may take a while).
+                        if hasattr(self, "theme_bank") and self.theme_bank:
+                            self.theme_bank.network_sources_detected = True
+                        self.logger.warning(
+                            f"⚠️  Network drive '{theme_name}': {media_dir} may stream slowly—local SSDs are recommended"
+                        )
 
-                if media_type == 'fonts':
-                    fonts = scan_font_directory(media_dir)
-                    if fonts:
-                        font_paths.extend(fonts)
-                        self.logger.info(f"🔤 Font bank '{theme_name}': {len(fonts)} font(s)")
+                    if not exists_now:
+                        resolved = _resolve_directory_path(media_dir)
+                        if resolved != media_dir and resolved.exists():
+                            self.logger.warning(
+                                "⚠️  Using corrected media bank path for '%s': %s -> %s",
+                                theme_name,
+                                media_dir,
+                                resolved,
+                            )
+                            media_dir = resolved
+                            exists_now = True
+                        else:
+                            self.logger.warning(f"⚠️  Skipping '{theme_name}': {media_dir} doesn't exist")
+                            continue
+
+                    if media_type == 'fonts':
+                        fonts = scan_font_directory(media_dir)
+                        if fonts:
+                            font_paths.extend(fonts)
+                            self.logger.info(f"🔤 Font bank '{theme_name}': {len(fonts)} font(s)")
+                        else:
+                            self.logger.warning(f"⚠️  Font bank '{theme_name}' contains no *.ttf/*.otf files")
+                        continue
+
+                    try:
+                        all_images, all_videos = scan_media_directory(media_dir)
+                    except Exception as scan_exc:
+                        self.logger.warning(
+                            "⚠️  Media scan failed for '%s' (%s): %s",
+                            theme_name,
+                            media_dir,
+                            scan_exc,
+                        )
+                        all_images, all_videos = [], []
+
+                    self.logger.info(
+                        "[MediaScan] scanned name=%s dir=%s -> images=%d videos=%d",
+                        theme_name,
+                        media_dir,
+                        len(all_images),
+                        len(all_videos),
+                    )
+
+                    if media_type == 'images':
+                        images = all_images
+                        videos = []
+                    elif media_type == 'videos':
+                        images = []
+                        videos = all_videos
                     else:
-                        self.logger.warning(f"⚠️  Font bank '{theme_name}' contains no *.ttf/*.otf files")
+                        images = all_images
+                        videos = all_videos
+
+                    theme = ThemeConfig(
+                        name=theme_name,
+                        enabled=True,
+                        image_path=images,
+                        animation_path=videos,
+                        font_path=[],
+                        text_line=[]
+                    )
+                    themes.append(theme)
+                    self.logger.info(f"✅ Theme '{theme_name}': {len(images)} images, {len(videos)} videos")
+
+                return themes, network_media_detected, font_paths
+
+            # SMB shares can appear mounted but report empty/partial contents
+            # right after boot. Retry a few times with backoff if we detect
+            # network media but get zero images.
+            retry_delays_s = (0.0, 2.0, 5.0, 10.0, 20.0)
+            themes: list[ThemeConfig] = []
+            network_media_detected = False
+            font_paths: list[str] = []
+            last_total_images = 0
+            for attempt, delay_s in enumerate(retry_delays_s, start=1):
+                if delay_s > 0:
+                    self.logger.info(
+                        "Media scan retry %d/%d in %.1fs (waiting for network shares)",
+                        attempt,
+                        len(retry_delays_s),
+                        delay_s,
+                    )
+                    time.sleep(delay_s)
+
+                themes, network_media_detected, font_paths = _scan_once()
+                last_total_images = sum(len(t.image_path) for t in themes)
+                if network_media_detected and last_total_images <= 0 and entries:
+                    self.logger.warning(
+                        "⚠️  Network media scan found 0 images; SMB share may still be warming up"
+                    )
                     continue
-
-                all_images, all_videos = scan_media_directory(media_dir)
-
-                if media_type == 'images':
-                    images = all_images
-                    videos = []
-                elif media_type == 'videos':
-                    images = []
-                    videos = all_videos
-                else:
-                    images = all_images
-                    videos = all_videos
-
-                theme = ThemeConfig(
-                    name=theme_name,
-                    enabled=True,
-                    image_path=images,
-                    animation_path=videos,
-                    font_path=[],
-                    text_line=[]
-                )
-                themes.append(theme)
-                self.logger.info(f"✅ Theme '{theme_name}': {len(images)} images, {len(videos)} videos")
+                break
 
             if themes:
                 self.theme_bank._root_path = Path('.')
@@ -1084,9 +1257,8 @@ class MainApplication(QMainWindow):
                 self.theme_bank._preload_theme_images()
                 self.theme_bank.set_active_themes(primary_index=1)
                 self.theme_bank.network_sources_detected = network_media_detected
-                total_images = sum(len(t.image_path) for t in themes)
                 self.logger.info(
-                    f"✅ Media scan complete: {len(themes)} theme(s) loaded, {total_images} total images"
+                    f"✅ Media scan complete: {len(themes)} theme(s) loaded, {last_total_images} total images"
                 )
             else:
                 self.logger.warning("⚠️  No media found in session media bank")
@@ -1100,6 +1272,11 @@ class MainApplication(QMainWindow):
 
         except Exception as exc:
             self.logger.error(f"❌ Background media scan failed: {exc}")
+            if hasattr(self, "theme_bank") and self.theme_bank:
+                setattr(self.theme_bank, "last_media_scan_error", str(exc))
+        finally:
+            if hasattr(self, "theme_bank") and self.theme_bank:
+                setattr(self.theme_bank, "media_scan_in_progress", False)
 
     def _on_import_cuelist(self):
         """Import a cuelist file."""

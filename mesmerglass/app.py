@@ -8,6 +8,7 @@ from .qss import QSS
 from . import __app_name__, __version__
 from .logging_utils import setup_logging
 import logging, faulthandler
+from .platform_paths import ensure_windows_start_menu_shortcut
 
 _DIAG_INSTALLED = False
 
@@ -88,6 +89,9 @@ def run():
     if not logging.getLogger().handlers:
         setup_logging(level=log_level, add_console=True, log_mode=log_mode_env)
     _install_diagnostics()
+
+    # First-run / install conveniences (safe no-ops outside frozen Windows builds)
+    ensure_windows_start_menu_shortcut(app_name=__app_name__)
     
     # Create QApplication
     app = QApplication(sys.argv)

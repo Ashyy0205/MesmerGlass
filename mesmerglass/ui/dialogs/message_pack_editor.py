@@ -121,7 +121,9 @@ class MessagePackEditor(QDialog):
     def _on_save_file(self):
         try: pack = self._build_pack()
         except Exception as e: QMessageBox.critical(self, "Invalid Pack", str(e)); return
-        fn, _ = QFileDialog.getSaveFileName(self, "Save Message Pack", "message_pack.json", "Message Packs (*.json);;All Files (*.*)")
+        from mesmerglass.platform_paths import ensure_dir, get_user_data_dir
+        default_dir = ensure_dir(get_user_data_dir() / "message_packs")
+        fn, _ = QFileDialog.getSaveFileName(self, "Save Message Pack", str(default_dir / "message_pack.json"), "Message Packs (*.json);;All Files (*.*)")
         if not fn: return
         try:
             with open(fn, "w", encoding="utf-8") as f:

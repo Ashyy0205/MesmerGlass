@@ -624,11 +624,14 @@ class CuelistEditor(QDialog):
         # Suggest a filename
         suggested_name = self.cuelist_data.get("name", "new_cuelist").replace(" ", "_").lower()
         suggested_name = f"{suggested_name}.cuelist.json"
+
+        from mesmerglass.platform_paths import ensure_dir, get_user_data_dir
+        default_dir = ensure_dir(get_user_data_dir() / "cuelists")
         
         file_path, _ = QFileDialog.getSaveFileName(
             self,
             "Save Cuelist As",
-            f"cuelists/{suggested_name}",
+            str(default_dir / suggested_name),
             "Cuelist Files (*.cuelist.json);;All Files (*.*)"
         )
         

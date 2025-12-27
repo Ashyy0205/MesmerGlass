@@ -7,6 +7,7 @@ from typing import Iterable, Sequence
 DEFAULT_IMAGE_EXTENSIONS: tuple[str, ...] = (
     ".jpg",
     ".jpeg",
+    ".jfif",
     ".png",
     ".gif",
     ".bmp",

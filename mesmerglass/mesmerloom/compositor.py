@@ -1407,6 +1407,63 @@ class LoomCompositor(QOpenGLWidget):  # type: ignore[misc]
             self._background_image_height = max(1, image_height)
         
         self._background_enabled = True
+
+    def upload_image_to_gpu(self, image_data, generate_mipmaps: bool = False) -> int:
+        """Upload ImageData to a GL texture in this widget's OpenGL context.
+
+        VisualDirector expects compositors to provide upload_image_to_gpu().
+        LoomCompositor historically relied on external upload helpers; this shim
+        makes it compatible with VisualDirector in the Playback Editor.
+        """
+
+        from OpenGL import GL
+        import logging
+
+        previous_ctx = QOpenGLContext.currentContext()
+        previous_surface = previous_ctx.surface() if previous_ctx else None
+        try:
+            self.makeCurrent()
+        except Exception as exc:
+            logging.getLogger(__name__).error(
+                f"[visual] Failed to make context current for texture upload: {exc}"
+            )
+            raise
+
+        try:
+            texture_id = GL.glGenTextures(1)
+            GL.glBindTexture(GL.GL_TEXTURE_2D, texture_id)
+
+            GL.glTexParameteri(
+                GL.GL_TEXTURE_2D,
+                GL.GL_TEXTURE_MIN_FILTER,
+                GL.GL_LINEAR_MIPMAP_LINEAR if generate_mipmaps else GL.GL_LINEAR,
+            )
+            GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MAG_FILTER, GL.GL_LINEAR)
+            GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_S, GL.GL_CLAMP_TO_EDGE)
+            GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_T, GL.GL_CLAMP_TO_EDGE)
+
+            GL.glTexImage2D(
+                GL.GL_TEXTURE_2D,
+                0,
+                GL.GL_RGBA8,
+                int(image_data.width),
+                int(image_data.height),
+                0,
+                GL.GL_RGBA,
+                GL.GL_UNSIGNED_BYTE,
+                image_data.data,
+            )
+
+            if generate_mipmaps:
+                GL.glGenerateMipmap(GL.GL_TEXTURE_2D)
+
+            GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
+            logging.getLogger(__name__).debug(
+                f"[visual] Uploaded texture {int(texture_id)} in LoomCompositor context: {int(image_data.width)}x{int(image_data.height)}"
+            )
+            return int(texture_id)
+        finally:
+            self._restore_previous_context(previous_ctx, previous_surface)
     
     def clear_background_texture(self) -> None:
         """Clear background image texture."""

@@ -11,6 +11,8 @@ from pathlib import Path
 from datetime import datetime
 from typing import Optional, Dict, Any
 
+from .platform_paths import ensure_dir, get_sessions_dir
+
 logger = logging.getLogger(__name__)
 
 
@@ -29,19 +31,48 @@ class SessionManager:
         """Initialize SessionManager.
         
         Args:
-            session_dir: Directory for session files. Defaults to mesmerglass/sessions/
+            session_dir: Directory for session files. Defaults to a persistent per-user
+                folder (e.g. %APPDATA%\\MesmerGlass\\sessions on Windows).
         """
         if session_dir is None:
-            session_dir = Path(__file__).parent / "sessions"
+            session_dir = get_sessions_dir()
         
         self.session_dir = Path(session_dir)
-        self.session_dir.mkdir(parents=True, exist_ok=True)
+        ensure_dir(self.session_dir)
+
+        # Copy bundled demo sessions into the user sessions directory if missing.
+        # This keeps the editor usable out-of-the-box while ensuring user sessions
+        # never live inside temp/installer locations.
+        self._seed_sessions_from_bundled()
         
         self.current_session: Optional[Dict[str, Any]] = None
         self.current_file: Optional[Path] = None
         self.dirty: bool = False
         
         logger.info(f"SessionManager initialized: {self.session_dir}")
+
+    def _seed_sessions_from_bundled(self) -> None:
+        bundled_dir = Path(__file__).parent / "sessions"
+        if not bundled_dir.exists():
+            return
+        if bundled_dir.resolve() == self.session_dir.resolve():
+            return
+
+        copied = 0
+        try:
+            for src in bundled_dir.glob("*.session.json"):
+                dst = self.session_dir / src.name
+                if dst.exists():
+                    continue
+                try:
+                    dst.write_bytes(src.read_bytes())
+                    copied += 1
+                except Exception as exc:
+                    logger.warning("Failed copying bundled session %s: %s", src.name, exc)
+        except Exception as exc:
+            logger.warning("Bundled session seeding failed: %s", exc)
+        if copied:
+            logger.info("Seeded %s bundled session(s) into %s", copied, self.session_dir)
     
     def new_session(self, name: str, description: str = "") -> Dict[str, Any]:
         """Create a new empty session.

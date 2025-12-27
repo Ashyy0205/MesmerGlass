@@ -47,18 +47,16 @@ _SPIRAL_TRACE_FLAG = "MESMERGLASS_SPIRAL_TRACE"
 def get_default_log_dir() -> Path:
     """Return a suitable per-user log directory.
 
-    On Windows, prefer %LOCALAPPDATA%/MesmerGlass. Else use ~/.mesmerglass.
+    On Windows, prefer %APPDATA%/MesmerGlass/logs. Else use ~/.mesmerglass.
     Falls back to cwd if neither is writable.
     """
-    # Windows: %LOCALAPPDATA%\MesmerGlass
-    local_appdata = os.environ.get("LOCALAPPDATA")
-    if local_appdata:
-        p = Path(local_appdata) / "MesmerGlass"
-        try:
-            p.mkdir(parents=True, exist_ok=True)
-            return p
-        except Exception:
-            pass
+    # Windows: %APPDATA%\MesmerGlass\logs
+    try:
+        from .platform_paths import ensure_dir, get_user_data_dir
+        p = ensure_dir(get_user_data_dir() / "logs")
+        return p
+    except Exception:
+        pass
 
     # Cross-platform fallback: ~/.mesmerglass
     home = Path.home()

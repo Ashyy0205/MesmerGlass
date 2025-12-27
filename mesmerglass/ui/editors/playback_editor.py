@@ -25,6 +25,9 @@ from pathlib import Path
 from typing import Optional
 from datetime import datetime
 from contextlib import contextmanager
+import difflib
+import re
+import os
 
 from PyQt6.QtCore import Qt, QTimer, QCoreApplication, pyqtSignal
 from PyQt6.QtWidgets import (
@@ -36,7 +39,8 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtGui import QColor, QGuiApplication
 
-from mesmerglass.content.media_scan import scan_font_directory
+from mesmerglass.content.media_scan import scan_font_directory, scan_media_directory
+from mesmerglass.platform_paths import get_user_data_dir, ensure_dir
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +52,10 @@ try:
     from mesmerglass.content import media
     from mesmerglass.content.text_renderer import TextRenderer, SplitMode
     from mesmerglass.engine.text_director import TextDirector
+    from mesmerglass.content.themebank import ThemeBank
+    from mesmerglass.content.theme import ThemeConfig
+    from mesmerglass.content.simple_video_streamer import SimpleVideoStreamer
+    from mesmerglass.mesmerloom.visual_director import VisualDirector
     import cv2
     import numpy as np
     PREVIEW_AVAILABLE = True
@@ -74,6 +82,10 @@ class PlaybackEditor(QDialog):
     
     # Signal emitted when playback is saved
     saved = pyqtSignal(str)  # file path
+
+    # Thread-safe signal to deliver media scan results back to the UI thread.
+    # Args: token, image_paths, video_paths, font_paths
+    media_scan_completed = pyqtSignal(int, object, object, object)
     
     # Speed calibration constant (matches VMC exactly)
     SPEED_GAIN = 10.0  # Calibrates modern RPM to match legacy "feel" (x4 old ≈ x40 new)
@@ -171,7 +183,136 @@ class PlaybackEditor(QDialog):
         self._spiral_tick_rate_last_avg_dt_ms = None
         self._spiral_tick_rate_last_report_ts = None
 
+        # --- Live-parity preview engine (VisualDirector + ThemeBank + CustomVisual) ---
+        # When enabled, we stop the PlaybackEditor-specific media cycling timers and
+        # instead tick the same pipeline used by cuelist playback.
+        self._preview_engine_requested = bool(PREVIEW_AVAILABLE)
+        self._preview_engine_enabled = False
+        self._preview_theme_bank = None
+        self._preview_video_streamer = None
+        self._preview_visual_director = None
+        self._preview_last_tick_perf = None
+        self._preview_config_reload_timer = None
+        self._preview_config_reload_reason = None
+        self._preview_playback_path = None
+
         self._initialize_editor()
+
+        try:
+            self.media_scan_completed.connect(self._on_media_scan_completed)
+        except Exception:
+            pass
+
+    def _on_media_scan_completed(self, scan_token: int, image_paths: object, video_paths: object, font_paths: object) -> None:
+        """Apply worker-thread scan results on the UI thread."""
+
+        if getattr(self, "_media_scan_token", None) != scan_token:
+            return
+
+        try:
+            image_list = list(image_paths or [])
+            video_list = list(video_paths or [])
+            font_list = list(font_paths or [])
+        except Exception:
+            image_list, video_list, font_list = [], [], []
+
+        self.image_files = [Path(p) for p in image_list]
+        self.video_files = [Path(p) for p in video_list]
+
+        # Deduplicate fonts while preserving order
+        deduped_fonts: list[str] = []
+        seen_fonts: set[str] = set()
+        for font_path in font_list:
+            key = str(font_path).lower()
+            if key in seen_fonts:
+                continue
+            seen_fonts.add(key)
+            deduped_fonts.append(str(font_path))
+
+        logger.info(
+            "[PlaybackEditor] Media scan complete: %d images, %d videos, %d fonts",
+            len(self.image_files),
+            len(self.video_files),
+            len(deduped_fonts),
+        )
+
+        # Many users run with WARNING-level console logs; surface the result there too.
+        logger.warning(
+            "[PlaybackEditor] Media scan result: %d images, %d videos, %d fonts",
+            len(self.image_files),
+            len(self.video_files),
+            len(deduped_fonts),
+        )
+
+        try:
+            self.status_display.setPlainText(
+                f"✅ Media scan complete.\n"
+                f"Images: {len(self.image_files)}\n"
+                f"Videos: {len(self.video_files)}\n"
+                f"Fonts: {len(deduped_fonts)}"
+            )
+        except Exception:
+            pass
+
+        if not self.image_files and not self.video_files:
+            logger.warning(
+                "[PlaybackEditor] No media discovered for selected banks (check paths/types/permissions)."
+            )
+            try:
+                self.status_display.setPlainText(
+                    "⚠️ No media found for selected banks.\n"
+                    "Check Media Bank paths (especially after corrections like Image&Video), "
+                    "and verify the folders contain supported file types."
+                )
+            except Exception:
+                pass
+
+        self.current_media_index = 0
+        self.current_media_list = []
+
+        self._pending_font_bank_fonts = deduped_fonts
+        if deduped_fonts:
+            self._apply_preview_font_from_bank()
+
+        # If live-parity preview is active, rebuild the ThemeBank from scan results.
+        # Otherwise fall back to legacy preview behavior below.
+        if self._is_live_parity_preview_enabled():
+            self._rebuild_preview_theme_bank(
+                image_files=self.image_files,
+                video_files=self.video_files,
+                fonts=deduped_fonts,
+            )
+            self._schedule_preview_config_reload(reason="media_scan_completed")
+            return
+
+        self._rebuild_media_list()
+
+        if self.current_media_list:
+            self._load_next_media()
+
+            # Start (or replace) the media cycling timer.
+            # Ensure we never end up with multiple active timers calling _cycle_media.
+            old_timer = getattr(self, "image_cycle_timer", None)
+            if old_timer is not None:
+                try:
+                    old_timer.stop()
+                except Exception:
+                    pass
+                try:
+                    old_timer.timeout.disconnect(self._cycle_media)
+                except Exception:
+                    pass
+                try:
+                    old_timer.deleteLater()
+                except Exception:
+                    pass
+
+            self.image_cycle_timer = QTimer(self)
+            self.image_cycle_timer.timeout.connect(self._cycle_media)
+            self._last_cycle_interval_ms = None
+
+            # Set initial cycle interval (will be overridden by acceleration if enabled)
+            self._update_cycle_interval(reason="initial_media_load")
 
     def _reset_cycle_debug_state(self):
         self._cycle_debug_last_tick = None
@@ -218,17 +359,24 @@ class PlaybackEditor(QDialog):
             self._refresh_media_bank_list()
         
         # Initialize after compositor is ready
-        QTimer.singleShot(500, self._load_test_images)
+        # For live-parity preview we want the real playback pipeline, not test images.
+        if PREVIEW_AVAILABLE:
+            QTimer.singleShot(0, self._initialize_text_system)
+            QTimer.singleShot(0, self._init_live_parity_preview_engine)
+            # Kick off a scan so selected media banks populate the preview ThemeBank.
+            QTimer.singleShot(50, self._load_test_images)
+        else:
+            QTimer.singleShot(500, self._load_test_images)
         
         # Start timers
         if PREVIEW_AVAILABLE:
+            # Drive preview at ~60fps so VisualDirector's frame-based cyclers match live playback.
             self.timer = QTimer()
-            self.timer.timeout.connect(self._update_spiral)
-            self.timer.start(33)  # 30 FPS (matches launcher)
+            self.timer.timeout.connect(self._preview_tick)
+            self.timer.start(16)
             
-            self.render_timer = QTimer()
-            self.render_timer.timeout.connect(self._update_render)
-            self.render_timer.start(33)
+            # Legacy render_timer is not needed when we run a unified tick.
+            self.render_timer = None
             
             # Disable fades globally (instant media swaps)
             self.compositor.set_fade_duration(0.0)
@@ -242,6 +390,260 @@ class PlaybackEditor(QDialog):
 
         # Initialize accelerate timing once UI + timers are ready
         self._reset_accelerate_progress()
+
+    def _is_live_parity_preview_enabled(self) -> bool:
+        return bool(getattr(self, "_preview_engine_enabled", False) and getattr(self, "_preview_visual_director", None) is not None)
+
+    def _maybe_schedule_preview_reload(self, *, reason: str, delay_ms: int = 140) -> None:
+        """Debounced preview reload for UI edits.
+
+        This is intentionally a no-op when the live-parity preview engine is not
+        requested/enabled, or when a bulk load operation is in progress.
+        """
+
+        if not getattr(self, "_preview_engine_requested", False):
+            return
+        if getattr(self, "_suppress_preview_reload", False):
+            return
+        if not self._is_live_parity_preview_enabled():
+            return
+        self._schedule_preview_config_reload(reason=reason, delay_ms=delay_ms)
+
+    def _init_live_parity_preview_engine(self) -> None:
+        """Initialize VisualDirector+ThemeBank preview so behavior matches live compositor."""
+
+        if not PREVIEW_AVAILABLE:
+            return
+
+        # Stop legacy cycling as early as possible to prevent double-driving.
+        self._stop_legacy_media_timers_for_live_preview()
+
+        if getattr(self, "_preview_engine_enabled", False):
+            return
+
+        try:
+            # Create video streamer + empty ThemeBank (replaced after media scan).
+            self._preview_video_streamer = SimpleVideoStreamer(buffer_size=180, prefill_frames=24)
+
+            theme = ThemeConfig(
+                name="Preview",
+                enabled=True,
+                image_path=[],
+                animation_path=[],
+                font_path=[],
+                text_line=[],
+            )
+            self._preview_theme_bank = ThemeBank(
+                themes=[theme],
+                root_path=Path("."),
+                image_cache_size=256,
+            )
+            self._preview_theme_bank.set_active_themes(primary_index=1)
+
+            # Create visual director using the SAME integration as live playback.
+            self._preview_visual_director = VisualDirector(
+                theme_bank=self._preview_theme_bank,
+                compositor=self.compositor,
+                text_renderer=getattr(self, "text_renderer", None),
+                video_streamer=self._preview_video_streamer,
+                text_director=getattr(self, "text_director", None),
+                mesmer_server=None,
+            )
+
+            # Wire text change callback to director if supported (matches MainApplication).
+            if self.text_director is not None and hasattr(self.text_director, "_on_text_change"):
+                try:
+                    self.text_director._on_text_change = self._preview_visual_director._on_change_text
+                except Exception:
+                    pass
+
+            self._preview_engine_enabled = True
+
+            # Debounced preview reload (write JSON + CustomVisual.reload_from_disk())
+            self._preview_config_reload_timer = QTimer(self)
+            self._preview_config_reload_timer.setSingleShot(True)
+            self._preview_config_reload_timer.timeout.connect(self._reload_live_parity_preview_from_ui)
+
+            # Create stable on-disk preview playback path in persistent user data dir.
+            preview_dir = ensure_dir(get_user_data_dir("MesmerGlass") / "preview")
+            self._preview_playback_path = preview_dir / "playback_editor_preview.json"
+
+            # Initial load.
+            # If a scan already completed before we initialized, rebuild ThemeBank now.
+            if getattr(self, "image_files", None) or getattr(self, "video_files", None) or getattr(self, "_pending_font_bank_fonts", None):
+                self._rebuild_preview_theme_bank(
+                    image_files=getattr(self, "image_files", []) or [],
+                    video_files=getattr(self, "video_files", []) or [],
+                    fonts=getattr(self, "_pending_font_bank_fonts", []) or [],
+                )
+            self._schedule_preview_config_reload(reason="init")
+            logger.info("[PlaybackEditor] Live-parity preview engine initialized")
+
+        except Exception as exc:
+            self._preview_engine_enabled = False
+            self._preview_visual_director = None
+            logger.warning(f"[PlaybackEditor] Live-parity preview engine init failed: {exc}")
+
+    def _stop_legacy_media_timers_for_live_preview(self) -> None:
+        """Stop editor-owned media timers so VisualDirector is the sole driver."""
+
+        # Stop legacy image cycle timer
+        old_timer = getattr(self, "image_cycle_timer", None)
+        if old_timer is not None:
+            try:
+                old_timer.stop()
+            except Exception:
+                pass
+            try:
+                old_timer.timeout.disconnect(self._cycle_media)
+            except Exception:
+                pass
+            try:
+                old_timer.deleteLater()
+            except Exception:
+                pass
+        self.image_cycle_timer = None
+
+        # Stop legacy cv2 video path
+        try:
+            self._stop_video()
+        except Exception:
+            pass
+
+    def _rebuild_preview_theme_bank(self, *, image_files: list[Path], video_files: list[Path], fonts: list[str]) -> None:
+        if not self._is_live_parity_preview_enabled():
+            return
+
+        try:
+            theme = ThemeConfig(
+                name="Preview",
+                enabled=True,
+                image_path=[str(p) for p in (image_files or [])],
+                animation_path=[str(p) for p in (video_files or [])],
+                font_path=[],
+                text_line=[],
+            )
+            tb = ThemeBank(
+                themes=[theme],
+                root_path=Path("."),
+                image_cache_size=256,
+            )
+            tb.set_active_themes(primary_index=1)
+            if fonts:
+                tb.set_font_library(fonts)
+
+            self._preview_theme_bank = tb
+            self._preview_visual_director.theme_bank = tb
+            if getattr(self._preview_visual_director, "current_visual", None) is not None:
+                try:
+                    self._preview_visual_director.current_visual.theme_bank = tb
+                except Exception:
+                    pass
+
+            logger.info(
+                "[PlaybackEditor] Preview ThemeBank rebuilt: %d images, %d videos, %d fonts",
+                len(image_files or []),
+                len(video_files or []),
+                len(fonts or []),
+            )
+        except Exception as exc:
+            logger.warning(f"[PlaybackEditor] Failed to rebuild preview ThemeBank: {exc}")
+
+    def _schedule_preview_config_reload(self, *, reason: str, delay_ms: int = 120) -> None:
+        if not self._is_live_parity_preview_enabled():
+            return
+
+        if self._preview_config_reload_timer is None:
+            return
+
+        self._preview_config_reload_reason = reason
+        try:
+            self._preview_config_reload_timer.start(max(0, int(delay_ms)))
+        except Exception:
+            pass
+
+    def _reload_live_parity_preview_from_ui(self) -> None:
+        """Write current UI config to preview file and reload CustomVisual in-place."""
+
+        if not self._is_live_parity_preview_enabled():
+            return
+
+        if self._preview_playback_path is None:
+            return
+
+        try:
+            config = self._build_config_dict()
+            ensure_dir(self._preview_playback_path.parent)
+            with open(self._preview_playback_path, "w", encoding="utf-8") as f:
+                json.dump(config, f, indent=2, ensure_ascii=False)
+
+            # Load the preview playback once, then reload in place for subsequent edits.
+            if getattr(self._preview_visual_director, "current_visual", None) is None:
+                loaded = self._preview_visual_director.load_playback(self._preview_playback_path)
+                if loaded:
+                    self._preview_visual_director.start_playback()
+                else:
+                    return
+            else:
+                visual = self._preview_visual_director.current_visual
+                if hasattr(visual, "reload_from_disk"):
+                    visual.reload_from_disk()
+                elif hasattr(visual, "reapply_all_settings"):
+                    # Fallback if reload is unavailable.
+                    visual.reapply_all_settings()
+
+        except Exception as exc:
+            logger.warning(f"[PlaybackEditor] Preview reload failed: {exc}")
+
+    def _preview_tick(self) -> None:
+        """Unified preview tick (~60fps) to match live playback behavior."""
+
+        if not PREVIEW_AVAILABLE:
+            return
+
+        now = time.perf_counter()
+        last = self._preview_last_tick_perf
+        self._preview_last_tick_perf = now
+        if last is None:
+            dt = 1.0 / 60.0
+        else:
+            dt = max(0.0, min(0.1, now - last))
+
+        # Update spiral at the same cadence as media/visual frames.
+        try:
+            # When live-parity preview is enabled, CustomVisual drives accelerate;
+            # avoid the editor's separate accelerate logic.
+            if not self._is_live_parity_preview_enabled():
+                self._update_accelerate_effects()
+            self.director.update(dt)
+            cached_uniforms = self.director.export_uniforms()
+            self.compositor._uniforms_cache = cached_uniforms
+        except Exception:
+            pass
+
+        # Advance the real visual pipeline (ThemeBank async_update + cyclers + video).
+        if self._is_live_parity_preview_enabled():
+            try:
+                self._preview_visual_director.update()
+            except Exception:
+                pass
+
+        # Drive compositor animations + text updates.
+        try:
+            self.compositor.update_zoom_animation()
+        except Exception:
+            pass
+
+        try:
+            if self.text_director:
+                self.text_director.update()
+        except Exception:
+            pass
+
+        try:
+            self.compositor.update()
+        except Exception:
+            pass
     
     def _setup_ui(self):
         """Build the editor UI (matches VMC layout exactly)."""
@@ -521,7 +923,7 @@ class PlaybackEditor(QDialog):
             "Disabled"
         ])
         self.zoom_mode_combo.setCurrentIndex(0)  # Exponential default
-        self.zoom_mode_combo.currentIndexChanged.connect(self._mark_modified)
+        self.zoom_mode_combo.currentIndexChanged.connect(self._on_zoom_mode_changed)
         zoom_layout.addWidget(self.zoom_mode_combo)
         
         # Zoom Rate
@@ -732,6 +1134,11 @@ class PlaybackEditor(QDialog):
         """Load test media from selected Media Bank entries."""
         if not PREVIEW_AVAILABLE:
             return
+
+        try:
+            self.status_display.setPlainText("🔄 Scanning selected media banks…")
+        except Exception:
+            pass
         
         # CRITICAL: Stop existing media cycle timer to prevent speed carryover
         if hasattr(self, 'image_cycle_timer') and self.image_cycle_timer is not None:
@@ -748,86 +1155,180 @@ class PlaybackEditor(QDialog):
             return
         
         logger.info(f"[PlaybackEditor] Loading media from {len(selected_indices)} selected bank entries")
-        
-        # Collect directories by type
-        image_dirs = []
-        video_dirs = []
-        font_dirs = []
-        
-        for idx in selected_indices:
-            if idx >= len(self._media_bank):
-                continue
-            
-            entry = self._media_bank[idx]
-            entry_path = Path(entry["path"])
-            entry_type = entry["type"]
-            
-            if entry_type in ("images", "both"):
-                image_dirs.append(entry_path)
-            if entry_type in ("videos", "both"):
-                video_dirs.append(entry_path)
-            if entry_type == "fonts":
-                font_dirs.append(entry_path)
-        
-        # Load images
-        self.image_files = []
-        for image_dir in image_dirs:
-            if image_dir.exists():
-                for ext in ['*.jpg', '*.jpeg', '*.png', '*.gif', '*.webp']:
-                    self.image_files.extend(list(image_dir.glob(ext)))
-        
-        self.image_files.sort()
-        
-        # Load videos
-        self.video_files = []
-        for video_dir in video_dirs:
-            if video_dir.exists():
-                for ext in ['*.mp4', '*.webm', '*.mkv', '*.avi', '*.mov']:
-                    self.video_files.extend(list(video_dir.glob(ext)))
-        
-        self.video_files.sort()
-        
-        font_files: list[str] = []
-        for font_dir in font_dirs:
-            if font_dir.exists():
-                font_files.extend(scan_font_directory(font_dir))
 
-        if font_files:
-            # Deduplicate while preserving discovery order
-            deduped: list[str] = []
-            seen_fonts: set[str] = set()
-            for font_path in font_files:
-                key = font_path.lower()
-                if key in seen_fonts:
+        # Run directory scans off the UI thread. Some banks can be network shares
+        # with deep folder structures (thousands of files) and will otherwise
+        # freeze the editor.
+        self._media_scan_token = getattr(self, "_media_scan_token", 0) + 1
+        scan_token = self._media_scan_token
+        
+        def _scan_worker():
+            def _normalize_entry_type(raw: object) -> str:
+                value = str(raw or "").strip().lower()
+                if value in ("images", "image", "img", "pics", "pictures", "photo", "photos"):
+                    return "images"
+                if value in ("videos", "video", "vid", "movie", "movies"):
+                    return "videos"
+                if value in ("fonts", "font", "typeface", "typefaces"):
+                    return "fonts"
+                if value in ("both", "all", "mixed"):
+                    return "both"
+                # Default to 'both' to be forgiving with legacy/unknown values.
+                return "both"
+
+            def _safe_exists(path: Path) -> bool:
+                try:
+                    return path.exists()
+                except Exception:
+                    return False
+
+            def _resolve_directory_path(raw: Path) -> Path:
+                """Best-effort correction for missing path segments.
+
+                Mirrors the main application's media-bank path correction so the
+                Playback Editor preview sees the same media.
+                """
+                candidate = raw
+                if _safe_exists(candidate):
+                    return candidate
+
+                parts = list(candidate.parts)
+                if not parts:
+                    return candidate
+
+                # Drive anchor like 'V:\\' or UNC like '\\\\server\\share'.
+                anchor = Path(parts[0])
+                start_index = 1
+                if len(parts) >= 2 and parts[0].startswith('\\\\'):
+                    anchor = Path('\\\\' + parts[0].lstrip('\\'))
+                    if len(parts) >= 2:
+                        anchor = Path('\\\\' + parts[0].lstrip('\\')) / parts[1]
+                        start_index = 2
+
+                current = anchor
+                if not _safe_exists(current):
+                    return candidate
+
+                remaining = parts[start_index:]
+                for segment in remaining:
+                    next_path = current / segment
+                    if _safe_exists(next_path):
+                        current = next_path
+                        continue
+
+                    try:
+                        siblings = [p.name for p in current.iterdir() if p.is_dir()]
+                    except Exception:
+                        return candidate
+
+                    matches = difflib.get_close_matches(segment, siblings, n=1, cutoff=0.75)
+                    if not matches:
+                        # Combined folder name fallback: "Image&Video" → parent if Image/Video exist
+                        if any(ch in segment for ch in ("&", "+")):
+                            parts_guess = [p.strip() for p in re.split(r"[&+]", segment) if p.strip()]
+                            existing_parts = [p for p in parts_guess if _safe_exists(current / p)]
+                            if existing_parts:
+                                logger.warning(
+                                    "[PlaybackEditor] Media bank folder '%s' not found under %s; using parent (found subfolders: %s)",
+                                    segment,
+                                    current,
+                                    ", ".join(existing_parts),
+                                )
+                                return current
+                        return candidate
+
+                    corrected = matches[0]
+                    logger.warning(
+                        "[PlaybackEditor] Media bank path segment '%s' not found under %s; using '%s'",
+                        segment,
+                        current,
+                        corrected,
+                    )
+                    current = current / corrected
+
+                return current
+
+            # Collect directories by type
+            image_dirs: list[Path] = []
+            video_dirs: list[Path] = []
+            font_dirs: list[Path] = []
+
+            for idx in selected_indices:
+                if idx >= len(self._media_bank):
                     continue
-                seen_fonts.add(key)
-                deduped.append(font_path)
-            font_files = deduped
 
-        logger.info(
-            f"[PlaybackEditor] Media scan complete: {len(self.image_files)} images, {len(self.video_files)} videos, {len(font_files)} fonts"
-        )
-        
-        self.current_media_index = 0
-        self.current_media_list = []
+                entry = self._media_bank[idx]
+                entry_path = Path(entry.get("path", ""))
+                entry_type = _normalize_entry_type(entry.get("type"))
 
-        self._pending_font_bank_fonts = font_files
-        if font_files:
-            self._apply_preview_font_from_bank()
-        
-        # Build media list based on mode
-        self._rebuild_media_list()
-        
-        if self.current_media_list:
-            self._load_next_media()
-            
-            # Start media cycling timer
-            self.image_cycle_timer = QTimer()
-            self.image_cycle_timer.timeout.connect(self._cycle_media)
-            self._last_cycle_interval_ms = None
-            
-            # Set initial cycle interval (will be overridden by acceleration if enabled)
-            self._update_cycle_interval(reason="initial_media_load")
+                if not _safe_exists(entry_path):
+                    resolved = _resolve_directory_path(entry_path)
+                    if resolved != entry_path and _safe_exists(resolved):
+                        logger.warning(
+                            "[PlaybackEditor] Using corrected media bank path for '%s': %s -> %s",
+                            entry.get("name", "Unnamed"),
+                            entry_path,
+                            resolved,
+                        )
+                        entry_path = resolved
+
+                if entry_type in ("images", "both"):
+                    image_dirs.append(entry_path)
+                if entry_type in ("videos", "both"):
+                    video_dirs.append(entry_path)
+                if entry_type == "fonts":
+                    font_dirs.append(entry_path)
+
+            image_files: list[Path] = []
+            video_files: list[Path] = []
+            font_files: list[str] = []
+
+            # Use the shared recursive scanner (matches the cuelist runner behavior)
+            for image_dir in image_dirs:
+                try:
+                    imgs, _vids = scan_media_directory(image_dir)
+                    image_files.extend(Path(p) for p in imgs)
+                except Exception as exc:
+                    logger.warning("[PlaybackEditor] Failed to scan image bank %s: %s", image_dir, exc)
+
+            for video_dir in video_dirs:
+                try:
+                    # Include .mov for the preview editor (legacy behavior).
+                    _imgs, vids = scan_media_directory(
+                        video_dir,
+                        video_exts=(".mp4", ".webm", ".mkv", ".avi", ".mov"),
+                    )
+                    video_files.extend(Path(p) for p in vids)
+                except Exception as exc:
+                    logger.warning("[PlaybackEditor] Failed to scan video bank %s: %s", video_dir, exc)
+
+            for font_dir in font_dirs:
+                try:
+                    font_files.extend(scan_font_directory(font_dir))
+                except Exception as exc:
+                    logger.warning("[PlaybackEditor] Failed to scan font bank %s: %s", font_dir, exc)
+
+            # Sort deterministically
+            image_files.sort(key=lambda p: str(p).lower())
+            video_files.sort(key=lambda p: str(p).lower())
+
+            # Emit results back to the UI thread safely.
+            self.media_scan_completed.emit(
+                scan_token,
+                [str(p) for p in image_files],
+                [str(p) for p in video_files],
+                list(font_files),
+            )
+
+        try:
+            t = threading.Thread(target=_scan_worker, daemon=True)
+            self._media_scan_thread = t
+            t.start()
+        except Exception as exc:
+            logger.error("[PlaybackEditor] Failed to start media scan thread: %s", exc)
+            self.image_files = []
+            self.video_files = []
+            return
 
     def _apply_preview_font_from_bank(self):
         """Shuffle and apply a cached media-bank font to the preview text director."""
@@ -869,6 +1370,7 @@ class PlaybackEditor(QDialog):
             self._trace_last_operation = label
             self._trace_last_operation_duration_ms = duration_ms
             self._trace_last_operation_finished_ts = time.time()
+
             if duration_ms >= self._trace_slow_threshold_ms:
                 logger.warning(
                     "[PlaybackEditor] [CycleDebug] Operation '%s' exceeded %.0fms (took %.1fms)",
@@ -878,124 +1380,22 @@ class PlaybackEditor(QDialog):
                 )
 
     @contextmanager
-    def _cycle_phase_timer(self, label: str, collector):
-        phase_start = time.perf_counter()
+    def _cycle_phase_timer(self, phase: str, timings: list):
+        """Lightweight phase timing helper for CycleDebug instrumentation.
+
+        The Playback Editor uses this from the preview timer handler. If the
+        timings list is provided, we append (phase, duration_ms) tuples.
+        """
+        start = time.perf_counter()
         try:
             yield
         finally:
-            collector.append((label, (time.perf_counter() - phase_start) * 1000.0))
-
-    def _log_cycle_phase_diagnostics(self, timings, reason: str, tick_delta_ms: float | None = None):
-        if not timings:
-            return
-
-        parts = [f"{name}={duration:.1f}ms" for name, duration in timings]
-        tick_label = "n/a" if tick_delta_ms is None else f"{tick_delta_ms:.1f}ms"
-        logger.info(
-            "[PlaybackEditor] [CycleDebug] Cycle phase breakdown (%s, Δtick=%s): %s",
-            reason,
-            tick_label,
-            ", ".join(parts),
-        )
-
-    def _log_overdue_context(
-        self,
-        elapsed_since_tick_ms: float,
-        elapsed_threshold_ms: float,
-        reference_interval_ms: float,
-        previous_interval_ms: float | None,
-        interval_ms: int,
-        speed: float,
-        reason_label: str,
-        pending_interval_before_ms: float | None,
-        remaining_before_ms: float | None,
-    ):
-        slider_value = None
-        if hasattr(self, "media_speed_slider"):
-            slider_value = self.media_speed_slider.value()
-
-        accel_enabled = False
-        accel_progress_pct = 0.0
-        accel_last_speed = self._accelerate_last_media_speed
-        accel_last_update_age_ms = None
-        if hasattr(self, "accelerate_enable_check"):
-            accel_enabled = self._is_accelerate_enabled()
-            accel_progress_pct = (self._accelerate_progress * 100.0) if accel_enabled else 0.0
-        if self._accelerate_last_interval_update_ts is not None:
-            accel_last_update_age_ms = (time.time() - self._accelerate_last_interval_update_ts) * 1000.0
-
-        timer_remaining_label = "n/a"
-        if hasattr(self, "image_cycle_timer") and self.image_cycle_timer is not None:
-            timer_remaining_label = f"{self.image_cycle_timer.remainingTime():.1f}ms"
-
-        pending_interval_label = "n/a"
-        if pending_interval_before_ms is not None:
-            pending_interval_label = f"{pending_interval_before_ms:.1f}ms"
-
-        remaining_before_label = "n/a"
-        if remaining_before_ms is not None:
-            remaining_before_label = f"{remaining_before_ms:.1f}ms"
-
-        accel_update_label = "n/a"
-        if accel_last_update_age_ms is not None:
-            accel_update_label = f"{accel_last_update_age_ms:.1f}ms"
-
-        event_thread_state = "unknown"
-        pending_events_flag = "unknown"
-        app = QCoreApplication.instance()
-        if app is not None:
             try:
-                pending_events_flag = app.hasPendingEvents()
-            except TypeError:
-                try:
-                    pending_events_flag = type(app).hasPendingEvents()
-                except Exception:
-                    pending_events_flag = "error"
+                duration_ms = (time.perf_counter() - start) * 1000.0
+                if isinstance(timings, list):
+                    timings.append((phase, duration_ms))
             except Exception:
-                pending_events_flag = "error"
-            thread = app.thread()
-            if thread is not None:
-                try:
-                    event_thread_state = f"running={thread.isRunning()}"
-                except Exception:
-                    event_thread_state = "error"
-
-        last_operation = self._describe_last_operation()
-        last_handler_label = "n/a"
-        if self._cycle_debug_last_handler_duration_ms is not None:
-            last_handler_label = f"{self._cycle_debug_last_handler_duration_ms:.1f}ms"
-
-        spiral_state = self._format_spiral_activity_state()
-
-        logger.warning(
-            (
-                "[PlaybackEditor] [CycleDebug] Timer overdue context (%s): elapsed=%.1fms threshold=%.1fms "
-                "ref_interval=%.1fms prev_interval=%s new_interval=%dms pending_interval=%s remaining_before=%s "
-                "timer_remaining=%s speed=%.1f slider=%s accel_enabled=%s accel_progress=%.1f%% "
-                "accel_last_speed=%s accel_last_update=%s last_handler=%s last_operation=%s "
-                "event_thread=%s pending_events=%s spiral_state=%s"
-            ),
-            reason_label,
-            elapsed_since_tick_ms,
-            elapsed_threshold_ms,
-            reference_interval_ms,
-            f"{previous_interval_ms:.1f}ms" if previous_interval_ms is not None else "n/a",
-            interval_ms,
-            pending_interval_label,
-            remaining_before_label,
-            timer_remaining_label,
-            speed,
-            slider_value,
-            accel_enabled,
-            accel_progress_pct,
-            accel_last_speed,
-            accel_update_label,
-            last_handler_label,
-            last_operation,
-            event_thread_state,
-            pending_events_flag,
-            spiral_state,
-        )
+                pass
 
     def _describe_last_operation(self) -> str:
         if not self._trace_last_operation:
@@ -1066,6 +1466,43 @@ class PlaybackEditor(QDialog):
             interval_label,
             spiral_state,
         )
+
+    def _log_overdue_context(
+        self,
+        elapsed_since_tick_ms: float,
+        elapsed_threshold_ms: float,
+        reference_interval_ms: int,
+        previous_interval_ms: int | None,
+        interval_ms: int,
+        speed: float,
+        reason_label: str,
+        pending_interval_before_ms: float | None,
+        remaining_before_ms: float | None,
+    ) -> None:
+        """Log context when the preview media-cycle timer appears overdue.
+
+        Diagnostic-only. Must never raise.
+        """
+        try:
+            prev_label = "n/a" if previous_interval_ms is None else f"{previous_interval_ms}"
+            pending_label = "n/a" if pending_interval_before_ms is None else f"{pending_interval_before_ms:.1f}"
+            remaining_label = "n/a" if remaining_before_ms is None else f"{remaining_before_ms:.1f}"
+            logger.warning(
+                "[PlaybackEditor] [CycleDebug] Timer overdue (%s): elapsed=%.1fms threshold=%.1fms "
+                "ref=%dms prev=%s new=%dms speed=%.1f pending=%sms remaining=%sms last_op=%s",
+                reason_label,
+                elapsed_since_tick_ms,
+                elapsed_threshold_ms,
+                reference_interval_ms,
+                prev_label,
+                interval_ms,
+                speed,
+                pending_label,
+                remaining_label,
+                self._describe_last_operation(),
+            )
+        except Exception:
+            pass
 
     def _log_stack_snapshot(self, reason: str, max_frames: int = 20, frame=None):
         now = time.time()
@@ -1196,6 +1633,7 @@ class PlaybackEditor(QDialog):
             4: "Square Root", 5: "Inverse", 6: "Power", 7: "Sawtooth"
         }
         logger.info(f"[PlaybackEditor] Spiral type: {type_names.get(spiral_type, spiral_type)}")
+        self._maybe_schedule_preview_reload(reason="spiral_type")
     
     def _on_opacity_changed(self, value):
         """Handle opacity slider."""
@@ -1209,6 +1647,7 @@ class PlaybackEditor(QDialog):
         except Exception:
             self.director.set_intensity(opacity)
         self._mark_modified()
+        self._maybe_schedule_preview_reload(reason="spiral_opacity")
     
     def _set_rotation_speed_preview(self, slider_value: int) -> float:
         """Apply the rotation slider value to the preview and return RPM."""
@@ -1236,12 +1675,14 @@ class PlaybackEditor(QDialog):
         self._capture_accelerate_start_values()
         
         logger.info(f"[PlaybackEditor] Rotation speed set: x={x_val:.1f} → rpm={rpm:.1f}")
+        self._maybe_schedule_preview_reload(reason="rotation_speed", delay_ms=160)
     
     def _on_spiral_reverse_changed(self, state):
         """Handle spiral reverse checkbox."""
         logger.info(f"[PlaybackEditor] Spiral reverse changed: {state == 2}")
         self._on_rotation_speed_changed(self.rotation_speed_slider.value())
         self._mark_modified()
+        self._maybe_schedule_preview_reload(reason="spiral_reverse")
     
     def _pick_color(self, which: str):
         """Open color picker for arm or gap color."""
@@ -1266,6 +1707,7 @@ class PlaybackEditor(QDialog):
             
             self._refresh_color_buttons()
             self._mark_modified()
+            self._maybe_schedule_preview_reload(reason=f"spiral_color_{which}")
 
     def _pick_text_color(self):
         """Allow the user to override the text overlay color."""
@@ -1276,6 +1718,7 @@ class PlaybackEditor(QDialog):
             self.text_color = (color.redF(), color.greenF(), color.blueF())
             self._apply_text_color_to_preview()
             self._mark_modified()
+            self._maybe_schedule_preview_reload(reason="text_color")
 
     def _refresh_color_buttons(self):
         """Sync color button backgrounds with current RGB tuples."""
@@ -1339,17 +1782,19 @@ class PlaybackEditor(QDialog):
             QTimer.singleShot(100, self._load_test_images)
         
         self._mark_modified()
+        self._maybe_schedule_preview_reload(reason="media_mode")
     
     def _on_media_speed_changed(self, value):
         """Handle media speed slider."""
         speed_desc, interval_s = self._describe_cycle_speed(value)
         self.media_speed_label.setText(f"{value} ({speed_desc}) - {interval_s:.2f}s")
         
-        if PREVIEW_AVAILABLE:
+        if PREVIEW_AVAILABLE and not self._is_live_parity_preview_enabled():
             self._update_cycle_interval(reason="media_speed_slider")
         
         self._mark_modified()
         self._capture_accelerate_start_values()
+        self._maybe_schedule_preview_reload(reason="media_speed", delay_ms=160)
 
     def _describe_cycle_speed(self, value: float) -> tuple[str, float]:
         """Return descriptor + seconds for a 1-100 cycle speed (matches media slider)."""
@@ -1422,6 +1867,7 @@ class PlaybackEditor(QDialog):
             logger.info(f"[PlaybackEditor] Text rendering: {'enabled' if enabled else 'disabled'}")
         
         self._mark_modified()
+        self._maybe_schedule_preview_reload(reason="text_enabled")
     
     def _on_text_opacity_changed(self, value):
         """Handle text opacity slider."""
@@ -1432,6 +1878,7 @@ class PlaybackEditor(QDialog):
             self.compositor.set_text_opacity(opacity)
         
         self._mark_modified()
+        self._maybe_schedule_preview_reload(reason="text_opacity")
     
     def _on_text_mode_changed(self, index):
         """Handle text mode combo box."""
@@ -1452,6 +1899,7 @@ class PlaybackEditor(QDialog):
             logger.info(f"[PlaybackEditor] Text mode changed to: {mode.name}")
         
         self._mark_modified()
+        self._maybe_schedule_preview_reload(reason="text_mode")
 
     def _on_text_sync_changed(self, state):
         """Enable/disable manual text speed control and update director."""
@@ -1462,6 +1910,7 @@ class PlaybackEditor(QDialog):
         self._refresh_text_speed_label()
         self._apply_text_sync_settings()
         self._mark_modified()
+        self._maybe_schedule_preview_reload(reason="text_sync")
 
     def _on_text_cycle_speed_changed(self, value):
         """Update manual text speed label + preview when slider moves."""
@@ -1469,6 +1918,7 @@ class PlaybackEditor(QDialog):
         if self._is_carousel_mode() or not self.text_sync_check.isChecked():
             self._apply_text_sync_settings()
         self._mark_modified()
+        self._maybe_schedule_preview_reload(reason="text_speed", delay_ms=180)
 
     def _apply_text_sync_settings(self):
         """Push sync/manual timing settings into the preview text director."""
@@ -1512,8 +1962,19 @@ class PlaybackEditor(QDialog):
 
     def _on_zoom_rate_changed(self, value):
         """Handle zoom rate slider."""
-        self._apply_zoom_rate(value / 100.0, mark_modified=True)
+        self._apply_zoom_rate(value / 100.0, mark_modified=True, reset_animation=False)
         self._capture_accelerate_start_values()
+        self._maybe_schedule_preview_reload(reason="zoom_rate", delay_ms=160)
+
+    def _on_zoom_mode_changed(self, _index: int) -> None:
+        """Handle zoom mode changes.
+
+        Zoom mode affects how CustomVisual restarts zoom animations in live playback,
+        so the preview needs a config reload.
+        """
+
+        self._mark_modified()
+        self._maybe_schedule_preview_reload(reason="zoom_mode")
 
     # === Accelerate Controls ===
 
@@ -1557,20 +2018,23 @@ class PlaybackEditor(QDialog):
             self._set_accelerate_hidden_disabled(False)
 
         self._mark_modified()
-        self._reset_accelerate_progress()
+        if not self._is_live_parity_preview_enabled():
+            self._reset_accelerate_progress()
 
         if not enabled and self._accelerate_overriding:
             self._accelerate_overriding = False
             self._restore_base_dynamic_controls()
         self._update_accelerate_state_label()
+        self._maybe_schedule_preview_reload(reason="accelerate_enabled")
 
 
     def _on_accelerate_duration_changed(self, value):
         """Update label + restart ramp when duration slider changes."""
         self._update_accelerate_duration_label(value)
-        if self._is_accelerate_enabled():
+        if self._is_accelerate_enabled() and not self._is_live_parity_preview_enabled():
             self._reset_accelerate_progress()
         self._mark_modified()
+        self._maybe_schedule_preview_reload(reason="accelerate_duration", delay_ms=200)
 
     def _update_accelerate_duration_label(self, value):
         if hasattr(self, "accelerate_duration_label"):
@@ -1595,22 +2059,18 @@ class PlaybackEditor(QDialog):
             return
         if self._is_accelerate_enabled():
             # When releasing hidden-disabled, start accelerate timing and immediately trigger
-            # the first media cycle at the correct interval
+            # the first interval update.
             logger.info("[PlaybackEditor] Releasing hidden-disabled flag, starting acceleration timer")
             self._accelerate_start_time = time.time()
             self._accelerate_progress = 0.0
             self._accelerate_overriding = False
             self._update_accelerate_state_label()
-            # Force immediate media cycle by calling the cycle handler directly
-            if hasattr(self, 'image_cycle_timer') and self.image_cycle_timer.isActive():
-                logger.info("[PlaybackEditor] Triggering immediate media cycle when releasing hidden accelerate")
-                # Stop the timer temporarily
-                self.image_cycle_timer.stop()
-                # Call the cycle handler directly to load next media immediately
-                self._cycle_media()
-                # The cycle handler will restart the timer at the correct interval
-            else:
-                logger.warning(f"[PlaybackEditor] Cannot trigger cycle: hasattr={hasattr(self, 'image_cycle_timer')}, isActive={self.image_cycle_timer.isActive() if hasattr(self, 'image_cycle_timer') else 'N/A'}")
+            # Don't force an immediate media swap here. Live playback doesn't
+            # swap media just because accelerate re-syncs; it only changes timing.
+            try:
+                self._update_cycle_interval(reason="accelerate_release_hidden", restart_timer=True)
+            except Exception:
+                pass
         else:
             logger.info("[PlaybackEditor] Accelerate not enabled when releasing hidden-disabled")
             self._update_accelerate_state_label()
@@ -1651,18 +2111,17 @@ class PlaybackEditor(QDialog):
             self._accelerate_media_speed_target = None
             self._accelerate_media_speed_smoothed = None
             self._accelerate_last_interval_update_ts = None
-            
-            # Trigger immediate media cycle at the START speed to avoid waiting for existing timer
-            has_timer = hasattr(self, 'image_cycle_timer')
-            timer_active = self.image_cycle_timer.isActive() if has_timer else False
-            logger.info(f"[PlaybackEditor] Timer check: has_timer={has_timer}, timer_active={timer_active}")
-            
-            if has_timer and timer_active:
-                logger.info("[PlaybackEditor] Triggering immediate media cycle when starting acceleration")
-                self.image_cycle_timer.stop()
-                self._cycle_media()
-            else:
-                logger.warning(f"[PlaybackEditor] Cannot trigger immediate cycle: has_timer={has_timer}, timer_active={timer_active}")
+
+            # Don't force an immediate media swap. Restart the timer using the
+            # accelerate start speed so timing matches live playback behavior.
+            try:
+                self._update_cycle_interval(
+                    speed_override=self._resolve_accelerate_media_start(),
+                    restart_timer=True,
+                    reason="accelerate_reset",
+                )
+            except Exception:
+                pass
         else:
             self._accelerate_start_time = None
             self._accelerate_progress = 0.0
@@ -2086,9 +2545,13 @@ class PlaybackEditor(QDialog):
     
     def _cycle_media(self):
         """Cycle to next media item."""
-        logger.debug("[PlaybackEditor] _cycle_media called - CODE VERSION 2025-11-27")
-        if not PREVIEW_AVAILABLE or not self.current_media_list:
+        try:
+            logger.debug("[PlaybackEditor] _cycle_media called - CODE VERSION 2025-11-27")
+            if not PREVIEW_AVAILABLE or not self.current_media_list:
+                return
+        except Exception:
             return
+
         handler_start_perf = time.perf_counter()
         handler_start_wall = None
         phase_timings = []
@@ -2284,7 +2747,7 @@ class PlaybackEditor(QDialog):
                 )
                 self._cycle_debug_last_media = now
                 
-                if media_file.suffix.lower() in ['.jpg', '.png', '.jpeg', '.bmp', '.gif', '.webp']:
+                if media_file.suffix.lower() in ['.jpg', '.png', '.jpeg', '.jfif', '.bmp', '.gif', '.webp']:
                     self._stop_video()
                     self._load_image(media_file)
                 else:
@@ -2342,11 +2805,9 @@ class PlaybackEditor(QDialog):
                     duration_frames=9999,
                     mode=mode
                 )
-                
-                if self.manual_zoom_rate is not None:
-                    self.compositor._zoom_rate = self.manual_zoom_rate
-                    self.compositor._zoom_start_time = time.time()
-                    self.compositor._zoom_current = 1.0
+
+                # Keep whatever zoom rate is currently active (manual slider value
+                # or accelerate override) without resetting the zoom timeline.
                 
                 self.compositor.update()
                 
@@ -2407,11 +2868,9 @@ class PlaybackEditor(QDialog):
                     duration_frames=9999,
                     mode=mode
                 )
-                
-                if self.manual_zoom_rate is not None:
-                    self.compositor._zoom_rate = self.manual_zoom_rate
-                    self.compositor._zoom_start_time = time.time()
-                    self.compositor._zoom_current = 1.0
+
+                # Keep whatever zoom rate is currently active (manual slider value
+                # or accelerate override) without resetting the zoom timeline.
                 
                 logger.info(f"[PlaybackEditor] Video started: {video_file.name}")
             except Exception as e:
@@ -2486,7 +2945,9 @@ class PlaybackEditor(QDialog):
         self._spiral_update_inflight = True
 
         try:
-            self._update_accelerate_effects()
+            # When live-parity preview is active, CustomVisual handles accelerate.
+            if not self._is_live_parity_preview_enabled():
+                self._update_accelerate_effects()
 
             # Track tick rate for debugging
             if not hasattr(self, '_spiral_tick_count'):
@@ -2591,13 +3052,25 @@ class PlaybackEditor(QDialog):
             
             media_mode = self.media_mode_combo.currentIndex()
 
+            def _normalize_entry_type(raw: object) -> str:
+                value = str(raw or "").strip().lower()
+                if value in ("images", "image", "img", "pics", "pictures", "photo", "photos"):
+                    return "images"
+                if value in ("videos", "video", "vid", "movie", "movies"):
+                    return "videos"
+                if value in ("fonts", "font", "typeface", "typefaces"):
+                    return "fonts"
+                if value in ("both", "all", "mixed"):
+                    return "both"
+                return "both"
+
             if not self._media_bank:
                 self.lbl_bank_info.setText("No media banks defined")
                 logger.warning("[PlaybackEditor] Media bank list is empty")
                 return
             
             for idx, entry in enumerate(self._media_bank):
-                entry_type = entry["type"]
+                entry_type = _normalize_entry_type(entry.get("type"))
                 entry_name = entry["name"]
                 
                 # Filter by media mode
@@ -2634,6 +3107,7 @@ class PlaybackEditor(QDialog):
         if PREVIEW_AVAILABLE:
             logger.info("[PlaybackEditor] Media bank selection changed, reloading media...")
             QTimer.singleShot(100, self._load_test_images)
+        self._maybe_schedule_preview_reload(reason="bank_selection", delay_ms=220)
     
     def _update_bank_info(self):
         """Update the info label showing selected bank count."""
@@ -2672,6 +3146,7 @@ class PlaybackEditor(QDialog):
     
     def _load_from_dict(self, data: dict):
         """Load playback settings from data dictionary (used by both file and session modes)."""
+        self._suppress_preview_reload = True
         # CRITICAL: Stop existing media cycle timer to prevent speed carryover
         if hasattr(self, 'image_cycle_timer') and self.image_cycle_timer is not None:
             if self.image_cycle_timer.isActive():
@@ -2685,156 +3160,172 @@ class PlaybackEditor(QDialog):
                 self.compositor.reset_zoom()
                 logger.debug("[PlaybackEditor] Reset compositor zoom before loading new playback")
         
-        # Load metadata
-        self.mode_name_input.setText(data.get("name", "Unnamed"))
-        
-        # Load spiral settings
-        spiral = data.get("spiral", {})
-        spiral_type = spiral.get("type", "linear")
-        type_map = {
-            "logarithmic": 0, "quadratic": 1, "linear": 2,
-            "sqrt": 3, "inverse": 4, "power": 5, "sawtooth": 6
-        }
-        self.spiral_type_combo.setCurrentIndex(type_map.get(spiral_type, 2))
-        
-        # Rotation speed: stored as RPM, convert to slider value (x10)
-        rpm = spiral.get("rotation_speed", 40.0)
-        x_val = rpm / self.SPEED_GAIN
-        print(f"[PlaybackEditor LOAD] rpm={rpm}, x_val={x_val}, slider_value={int(x_val * 10)}", flush=True)
-        self.rotation_speed_slider.setValue(int(x_val * 10))
-        
-        # CRITICAL: Explicitly set rotation speed on director since slider valueChanged
-        # may not fire during initialization
-        if hasattr(self, 'director') and self.director:
-            reversed_flag = spiral.get("reverse", False)
-            final_rpm = -rpm if reversed_flag else rpm
-            self.director.set_rotation_speed(final_rpm)
-            print(f"[PlaybackEditor LOAD] Explicitly set director RPM: {final_rpm:.1f}", flush=True)
-        
-        self.opacity_slider.setValue(int(spiral.get("opacity", 0.8) * 100))
-        self.spiral_reverse_check.setChecked(spiral.get("reverse", False))
+        try:
+            # Load metadata
+            self.mode_name_input.setText(data.get("name", "Unnamed"))
 
-        # Spiral colors (optional per-playback fields)
-        self.arm_color = self._clamp_color_tuple(spiral.get("arm_color"), (1.0, 1.0, 1.0))
-        self.gap_color = self._clamp_color_tuple(spiral.get("gap_color"), (0.0, 0.0, 0.0))
-        self._apply_spiral_colors_to_preview()
-        
-        # Load media settings
-        media_data = data.get("media", {})
-        media_mode = media_data.get("mode", "both")
-        mode_map = {"both": 0, "images": 1, "videos": 2}
-        self.media_mode_combo.setCurrentIndex(mode_map.get(media_mode, 0))
-        
-        self.media_speed_slider.setValue(media_data.get("cycle_speed", 50))
-        
-        # Load bank selections
-        bank_selections = media_data.get("bank_selections", [])
-        self._refresh_media_bank_list()
-        
-        # If file has bank_selections, apply them; otherwise keep all checked
-        if bank_selections:
-            for i in range(self.list_media_bank.count()):
-                item = self.list_media_bank.item(i)
-                bank_idx = item.data(Qt.ItemDataRole.UserRole)
-                item.setCheckState(
-                    Qt.CheckState.Checked if bank_idx in bank_selections else Qt.CheckState.Unchecked
+            # Load spiral settings
+            spiral = data.get("spiral", {})
+            spiral_type = spiral.get("type", "linear")
+            type_map = {
+                "logarithmic": 0, "quadratic": 1, "linear": 2,
+                "sqrt": 3, "inverse": 4, "power": 5, "sawtooth": 6
+            }
+            self.spiral_type_combo.setCurrentIndex(type_map.get(spiral_type, 2))
+
+            # Rotation speed: stored as RPM, convert to slider value (x10)
+            rpm = spiral.get("rotation_speed", 40.0)
+            x_val = rpm / self.SPEED_GAIN
+            print(f"[PlaybackEditor LOAD] rpm={rpm}, x_val={x_val}, slider_value={int(x_val * 10)}", flush=True)
+            self.rotation_speed_slider.setValue(int(x_val * 10))
+
+            # CRITICAL: Explicitly set rotation speed on director since slider valueChanged
+            # may not fire during initialization
+            if hasattr(self, 'director') and self.director:
+                reversed_flag = spiral.get("reverse", False)
+                final_rpm = -rpm if reversed_flag else rpm
+                self.director.set_rotation_speed(final_rpm)
+                print(f"[PlaybackEditor LOAD] Explicitly set director RPM: {final_rpm:.1f}", flush=True)
+
+            self.opacity_slider.setValue(int(spiral.get("opacity", 0.8) * 100))
+            self.spiral_reverse_check.setChecked(spiral.get("reverse", False))
+
+            # Spiral colors (optional per-playback fields)
+            self.arm_color = self._clamp_color_tuple(spiral.get("arm_color"), (1.0, 1.0, 1.0))
+            self.gap_color = self._clamp_color_tuple(spiral.get("gap_color"), (0.0, 0.0, 0.0))
+            self._apply_spiral_colors_to_preview()
+
+            # Load media settings
+            media_data = data.get("media", {})
+            media_mode = media_data.get("mode", "both")
+            mode_map = {"both": 0, "images": 1, "videos": 2}
+            self.media_mode_combo.setCurrentIndex(mode_map.get(media_mode, 0))
+
+            self.media_speed_slider.setValue(media_data.get("cycle_speed", 50))
+
+            # Load bank selections
+            bank_selections = media_data.get("bank_selections", [])
+            self._refresh_media_bank_list()
+
+            # If file has bank_selections, apply them; otherwise keep all checked
+            if bank_selections:
+                for i in range(self.list_media_bank.count()):
+                    item = self.list_media_bank.item(i)
+                    bank_idx = item.data(Qt.ItemDataRole.UserRole)
+                    item.setCheckState(
+                        Qt.CheckState.Checked if bank_idx in bank_selections else Qt.CheckState.Unchecked
+                    )
+                # If filtering by media mode hid all selected indices, don't leave the user
+                # with zero visible banks selected (which would scan nothing).
+                any_checked = any(
+                    self.list_media_bank.item(i).checkState() == Qt.CheckState.Checked
+                    for i in range(self.list_media_bank.count())
                 )
-        # else: keep all checked (default from _refresh_media_bank_list)
-        
-        # Load text settings
-        text_data = data.get("text", {})
-        self.text_enabled_check.setChecked(text_data.get("enabled", True))
-        self.text_opacity_slider.setValue(int(text_data.get("opacity", 0.8) * 100))
-        
-        text_mode = text_data.get("mode", "centered_sync")
-        mode_map = {"centered_sync": 0, "subtext": 1}
-        self.text_mode_combo.setCurrentIndex(mode_map.get(text_mode, 0))
+                if not any_checked and self.list_media_bank.count() > 0:
+                    logger.warning(
+                        "[PlaybackEditor] bank_selections did not match visible banks; selecting all visible banks"
+                    )
+                    for i in range(self.list_media_bank.count()):
+                        self.list_media_bank.item(i).setCheckState(Qt.CheckState.Checked)
+            # else: keep all checked (default from _refresh_media_bank_list)
 
-        self.text_color = self._clamp_color_tuple(text_data.get("color"), (1.0, 1.0, 1.0))
-        self._apply_text_color_to_preview()
+            # Load text settings
+            text_data = data.get("text", {})
+            self.text_enabled_check.setChecked(text_data.get("enabled", True))
+            self.text_opacity_slider.setValue(int(text_data.get("opacity", 0.8) * 100))
 
-        # Text sync + manual speed
-        manual_speed = int(text_data.get("manual_cycle_speed", 50))
-        manual_speed = max(1, min(100, manual_speed))
-        sync_with_media = text_data.get("sync_with_media", True)
-        self.text_speed_slider.blockSignals(True)
-        self.text_speed_slider.setValue(manual_speed)
-        self.text_speed_slider.blockSignals(False)
-        self.text_sync_check.blockSignals(True)
-        self.text_sync_check.setChecked(sync_with_media)
-        self.text_sync_check.blockSignals(False)
-        self._preferred_text_sync = sync_with_media
-        self._refresh_text_speed_label()
-        self._enforce_text_sync_policy()
-        self._apply_text_sync_settings()
-        
-        # Load zoom settings
-        zoom_data = data.get("zoom", {})
-        zoom_mode = zoom_data.get("mode", "exponential")
-        mode_map = {"exponential": 0, "pulse": 1, "linear": 2, "none": 3}
-        self.zoom_mode_combo.setCurrentIndex(mode_map.get(zoom_mode, 0))
-        
-        saved_zoom_rate = float(zoom_data.get("rate", 0.2))
-        self.zoom_rate_slider.setValue(int(saved_zoom_rate * 100))
-        self._apply_zoom_rate(saved_zoom_rate, mark_modified=False)
+            text_mode = text_data.get("mode", "centered_sync")
+            mode_map = {"centered_sync": 0, "subtext": 1}
+            self.text_mode_combo.setCurrentIndex(mode_map.get(text_mode, 0))
 
-        # Load accelerate settings
-        accel_data = data.get("accelerate", {})
-        accel_enabled = bool(accel_data.get("enabled", False))
-        accel_duration = float(accel_data.get("duration", 30))
-        accel_start_rotation = accel_data.get("start_rotation_x")
-        accel_start_media = accel_data.get("start_media_speed")
-        accel_start_zoom = accel_data.get("start_zoom_rate")
+            self.text_color = self._clamp_color_tuple(text_data.get("color"), (1.0, 1.0, 1.0))
+            self._apply_text_color_to_preview()
 
-        try:
-            self._accelerate_rotation_start_x = float(accel_start_rotation)
-        except (TypeError, ValueError):
-            self._accelerate_rotation_start_x = self.rotation_speed_slider.value() / 10.0
+            # Text sync + manual speed
+            manual_speed = int(text_data.get("manual_cycle_speed", 50))
+            manual_speed = max(1, min(100, manual_speed))
+            sync_with_media = text_data.get("sync_with_media", True)
+            self.text_speed_slider.blockSignals(True)
+            self.text_speed_slider.setValue(manual_speed)
+            self.text_speed_slider.blockSignals(False)
+            self.text_sync_check.blockSignals(True)
+            self.text_sync_check.setChecked(sync_with_media)
+            self.text_sync_check.blockSignals(False)
+            self._preferred_text_sync = sync_with_media
+            self._refresh_text_speed_label()
+            self._enforce_text_sync_policy()
+            self._apply_text_sync_settings()
 
-        try:
-            self._accelerate_media_start_speed = float(accel_start_media)
-        except (TypeError, ValueError):
-            self._accelerate_media_start_speed = float(self.media_speed_slider.value())
+            # Load zoom settings
+            zoom_data = data.get("zoom", {})
+            zoom_mode = zoom_data.get("mode", "exponential")
+            mode_map = {"exponential": 0, "pulse": 1, "linear": 2, "none": 3}
+            self.zoom_mode_combo.setCurrentIndex(mode_map.get(zoom_mode, 0))
 
-        try:
-            self._accelerate_zoom_start_rate = float(accel_start_zoom)
-        except (TypeError, ValueError):
-            self._accelerate_zoom_start_rate = self.zoom_rate_slider.value() / 100.0
+            saved_zoom_rate = float(zoom_data.get("rate", 0.2))
+            self.zoom_rate_slider.setValue(int(saved_zoom_rate * 100))
+            self._apply_zoom_rate(saved_zoom_rate, mark_modified=False)
 
-        self._cancel_accelerate_auto_enable_timer()
-        self._accelerate_auto_enable_pending = False
-        self._accelerate_auto_enable_scheduled = False
+            # Load accelerate settings
+            accel_data = data.get("accelerate", {})
+            accel_enabled = bool(accel_data.get("enabled", False))
+            accel_duration = float(accel_data.get("duration", 30))
+            accel_start_rotation = accel_data.get("start_rotation_x")
+            accel_start_media = accel_data.get("start_media_speed")
+            accel_start_zoom = accel_data.get("start_zoom_rate")
 
-        self.accelerate_enable_check.blockSignals(True)
-        self.accelerate_enable_check.setChecked(accel_enabled)
-        self.accelerate_enable_check.blockSignals(False)
+            try:
+                self._accelerate_rotation_start_x = float(accel_start_rotation)
+            except (TypeError, ValueError):
+                self._accelerate_rotation_start_x = self.rotation_speed_slider.value() / 10.0
 
-        if accel_enabled:
-            # Start acceleration immediately without any delay
-            logger.info(f"[PlaybackEditor] Starting acceleration immediately for loaded playback")
-            self._accelerate_hidden_disabled = False
-            self._reset_accelerate_progress()
-            # CRITICAL: Immediately update compositor effects to prevent visual snap
-            # Without this, media cycles immediately but spiral/zoom don't update until next frame
-            self._update_accelerate_effects()
-            logger.info(f"[PlaybackEditor] Applied initial acceleration visual effects")
-        else:
-            self._accelerate_hidden_disabled = False
-            self._update_accelerate_state_label()
+            try:
+                self._accelerate_media_start_speed = float(accel_start_media)
+            except (TypeError, ValueError):
+                self._accelerate_media_start_speed = float(self.media_speed_slider.value())
 
-        self.accelerate_duration_slider.blockSignals(True)
-        duration_clamped = max(self.accelerate_duration_slider.minimum(), min(self.accelerate_duration_slider.maximum(), int(accel_duration)))
-        self.accelerate_duration_slider.setValue(duration_clamped)
-        self.accelerate_duration_slider.blockSignals(False)
+            try:
+                self._accelerate_zoom_start_rate = float(accel_start_zoom)
+            except (TypeError, ValueError):
+                self._accelerate_zoom_start_rate = self.zoom_rate_slider.value() / 100.0
 
-        self._update_accelerate_duration_label(duration_clamped)
-        
-        # Reload media with new bank selections
-        if PREVIEW_AVAILABLE:
-            QTimer.singleShot(100, self._load_test_images)
-        # NOTE: Don't call _reset_accelerate_progress() here - already called above for accel_enabled
-        # Calling it again would reset the start time and cause delays
-        self._capture_accelerate_start_values()
+            self._cancel_accelerate_auto_enable_timer()
+            self._accelerate_auto_enable_pending = False
+            self._accelerate_auto_enable_scheduled = False
+
+            self.accelerate_enable_check.blockSignals(True)
+            self.accelerate_enable_check.setChecked(accel_enabled)
+            self.accelerate_enable_check.blockSignals(False)
+
+            if accel_enabled:
+                # Start acceleration immediately without any delay
+                logger.info(f"[PlaybackEditor] Starting acceleration immediately for loaded playback")
+                self._accelerate_hidden_disabled = False
+                self._reset_accelerate_progress()
+                # CRITICAL: Immediately update compositor effects to prevent visual snap
+                # Without this, media cycles immediately but spiral/zoom don't update until next frame
+                self._update_accelerate_effects()
+                logger.info(f"[PlaybackEditor] Applied initial acceleration visual effects")
+            else:
+                self._accelerate_hidden_disabled = False
+                self._update_accelerate_state_label()
+
+            self.accelerate_duration_slider.blockSignals(True)
+            duration_clamped = max(self.accelerate_duration_slider.minimum(), min(self.accelerate_duration_slider.maximum(), int(accel_duration)))
+            self.accelerate_duration_slider.setValue(duration_clamped)
+            self.accelerate_duration_slider.blockSignals(False)
+
+            self._update_accelerate_duration_label(duration_clamped)
+
+            # Reload media with new bank selections
+            if PREVIEW_AVAILABLE:
+                QTimer.singleShot(100, self._load_test_images)
+            # NOTE: Don't call _reset_accelerate_progress() here - already called above for accel_enabled
+            # Calling it again would reset the start time and cause delays
+            self._capture_accelerate_start_values()
+        finally:
+            self._suppress_preview_reload = False
+            self._maybe_schedule_preview_reload(reason="load_from_dict", delay_ms=50)
     
     def _save_playback(self):
         """Save playback (to session or file depending on mode)."""
@@ -2853,8 +3344,8 @@ class PlaybackEditor(QDialog):
             self._save_to_session()
             return
         
-        default_dir = PROJECT_ROOT / "mesmerglass" / "playbacks"
-        default_dir.mkdir(parents=True, exist_ok=True)
+        from mesmerglass.platform_paths import ensure_dir, get_user_data_dir
+        default_dir = ensure_dir(get_user_data_dir() / "playbacks")
         
         mode_name = self.mode_name_input.text().strip()
         default_filename = f"{mode_name.replace(' ', '_').lower()}.json"
@@ -3113,13 +3604,27 @@ class PlaybackEditor(QDialog):
         # Stop timers
         if hasattr(self, 'timer'):
             self.timer.stop()
-        if hasattr(self, 'render_timer'):
-            self.render_timer.stop()
+        if hasattr(self, 'render_timer') and getattr(self, 'render_timer', None) is not None:
+            try:
+                self.render_timer.stop()
+            except Exception:
+                pass
         if hasattr(self, 'image_cycle_timer'):
-            self.image_cycle_timer.stop()
+            if getattr(self, 'image_cycle_timer', None) is not None:
+                try:
+                    self.image_cycle_timer.stop()
+                except Exception:
+                    pass
         self._cancel_cycle_watchdog()
         
         self._stop_video()
+
+        # Stop preview video streamer if active
+        if getattr(self, "_preview_video_streamer", None) is not None:
+            try:
+                self._preview_video_streamer.stop()
+            except Exception:
+                pass
         
         event.accept()
 
