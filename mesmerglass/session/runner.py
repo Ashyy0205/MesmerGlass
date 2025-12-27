@@ -148,6 +148,12 @@ class SessionRunner:
         self._transition_in_progress = False  # Currently fading between cues
         self._transition_start_time: Optional[float] = None  # When fade started
         self._transition_fade_alpha: float = 1.0  # Fade alpha (1.0 = old cue, 0.0 = new cue)
+
+        # Transition safety: if cycle boundaries never arrive (e.g., media disabled
+        # or a visual doesn't emit cycle events), we must still respect cue durations.
+        self._pending_transition_since_ts: Optional[float] = None
+        self._last_cycle_boundary_ts: Optional[float] = None
+        self._cycle_boundary_interval_ema_s: float = 1.0
         
         # Session timing
         self._session_start_time: Optional[float] = None
@@ -1006,6 +1012,7 @@ class SessionRunner:
         self._cue_start_time = None
         self._session_start_time = None
         self._pending_transition = False
+        self._pending_transition_since_ts = None
         self._transition_target_cue = None
     
     def pause(self) -> bool:
@@ -1854,6 +1861,63 @@ class SessionRunner:
         # Check for transition triggers
         if self._check_transition_trigger():
             self._request_transition()
+
+        # Safety net: if we are waiting for a cycle boundary that never arrives,
+        # force the transition so cue durations are respected.
+        if self._pending_transition:
+            self._force_transition_if_stuck()
+
+    def _force_transition_if_stuck(self) -> None:
+        """Force a pending cue transition when cycle boundaries do not arrive.
+
+        Transitions are designed to be cycle-synchronized, but some visuals/media
+        modes may not emit cycle boundaries (or may emit them extremely rarely).
+        Without a fallback, cues (and ONCE-mode sessions) can run indefinitely.
+        """
+        if not self._pending_transition or self._transition_target_cue is None:
+            return
+
+        # If we're ending the session (next cue < 0), do not wait for a cycle boundary.
+        if self._transition_target_cue < 0:
+            cue_elapsed = self._get_cue_elapsed_time()
+            cue = None
+            if 0 <= self._current_cue_index < len(self.cuelist.cues):
+                cue = self.cuelist.cues[self._current_cue_index]
+
+            if cue is None or cue_elapsed >= cue.duration_seconds:
+                self.logger.info("[session] Forcing session end (no cycle boundary required)")
+                target = self._transition_target_cue
+                self._pending_transition = False
+                self._pending_transition_since_ts = None
+                self._transition_target_cue = None
+                self._execute_transition(target)
+            return
+
+        if self._pending_transition_since_ts is None:
+            self._pending_transition_since_ts = time.perf_counter()
+            return
+
+        waited_s = time.perf_counter() - self._pending_transition_since_ts
+
+        # Timeout scales with observed cycle interval; if we've never observed a
+        # cycle boundary, fall back to a small constant.
+        base_interval_s = float(self._cycle_boundary_interval_ema_s or 1.0)
+        timeout_s = max(0.75, min(10.0, 2.5 * base_interval_s))
+
+        if waited_s < timeout_s:
+            return
+
+        self.logger.warning(
+            "[session] Forcing cue transition after %.2fs waiting for cycle boundary (timeout=%.2fs)",
+            waited_s,
+            timeout_s,
+        )
+
+        target = self._transition_target_cue
+        self._pending_transition = False
+        self._pending_transition_since_ts = None
+        self._transition_target_cue = None
+        self._execute_transition(target)
     
     def _check_playback_switch(self) -> None:
         """Check if we should switch to a new playback from the pool (time-based with cycle sync)."""
@@ -2016,6 +2080,7 @@ class SessionRunner:
         
         self.logger.info("[session] Transition requested, waiting for cycle boundary...")
         self._pending_transition = True
+        self._pending_transition_since_ts = time.perf_counter()
 
         # Determine next cue index
         self._transition_target_cue = self._calculate_next_cue_index()
@@ -2023,6 +2088,16 @@ class SessionRunner:
     
     def _on_cycle_boundary(self) -> None:
         """Callback fired when visual director crosses a cycle boundary."""
+        now = time.perf_counter()
+        if self._last_cycle_boundary_ts is not None:
+            interval = now - self._last_cycle_boundary_ts
+            interval = max(0.05, min(60.0, float(interval)))
+            alpha = 0.25
+            self._cycle_boundary_interval_ema_s = (
+                (1.0 - alpha) * self._cycle_boundary_interval_ema_s + alpha * interval
+            )
+        self._last_cycle_boundary_ts = now
+
         if self._playback_switch_pending and self._pending_transition:
             if self._process_playback_switch(force=True):
                 self.logger.debug(
@@ -2045,6 +2120,7 @@ class SessionRunner:
         
         # Clear pending state
         self._pending_transition = False
+        self._pending_transition_since_ts = None
         self._transition_target_cue = None
     
     def _log_frame_timing_stats(self) -> None:

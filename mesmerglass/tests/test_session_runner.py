@@ -521,6 +521,34 @@ class TestCueProgression:
         assert not runner._pending_transition
         assert len(events) == 1
 
+    def test_once_mode_ends_without_cycle_boundary(self, sample_playback_entries, mock_visual_director):
+        """ONCE-mode sessions must end even if cycle boundaries never arrive.
+
+        Some visuals/media modes may not emit cycle boundary callbacks (e.g. media disabled).
+        In that case, cue durations must still be enforced so the cuelist doesn't run forever.
+        """
+        cuelist = Cuelist(name="NoCycles", loop_mode=CuelistLoopMode.ONCE)
+        cuelist.add_cue(
+            Cue(
+                name="OnlyCue",
+                duration_seconds=1.0,
+                playback_pool=[sample_playback_entries[0]],
+                selection_mode=PlaybackSelectionMode.ON_CUE_START,
+            )
+        )
+
+        runner = SessionRunner(cuelist, mock_visual_director)
+        assert runner.start()
+
+        # Expire the cue duration.
+        runner._cue_start_time = time.time() - 2.0
+
+        # No cycle boundary will be fired in this test.
+        runner.update(0.016)
+
+        assert runner.is_stopped()
+        assert runner.get_current_cue_index() == -1
+
 
 class TestSessionControl:
     """Test pause/resume/stop functionality."""
