@@ -100,6 +100,8 @@ class VisualDirector:
         self._last_image_zoom_restart_frame: Optional[int] = None
         self._last_image_zoom_restart_ts: Optional[float] = None
         self._global_image_zoom_duration: Optional[int] = None
+        self._last_video_streamer_tick_ts: Optional[float] = None
+        self._video_streamer_tick_fps_ema: float = 60.0
     
     # ===== Multi-Display Support =====
     
@@ -465,7 +467,31 @@ class VisualDirector:
 
                         update_start = perf_counter()
                         # Advance video playback
-                        self.video_streamer.update(global_fps=60.0)
+                        # IMPORTANT: Use the *actual* tick rate here.
+                        # The compositor may render at a steady 60Hz while the Qt update loop
+                        # can briefly run faster (especially during startup), which would
+                        # make video appear to fast-forward for ~1s if we hard-code 60fps.
+                        now_ts = perf_counter()
+                        last_ts = self._last_video_streamer_tick_ts
+                        self._last_video_streamer_tick_ts = now_ts
+                        if last_ts is None:
+                            effective_fps = 60.0
+                        else:
+                            dt = now_ts - last_ts
+                            if dt <= 0:
+                                effective_fps = 60.0
+                            else:
+                                effective_fps = 1.0 / dt
+                                # Clamp to avoid absurd values from timer jitter.
+                                effective_fps = max(10.0, min(240.0, effective_fps))
+
+                        # Smooth a bit so tiny dt jitter doesn't cause speed wobble.
+                        alpha = 0.15
+                        self._video_streamer_tick_fps_ema = (
+                            (1.0 - alpha) * self._video_streamer_tick_fps_ema + alpha * effective_fps
+                        )
+
+                        self.video_streamer.update(global_fps=self._video_streamer_tick_fps_ema)
                         update_duration = perf_counter() - update_start
                     
                         if update_duration > slow_threshold:
@@ -520,7 +546,9 @@ class VisualDirector:
                             for comp in self._get_all_compositors():
                                 try:
                                     current_zoom = getattr(comp, '_background_zoom', 1.0)
-                                    frame_zoom = 1.0 if is_first_frame else current_zoom
+                                    # Keep the current zoom on the first frame to avoid a visible
+                                    # "snap back" when switching media.
+                                    frame_zoom = current_zoom
                                     comp.set_background_video_frame(
                                         frame.data,
                                         width=frame.width,
@@ -920,9 +948,23 @@ class VisualDirector:
                     self.logger.debug("[visual] Background texture applied (zoom disabled)")
                 
                 if should_start_zoom and hasattr(self.compositor, 'start_zoom_animation'):
-                    current_zoom = getattr(self.compositor, '_background_zoom', 1.0)
-                    self.compositor.start_zoom_animation(target_zoom=1.5, start_zoom=current_zoom, duration_frames=48)
-                    self.logger.debug("[visual] Background texture applied with zoom animation")
+                    current_zoom = 1.0
+                    # Keep zoom moving for the entire media cycle; otherwise it will
+                    # finish early and appear to "zoom once then stop" until the next
+                    # media change.
+                    # If expected cycle frames is extremely small (e.g., 7), the zoom can be so
+                    # fast it looks like it "doesn't zoom". Clamp to a small minimum so motion
+                    # is still visible while remaining responsive.
+                    duration_frames = max(20, int(self._get_expected_media_cycle_frames()))
+                    self.compositor.start_zoom_animation(
+                        target_zoom=1.5,
+                        start_zoom=current_zoom,
+                        duration_frames=duration_frames,
+                    )
+                    self.logger.debug(
+                        "[visual] Background texture applied with zoom animation (duration=%d)",
+                        duration_frames,
+                    )
                 
                 # Notify text director of media change (for CENTERED_SYNC mode)
                 # Call this when image is actually uploaded (not before)
@@ -1297,12 +1339,9 @@ class VisualDirector:
 
     def _capture_video_zoom_duration(self) -> Optional[int]:
         """Measure the previous zoom span so the next clip can use a matching duration."""
-        frames_per_cycle = None
-        if self.current_visual and hasattr(self.current_visual, '_frames_per_cycle'):
-            try:
-                frames_per_cycle = int(max(1, getattr(self.current_visual, '_frames_per_cycle', 0)))
-            except Exception:
-                frames_per_cycle = None
+        # Zoom duration should never be shorter than the media-cycle duration,
+        # otherwise zoom will finish early and look "wrong".
+        expected_frames = max(1, self._get_expected_media_cycle_frames())
 
         measured_span: Optional[int] = None
         if self._last_video_zoom_restart_frame is not None:
@@ -1311,22 +1350,22 @@ class VisualDirector:
         # Update baseline for the next measurement (current frame marks new clip start)
         self._last_video_zoom_restart_frame = self._frame_count
 
-        if measured_span is not None and frames_per_cycle:
-            measured_span = max(measured_span, frames_per_cycle)
+        if measured_span is not None:
+            measured_span = max(measured_span, expected_frames)
 
         if measured_span is not None:
             self.logger.debug(
-                "[visual.video] Measured previous zoom duration: %d frames (min=%s)",
+                "[visual.video] Measured previous zoom duration: %d frames (min=%d)",
                 measured_span,
-                frames_per_cycle,
+                expected_frames,
             )
-        elif frames_per_cycle:
+        else:
             self.logger.debug(
                 "[visual.video] No prior zoom duration measured; defaulting to %d frames",
-                frames_per_cycle,
+                expected_frames,
             )
 
-        self._video_zoom_duration_override = measured_span or frames_per_cycle
+        self._video_zoom_duration_override = measured_span or expected_frames
         return self._video_zoom_duration_override
 
     def _restart_video_zoom_animation(
@@ -1356,9 +1395,12 @@ class VisualDirector:
             return
 
         duration_frames = effective_duration or self._derive_visual_cycle_frames()
+        duration_frames = max(20, int(duration_frames or 1))
 
         if self.compositor and hasattr(self.compositor, 'start_zoom_animation'):
             try:
+                if abs(float(start_zoom) - 1.5) < 1e-3:
+                    start_zoom = 1.0
                 self.compositor.start_zoom_animation(
                     target_zoom=1.5,
                     start_zoom=start_zoom,

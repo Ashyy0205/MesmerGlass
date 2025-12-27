@@ -293,11 +293,11 @@ class SessionManager:
             },
             "intense": {
                 "spiral": {"type": "logarithmic", "rotation_speed": 100.0, "opacity": 0.65, "reverse": True},
-                "zoom": {"mode": "pulse", "rate": 30.0}
+                "zoom": {"mode": "exponential", "rate": 30.0}
             },
             "gentle": {
                 "spiral": {"type": "sqrt", "rotation_speed": 20.0, "opacity": 0.35, "reverse": False},
-                "zoom": {"mode": "linear", "rate": 10.0}
+                "zoom": {"mode": "exponential", "rate": 10.0}
             },
             "minimal": {
                 "spiral": {"type": "linear", "rotation_speed": 10.0, "opacity": 0.2, "reverse": False},

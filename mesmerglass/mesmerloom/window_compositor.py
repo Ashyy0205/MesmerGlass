@@ -1213,11 +1213,20 @@ class LoomWindowCompositor(QOpenGLWindow):
         Args:
             duration_seconds: Fade duration in seconds (0.0 = instant, 0.5 = half second, etc.)
         """
-        self._fade_duration = 0.0
-        self._fade_enabled = False
-        self._fade_queue.clear()
-        self._fade_active = False
-        logger.info("[fade] Disabled (instant transitions)")
+        try:
+            value = float(duration_seconds)
+        except (TypeError, ValueError):
+            value = 0.0
+
+        value = max(0.0, value)
+        self._fade_duration = value
+        self._fade_enabled = value > 0.0
+        if not self._fade_enabled:
+            self._fade_queue.clear()
+            self._fade_active = False
+            logger.info("[fade] Disabled (instant transitions)")
+        else:
+            logger.info(f"[fade] Enabled (duration={self._fade_duration:.2f}s)")
     
     def set_background_zoom(self, zoom: float) -> None:
         """Set background zoom factor."""
@@ -1230,33 +1239,72 @@ class LoomWindowCompositor(QOpenGLWindow):
             target_zoom: Final zoom level (clamped to 0.1-5.0)
             start_zoom: Starting zoom level (clamped to 0.1-5.0)
             duration_frames: Number of frames over which to animate (e.g., 48 for images, 300 for videos)
-            mode: "exponential" (continuous zoom in/out), "pulse" (wave), "linear" (legacy), "falling" (zoom out)
+            mode: "exponential" (continuous zoom in). Other legacy modes are treated as exponential.
             rate: Optional explicit zoom rate (overrides auto-calculation)
         """
         # Don't start zoom if disabled (e.g., video focus mode)
         if not self._zoom_enabled:
             return
         
-        self._zoom_start = max(0.1, min(5.0, start_zoom))
-        self._zoom_target = max(0.1, min(5.0, target_zoom))
+        normalized_mode = "exponential" if mode == "exponential" else "exponential"
+
+        normalized_start = max(0.1, min(5.0, start_zoom))
+        normalized_target = max(0.1, min(5.0, target_zoom))
+
+        # Treat (start_zoom -> target_zoom) as a requested multiplier.
+        # For the "illusion" behavior: restart each media item at a stable baseline
+        # (typically 1.0) and keep motion constant so it never appears to pause.
+        requested_factor = normalized_target / max(0.001, normalized_start)
+
+        self._zoom_start = normalized_start
+        self._zoom_target = normalized_target
+
+        # If start is too close to target, the zoom delta is imperceptible.
+        if abs(self._zoom_target - self._zoom_start) < 0.02:
+            if abs(self._zoom_target - 1.5) < 0.02:
+                self._zoom_start = 1.0
+            elif abs(self._zoom_target - 1.0) < 0.02:
+                self._zoom_start = 1.5
+            else:
+                self._zoom_start = 1.0
+
         self._zoom_current = self._zoom_start
         self._zoom_duration_frames = max(1, duration_frames)
         self._zoom_elapsed_frames = 0
-        self._zoom_start_time = time.time()  # Reset time for consistent speed
+        # Use a monotonic clock so system time adjustments and FPS spikes don't affect zoom timing.
+        now = time.perf_counter()
+        self._zoom_start_time = now
+        self._zoom_last_time = now
+        self._zoom_duration_seconds = max(1e-3, self._zoom_duration_frames / 60.0)
         
         # Store zoom mode for update calculations
-        self._zoom_mode = mode if mode in ["exponential", "pulse", "linear", "falling"] else "exponential"
+        self._zoom_mode = normalized_mode
         
-        # Set explicit zoom rate if provided, otherwise use default calculation
-        if rate is not None:
-            self._zoom_rate = rate
-            # For exponential mode (zoom in), rate should be POSITIVE (zoom value increases)
-            # Shader uses / uZoom, so LARGER zoom = shows LESS = visual zoom in
-            if mode == "exponential" and self._zoom_rate < 0:
+        # For exponential we want CONSTANT speed; _zoom_rate is log-rate-per-second.
+        if normalized_mode == "exponential":
+            duration_s = float(getattr(self, "_zoom_duration_seconds", 0.0) or 0.0)
+            if duration_s <= 0.0:
+                duration_s = max(1e-3, float(self._zoom_duration_frames or 1) / 60.0)
+
+            if rate is not None:
+                self._zoom_rate = float(rate)
+            else:
+                import math
+                factor = float(requested_factor)
+                if factor <= 0.0:
+                    factor = 1.0
+                if abs(factor - 1.0) < 1e-6:
+                    factor = 1.5
+                self._zoom_rate = math.log(factor) / duration_s
+
+            if self._zoom_rate < 0:
                 self._zoom_rate = abs(self._zoom_rate)
-            # For falling mode (zoom out), rate should be NEGATIVE (zoom value decreases)
-            elif mode == "falling" and self._zoom_rate > 0:
-                self._zoom_rate = -self._zoom_rate
+            logger.info(
+                f"[zoom] Starting {normalized_mode} zoom start={self._zoom_start:.3f} target={self._zoom_target:.3f} "
+                f"log_rate={self._zoom_rate:.3f}/s (duration={duration_s:.2f}s)"
+            )
+        elif rate is not None:
+            self._zoom_rate = float(rate)
         
         self._background_zoom = self._zoom_current
         self._zoom_animating = True
@@ -1299,61 +1347,31 @@ class LoomWindowCompositor(QOpenGLWindow):
         logger.info(f"[compositor] Zoom target set to {self._zoom_target}x")
     
     def update_zoom_animation(self) -> None:
-        """Update zoom animation (exponential, pulse, falling, or linear modes)."""
+        """Update zoom animation (exponential mode)."""
         if not self._zoom_animating:
             return
         
         # Increment elapsed frames
         self._zoom_elapsed_frames += 1
-        # Use frame-based time for consistent animation speed regardless of actual FPS
-        # This ensures zoom duration matches media cycle duration (both use frame counts)
-        elapsed_time = self._zoom_elapsed_frames / 60.0  # Assume 60fps target
-        
-        # Calculate zoom based on mode
+
+        # Treat any legacy mode as exponential.
+        if self._zoom_mode != "exponential":
+            self._zoom_mode = "exponential"
+
         if self._zoom_mode == "exponential":
-            # Exponential zoom IN: zoom value increases (shader divides by it)
-            # With positive rate, zoom: 1.0 → 1.5 → 2.0 → 3.0
-            # Shader /zoom with larger values = see LESS = visual zoom in
             import math
-            
-            # Check if duration-based animation is complete
-            if self._zoom_elapsed_frames >= self._zoom_duration_frames:
-                # Hold at target zoom (don't reset or continue growing)
-                self._zoom_current = self._zoom_target
-                self._zoom_animating = False  # Stop animation
-            else:
-                # Continue exponential growth until duration complete
-                self._zoom_current = self._zoom_start * math.exp(self._zoom_rate * elapsed_time)
-                # Clamp to target (don't overshoot)
-                self._zoom_current = min(self._zoom_current, self._zoom_target)
-        
-        elif self._zoom_mode == "falling":
-            # Falling mode: zoom OUT (zoom value decreases)
-            import math
-            self._zoom_current = self._zoom_start * math.exp(self._zoom_rate * elapsed_time)  # rate should be negative
-            
-            # Reset when zoom gets too small (zoomed out limit)
-            if self._zoom_current < 0.5:
-                self._zoom_start = 1.0
-                self._zoom_current = 1.0
-                self._zoom_start_time = time.time()
-        
-        elif self._zoom_mode == "pulse":
-            # Pulsing wave: scale = 1.0 + amplitude * sin(rate * time)
-            # Creates repeating zoom in/out effect synced to spiral
-            import math
-            amplitude = 0.3  # 30% zoom variation (1.0 to 1.3)
-            self._zoom_current = 1.0 + amplitude * math.sin(self._zoom_rate * elapsed_time)
-        
-        else:  # "linear" mode (legacy)
-            # Linear interpolation from start to target over fixed duration
-            progress = min(1.0, self._zoom_elapsed_frames / self._zoom_duration_frames)
-            self._zoom_current = self._zoom_start + (self._zoom_target - self._zoom_start) * progress
-            
-            # Stop animation when complete
-            if progress >= 1.0:
-                self._zoom_current = self._zoom_target
-                self._zoom_animating = False
+            now = time.perf_counter()
+            last = float(getattr(self, "_zoom_last_time", 0.0) or now)
+            dt = max(0.0, now - last)
+            dt = min(dt, 0.10)
+            self._zoom_last_time = now
+
+            current = float(getattr(self, "_zoom_current", 1.0) or 1.0)
+            current = max(0.001, current)
+            rate = float(getattr(self, "_zoom_rate", 0.0) or 0.0)
+            self._zoom_current = current * math.exp(rate * dt)
+        else:
+            return
         
         # Clamp to safe range
         self._zoom_current = max(0.1, min(5.0, self._zoom_current))
@@ -1546,7 +1564,11 @@ class LoomWindowCompositor(QOpenGLWindow):
                 # Update state
                 self._background_image_width = width
                 self._background_image_height = height
-                self._background_zoom = max(0.1, min(5.0, zoom))
+                # Important: video uploads happen every frame. If we overwrite
+                # _background_zoom here while a compositor-driven zoom animation is
+                # active, the animation will appear to "zoom once then stop".
+                if not getattr(self, "_zoom_animating", False):
+                    self._background_zoom = max(0.1, min(5.0, zoom))
                 self._background_enabled = True
 
                 if getattr(self, "_pending_video_upload_log", False):

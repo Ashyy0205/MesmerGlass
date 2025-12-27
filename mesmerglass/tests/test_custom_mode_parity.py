@@ -77,8 +77,6 @@ def test_zoom_mode_mapping():
     # Visual Mode Creator combo box text → JSON mode value
     creator_to_json = {
         "Exponential (Falling In)": "exponential",
-        "Pulse (Wave)": "pulse",
-        "Linear (Legacy)": "linear",
         "Disabled": "none"
     }
     
@@ -86,7 +84,7 @@ def test_zoom_mode_mapping():
         print(f"✅ Creator '{creator_text}' → JSON '{json_mode}'")
     
     # Verify all modes are valid
-    valid_modes = {"exponential", "falling", "pulse", "linear", "none"}
+    valid_modes = {"exponential", "none"}
     for mode in creator_to_json.values():
         assert mode in valid_modes, f"Invalid zoom mode: {mode}"
 

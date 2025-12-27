@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 from typing import Optional
+from time import perf_counter
 
 import numpy as np
 
@@ -45,7 +46,12 @@ class SimpleVideoStreamer:
         self._streamer = VideoStreamer(buffer_size=buffer_size)
         self._prefill_frames = prefill_frames
         self._current_video_path: Optional[Path] = None
-        self._frame_counter = 0.0
+        # Time-based advancement so video speed stays stable even if update()
+        # is called at an irregular rate (startup spikes, nested timers, etc.).
+        self._last_update_ts: Optional[float] = None
+        self._accum_s: float = 0.0
+        # Trance-style sampling rate: 120/fps/8 per tick @fps -> 15fps effective.
+        self._target_frame_fps: float = 15.0
         
         logger.info(
             "[SimpleVideoStreamer] Initialized (forward-only mode, buffer=%d, prefill=%s)",
@@ -67,7 +73,18 @@ class SimpleVideoStreamer:
         
         if result:
             self._current_video_path = path
-            self._frame_counter = 0.0
+            self._last_update_ts = None
+            self._accum_s = 0.0
+
+            # CRITICAL: VideoStreamer keeps playback state (_index, _update_counter, etc.)
+            # across loads unless advance_frame() performs a buffer swap. Since
+            # SimpleVideoStreamer manually drives _index and never calls advance_frame(),
+            # we must reset playback state here so each new clip starts at frame 0.
+            with self._streamer._lock:
+                self._streamer._index = 0
+                self._streamer._backwards = False
+                self._streamer._reached_end = False
+                self._streamer._update_counter = 0.0
             logger.info(f"[SimpleVideoStreamer] Loaded: {path.name}")
         
         return result
@@ -91,32 +108,57 @@ class SimpleVideoStreamer:
         Args:
             global_fps: Current application FPS (default 60.0)
         """
-        # Fractional frame advancement (Trance formula)
-        # At 60 FPS: (120 / 60) / 8 = 0.25 per update
-        # This means advance 1 video frame every 4 updates (15 FPS video playback)
-        frame_increment = (120.0 / global_fps) / 8.0
-        self._frame_counter += frame_increment
-        
-        # Advance frame when counter >= 1.0
-        if self._frame_counter >= 1.0:
-            self._frame_counter -= 1.0
-            
-            # Get current state
-            info = self._streamer.get_info()
-            current_idx = info.get('index', 0)
-            buffer_size = info.get('current_size', 0)
-            
-            if buffer_size > 0:
-                # Move to next frame
-                next_idx = (current_idx + 1) % buffer_size
-                
-                # Manually update index (since we're not using ping-pong)
-                with self._streamer._lock:
-                    self._streamer._index = next_idx
-                    
-                    # If we wrapped around, video looped
-                    if next_idx == 0:
-                        logger.debug(f"[SimpleVideoStreamer] Looped: {self._current_video_path.name if self._current_video_path else 'unknown'}")
+        # Use wall-clock time to determine how many frames to advance.
+        now_ts = perf_counter()
+        if self._last_update_ts is None:
+            self._last_update_ts = now_ts
+            return
+
+        dt = now_ts - self._last_update_ts
+        self._last_update_ts = now_ts
+
+        if dt <= 0.0:
+            return
+
+        step_s = 1.0 / max(1e-6, float(self._target_frame_fps))
+
+        # IMPORTANT: Do not "catch up" after a stall by advancing multiple frames
+        # in one UI tick, because that reads as a visible fast-forward. Instead,
+        # clamp the time contribution so we advance at most 1 frame per call.
+        dt = min(dt, step_s)
+        self._accum_s += dt
+
+        if self._accum_s < step_s:
+            return
+
+        # Consume exactly one step.
+        self._accum_s -= step_s
+
+        info = self._streamer.get_info()
+        current_idx = info.get('index', 0)
+        current_size = info.get('current_size', 0)
+        current_end = bool(info.get('current_end', False))
+
+        if current_size <= 0:
+            return
+
+        next_idx = current_idx + 1
+
+        # Don't loop early while buffer is still filling.
+        if next_idx >= current_size:
+            if current_end:
+                next_idx = 0
+            else:
+                next_idx = current_idx
+
+        with self._streamer._lock:
+            self._streamer._index = next_idx
+
+        if next_idx == 0 and current_end:
+            logger.debug(
+                "[SimpleVideoStreamer] Looped: %s",
+                self._current_video_path.name if self._current_video_path else 'unknown',
+            )
     
     def reset(self) -> None:
         """Reset playback to beginning."""
@@ -124,7 +166,8 @@ class SimpleVideoStreamer:
             self._streamer._index = 0
             self._streamer._backwards = False
             self._streamer._reached_end = False
-            self._frame_counter = 0.0
+            self._last_update_ts = None
+            self._accum_s = 0.0
         
         logger.debug("[SimpleVideoStreamer] Reset to start")
     
@@ -132,7 +175,8 @@ class SimpleVideoStreamer:
         """Stop playback and cleanup resources."""
         self._streamer.stop()
         self._current_video_path = None
-        self._frame_counter = 0.0
+        self._last_update_ts = None
+        self._accum_s = 0.0
         
         logger.info("[SimpleVideoStreamer] Stopped")
     

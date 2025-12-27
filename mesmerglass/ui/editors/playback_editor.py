@@ -378,8 +378,18 @@ class PlaybackEditor(QDialog):
             # Legacy render_timer is not needed when we run a unified tick.
             self.render_timer = None
             
-            # Disable fades globally (instant media swaps)
-            self.compositor.set_fade_duration(0.0)
+            # Let fades be controlled by the playback config (for live parity).
+            # Default to instant swaps unless the loaded playback specifies otherwise.
+            fade_duration = 0.0
+            if isinstance(getattr(self, "playback_data", None), dict):
+                try:
+                    fade_duration = float(
+                        (self.playback_data.get("media", {}) or {}).get("fade_duration", 0.0) or 0.0
+                    )
+                except (TypeError, ValueError):
+                    fade_duration = 0.0
+            fade_duration = max(0.0, float(fade_duration or 0.0))
+            self.compositor.set_fade_duration(fade_duration)
             
             # Update initial state only if we didn't load data
             # (if we loaded data, the setCurrentIndex calls already updated the director)
@@ -918,8 +928,6 @@ class PlaybackEditor(QDialog):
         self.zoom_mode_combo = QComboBox()
         self.zoom_mode_combo.addItems([
             "Exponential (Falling In)",
-            "Pulse (Wave)",
-            "Linear (Legacy)",
             "Disabled"
         ])
         self.zoom_mode_combo.setCurrentIndex(0)  # Exponential default
@@ -2792,19 +2800,19 @@ class PlaybackEditor(QDialog):
                 )
                 
                 # Start zoom animation
-                zoom_mode_map = {
-                    0: "exponential",
-                    1: "pulse",
-                    2: "linear",
-                    3: "linear"  # Disabled
-                }
-                mode = zoom_mode_map[self.zoom_mode_combo.currentIndex()]
-                
-                self.compositor.start_zoom_animation(
-                    start_zoom=1.0,
-                    duration_frames=9999,
-                    mode=mode
-                )
+                if self.zoom_mode_combo.currentIndex() == 0:
+                    if hasattr(self.compositor, "set_zoom_animation_enabled"):
+                        self.compositor.set_zoom_animation_enabled(True)
+                    self.compositor.start_zoom_animation(
+                        start_zoom=1.0,
+                        duration_frames=9999,
+                        mode="exponential",
+                    )
+                else:
+                    if hasattr(self.compositor, "set_zoom_animation_enabled"):
+                        self.compositor.set_zoom_animation_enabled(False)
+                    if hasattr(self.compositor, "set_background_zoom"):
+                        self.compositor.set_background_zoom(1.0)
 
                 # Keep whatever zoom rate is currently active (manual slider value
                 # or accelerate override) without resetting the zoom timeline.
@@ -2855,19 +2863,19 @@ class PlaybackEditor(QDialog):
                 self.video_frame_timer.start(frame_interval_ms)
                 
                 # Start zoom animation
-                zoom_mode_map = {
-                    0: "exponential",
-                    1: "pulse",
-                    2: "linear",
-                    3: "linear"
-                }
-                mode = zoom_mode_map[self.zoom_mode_combo.currentIndex()]
-                
-                self.compositor.start_zoom_animation(
-                    start_zoom=1.0,
-                    duration_frames=9999,
-                    mode=mode
-                )
+                if self.zoom_mode_combo.currentIndex() == 0:
+                    if hasattr(self.compositor, "set_zoom_animation_enabled"):
+                        self.compositor.set_zoom_animation_enabled(True)
+                    self.compositor.start_zoom_animation(
+                        start_zoom=1.0,
+                        duration_frames=9999,
+                        mode="exponential",
+                    )
+                else:
+                    if hasattr(self.compositor, "set_zoom_animation_enabled"):
+                        self.compositor.set_zoom_animation_enabled(False)
+                    if hasattr(self.compositor, "set_background_zoom"):
+                        self.compositor.set_background_zoom(1.0)
 
                 # Keep whatever zoom rate is currently active (manual slider value
                 # or accelerate override) without resetting the zoom timeline.
@@ -3259,7 +3267,8 @@ class PlaybackEditor(QDialog):
             # Load zoom settings
             zoom_data = data.get("zoom", {})
             zoom_mode = zoom_data.get("mode", "exponential")
-            mode_map = {"exponential": 0, "pulse": 1, "linear": 2, "none": 3}
+            mode_map = {"exponential": 0, "none": 1}
+            # Treat any legacy modes as exponential.
             self.zoom_mode_combo.setCurrentIndex(mode_map.get(zoom_mode, 0))
 
             saved_zoom_rate = float(zoom_data.get("rate", 0.2))
@@ -3486,9 +3495,7 @@ class PlaybackEditor(QDialog):
         
         zoom_modes_map = {
             "Exponential (Falling In)": "exponential",
-            "Pulse (Wave)": "pulse",
-            "Linear (Legacy)": "linear",
-            "Disabled": "none"
+            "Disabled": "none",
         }
         zoom_mode = zoom_modes_map.get(self.zoom_mode_combo.currentText(), "none")
         

@@ -402,9 +402,18 @@ class CustomVisual(Visual):
         self.logger.debug(f"[CustomVisual] Cleared cycler to force rebuild with new period={self._frames_per_cycle}")
         
         # Fade duration (disabled)
+        fade_duration = 0.0
+        try:
+            fade_duration = float(media_config.get("fade_duration", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            fade_duration = 0.0
+        fade_duration = max(0.0, fade_duration)
         if self.compositor and hasattr(self.compositor, 'set_fade_duration'):
-            self.compositor.set_fade_duration(0.0)
-            self.logger.info("[CustomVisual] Media fades disabled; using instant cuts")
+            self.compositor.set_fade_duration(fade_duration)
+            if fade_duration > 0.0:
+                self.logger.info(f"[CustomVisual] Media fades enabled (duration={fade_duration:.2f}s)")
+            else:
+                self.logger.info("[CustomVisual] Media fades disabled; using instant cuts")
         
         # Build media path list or configure ThemeBank usage
         use_theme_bank = media_config.get("use_theme_bank", True)
@@ -674,9 +683,14 @@ class CustomVisual(Visual):
         self.logger.info(f"[CustomVisual] Text application complete: mode={text_mode}, enabled={enabled}, opacity={opacity}")
     
     def _restart_zoom_animation(self, duration_override: Optional[int] = None) -> None:
-        """Restart zoom animation from 1.0 (called on each media change)."""
+        """Restart zoom animation (called on each media change)."""
         zoom_config = self.config.get("zoom", {})
         zoom_mode = zoom_config.get("mode", "none")
+
+        # Only support disabled + exponential. Treat any legacy modes as exponential.
+        if zoom_mode not in ("none", "exponential"):
+            self.logger.info(f"[CustomVisual] Legacy zoom mode '{zoom_mode}' mapped to 'exponential'")
+            zoom_mode = "exponential"
         
         if zoom_mode == "none":
             return
@@ -686,44 +700,47 @@ class CustomVisual(Visual):
         if not all_compositors:
             return
         
-        # Get media cycle duration for zoom animation (matches cycle speed exactly)
-        duration_frames = duration_override or getattr(self, '_frames_per_cycle', 127)
+        # Get media cycle duration for zoom animation (matches cycle speed exactly).
+        # IMPORTANT: If we use a too-short override (common during initial warm-up
+        # cycles), exponential zoom can reach target early and then "sit" until the
+        # media actually changes. Clamp overrides so zoom keeps moving for the whole
+        # cycle.
+        frames_per_cycle = int(max(1, self.get_expected_media_cycle_frames()))
+        if duration_override is None:
+            duration_frames = frames_per_cycle
+        else:
+            duration_frames = max(int(duration_override), frames_per_cycle)
         duration_frames = max(1, int(duration_frames))
+        # If the cycle is extremely short (e.g., 7 frames), zoom becomes imperceptible.
+        # Clamp to a small minimum so users always see motion.
+        duration_frames = max(20, duration_frames)
         duration_seconds = duration_frames / 60.0  # Convert to seconds at 60fps
         
-        # For exponential/falling modes, calculate rate from duration
-        # Formula: zoom_current = zoom_start * exp(rate * time)
-        # At end of duration: zoom_target = zoom_start * exp(rate * duration)
-        # Therefore: rate = ln(zoom_target / zoom_start) / duration
-        zoom_start = 1.0
+        # Exponential zoom always zooms in.
         zoom_target = 1.5
-        
-        if zoom_mode in ("exponential", "falling"):
-            import math
-            zoom_rate = math.log(zoom_target / zoom_start) / duration_seconds
-            # For falling mode, use negative rate
-            if zoom_mode == "falling":
-                zoom_rate = -zoom_rate
-        else:
-            # For linear/pulse modes, use config rate (or default)
-            zoom_rate = zoom_config.get("rate", 0.5)
-        
+
         # Restart zoom on ALL compositors (primary + secondaries)
         for comp in all_compositors:
-            if hasattr(comp, 'start_zoom_animation'):
-                comp.start_zoom_animation(
-                    start_zoom=zoom_start,
-                    target_zoom=zoom_target,
-                    duration_frames=duration_frames,
-                    mode=zoom_mode,
-                    rate=zoom_rate
-                )
+            if not hasattr(comp, 'start_zoom_animation'):
+                continue
+
+            # Always restart from a stable baseline so each media change has a visible zoom.
+            # Using the current compositor zoom as the start can yield near-target restarts
+            # that are effectively imperceptible.
+            zoom_start = 1.0
+            zoom_start = max(0.001, float(zoom_start))
+
+            comp.start_zoom_animation(
+                start_zoom=zoom_start,
+                target_zoom=zoom_target,
+                duration_frames=duration_frames,
+                mode=zoom_mode,
+            )
         
         self.logger.debug(
-            "[CustomVisual] Restarted zoom animation on %d compositor(s): mode=%s, rate=%.4f, duration=%d frames (%.2fs)",
+            "[CustomVisual] Restarted zoom animation on %d compositor(s): mode=%s, duration=%d frames (%.2fs)",
             len(all_compositors),
             zoom_mode,
-            zoom_rate,
             duration_frames,
             duration_seconds,
         )
@@ -737,9 +754,13 @@ class CustomVisual(Visual):
         if not all_compositors:
             return
         
-        # Zoom mode: "none", "exponential", "falling", "linear", "pulse", "in", "out"
+        # Zoom mode: "none" or "exponential" (legacy modes map to exponential)
         zoom_mode = zoom_config.get("mode", "none")
         zoom_rate = zoom_config.get("rate", 0.5)
+
+        if zoom_mode not in ("none", "exponential"):
+            self.logger.info(f"[CustomVisual] Legacy zoom mode '{zoom_mode}' mapped to 'exponential'")
+            zoom_mode = "exponential"
         
         if zoom_mode == "none":
             # Disable zoom on all compositors
@@ -760,13 +781,11 @@ class CustomVisual(Visual):
                     comp.start_zoom_animation(
                         start_zoom=1.0,
                         target_zoom=1.5,  # End zoom level
-                        mode=zoom_mode,
+                        mode="exponential",
                         rate=zoom_rate
                     )
                 elif hasattr(comp, 'set_zoom_rate'):
-                    # Fallback: use simple zoom rate if start_zoom_animation not available
-                    rate = zoom_rate if zoom_mode in ["exponential", "in"] else -zoom_rate
-                    comp.set_zoom_rate(rate)
+                    comp.set_zoom_rate(zoom_rate)
             
             self.logger.info(f"[CustomVisual] Applied zoom animation on {len(all_compositors)} compositor(s): mode={zoom_mode}, rate={zoom_rate}")
 
@@ -1022,15 +1041,12 @@ class CustomVisual(Visual):
                 frames_result = max(1, int(round(interval_s * 60.0)))
                 source = "interval"
             else:
-                # Fall back to current accelerate speed hints when interval is not set yet
-                speed_hint = self._accelerate_media_speed_smoothed or self._accelerate_media_speed_current
-                if speed_hint is not None:
-                    frames_hint, _ = self._cycle_speed_to_frames(int(round(speed_hint)))
-                    frames_result = max(1, frames_hint)
-                    source = "speed_hint"
-                else:
-                    frames_result = base_frames
-                    source = "fallback"
+                # IMPORTANT: During initial warm-up, accelerate may be enabled but the
+                # strict media scheduler still falls back to base _frames_per_cycle until
+                # _accelerate_media_interval_s is computed. Returning a speed-hint here
+                # causes zoom to finish early and then "sit" before the media changes.
+                frames_result = base_frames
+                source = "base"
         if self.logger.isEnabledFor(logging.DEBUG):
             self.logger.debug(
                 "[CustomVisual][accelerate] expected frames (%s): %d",

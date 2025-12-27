@@ -402,6 +402,10 @@ class CueEditor(QDialog):
         self.name_edit.blockSignals(False)
 
         duration_value = self.cue_data.get("duration_seconds", 60)
+        try:
+            duration_value = int(round(float(duration_value)))
+        except (TypeError, ValueError):
+            duration_value = 60
         self._updating_duration_spin = True
         self.duration_spin.setValue(duration_value)
         self._updating_duration_spin = False
