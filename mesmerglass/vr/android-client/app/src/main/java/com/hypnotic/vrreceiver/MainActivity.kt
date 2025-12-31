@@ -2,7 +2,11 @@ package com.hypnotic.vrreceiver
 
 import android.Manifest
 import android.app.Activity
+import android.app.UiModeManager
+import android.content.Context
+import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
+import android.content.res.Configuration
 import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.media.MediaCodec
@@ -65,6 +69,15 @@ class MainActivity : Activity(), GLSurfaceView.Renderer {
     
     // Protocol detection
     private var streamProtocol: StreamProtocol = StreamProtocol.UNKNOWN
+
+    private enum class DisplayLayout {
+        AUTO,
+        VR_STEREO,
+        FULLSCREEN
+    }
+
+    private var displayLayout: DisplayLayout = DisplayLayout.AUTO
+    @Volatile private var resolvedDisplayLayout: DisplayLayout = DisplayLayout.FULLSCREEN
     
     // H.264 MediaCodec decoders (hardware accelerated)
     private var leftDecoder: MediaCodec? = null
@@ -132,6 +145,9 @@ class MainActivity : Activity(), GLSurfaceView.Renderer {
         glSurfaceView.setRenderer(this)
         glSurfaceView.renderMode = GLSurfaceView.RENDERMODE_WHEN_DIRTY  // Render on demand
         setContentView(glSurfaceView)
+
+        resolvedDisplayLayout = resolveDisplayLayout()
+        applyOrientationForLayout(resolvedDisplayLayout)
         
         // Start automatic server discovery
         startAutoDiscovery()
@@ -198,6 +214,9 @@ class MainActivity : Activity(), GLSurfaceView.Renderer {
     override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
         // Called when surface size changes - on GL thread
         GLES30.glViewport(0, 0, width, height)
+
+        // Surface size changes can happen during display/orientation switches.
+        resolvedDisplayLayout = resolveDisplayLayout()
     }
     
     override fun onDrawFrame(gl: GL10?) {
@@ -218,29 +237,35 @@ class MainActivity : Activity(), GLSurfaceView.Renderer {
             if (hasFrame && leftFrameData != null && rightFrameData != null) {
                 // Measure decode time
                 val decodeStart = System.currentTimeMillis()
+
+                val layout = resolvedDisplayLayout
                 
-                // Decode and upload left eye
+                // Decode/upload textures. In fullscreen mode we only need one eye.
                 val leftBitmap = BitmapFactory.decodeByteArray(leftFrameData, 0, leftFrameData!!.size)
                 if (leftBitmap != null) {
                     GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, leftEyeTextureId)
                     GLUtils.texImage2D(GLES30.GL_TEXTURE_2D, 0, leftBitmap, 0)
                     leftBitmap.recycle()
                 }
-                
-                // Decode and upload right eye
-                val rightBitmap = BitmapFactory.decodeByteArray(rightFrameData, 0, rightFrameData!!.size)
-                if (rightBitmap != null) {
-                    GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, rightEyeTextureId)
-                    GLUtils.texImage2D(GLES30.GL_TEXTURE_2D, 0, rightBitmap, 0)
-                    rightBitmap.recycle()
+
+                if (layout == DisplayLayout.VR_STEREO) {
+                    val rightBitmap = BitmapFactory.decodeByteArray(rightFrameData, 0, rightFrameData!!.size)
+                    if (rightBitmap != null) {
+                        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, rightEyeTextureId)
+                        GLUtils.texImage2D(GLES30.GL_TEXTURE_2D, 0, rightBitmap, 0)
+                        rightBitmap.recycle()
+                    }
                 }
                 
                 // Track decode time
                 val decodeTime = System.currentTimeMillis() - decodeStart
                 decodeTimes.add(decodeTime)
                 
-                // Render stereo (left half = left eye, right half = right eye)
-                renderStereo()
+                when (layout) {
+                    DisplayLayout.VR_STEREO -> renderStereo()
+                    DisplayLayout.FULLSCREEN -> renderFullscreen(leftEyeTextureId)
+                    DisplayLayout.AUTO -> renderFullscreen(leftEyeTextureId) // should not happen; AUTO resolves
+                }
             }
         }
         
@@ -366,6 +391,129 @@ class MainActivity : Activity(), GLSurfaceView.Renderer {
         GLES30.glDisableVertexAttribArray(positionHandle)
         GLES30.glDisableVertexAttribArray(texCoordHandle)
     }
+
+    private fun renderFullscreen(textureId: Int) {
+        // Use shader program
+        GLES30.glUseProgram(shaderProgram)
+
+        // Enable vertex attributes
+        GLES30.glEnableVertexAttribArray(positionHandle)
+        GLES30.glEnableVertexAttribArray(texCoordHandle)
+
+        // Bind texture uniform
+        GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
+        GLES30.glUniform1i(textureHandle, 0)
+
+        // Get viewport dimensions
+        val viewport = IntArray(4)
+        GLES30.glGetIntegerv(GLES30.GL_VIEWPORT, viewport, 0)
+        val width = viewport[2]
+        val height = viewport[3]
+
+        // 16:9 aspect ratio for the video (native video format)
+        val videoAspect = 16.0f / 9.0f
+        val screenAspect = width / height.toFloat()
+
+        val scaleX: Float
+        val scaleY: Float
+
+        // Fullscreen for flat devices: fill the screen (center-crop). This avoids letterboxing.
+        if (screenAspect > videoAspect) {
+            // Screen is wider than video - fill width, crop top/bottom
+            scaleX = 1.0f
+            scaleY = screenAspect / videoAspect
+        } else {
+            // Screen is taller than video - fill height, crop left/right
+            scaleY = 1.0f
+            scaleX = videoAspect / screenAspect
+        }
+
+        val fullVertices = floatArrayOf(
+            -scaleX, -scaleY,         0.0f, 1f,
+             scaleX, -scaleY,         1.0f, 1f,
+            -scaleX,  scaleY,         0.0f, 0f,
+             scaleX,  scaleY,         1.0f, 0f
+        )
+        val fullBuffer = ByteBuffer.allocateDirect(fullVertices.size * 4)
+            .order(ByteOrder.nativeOrder())
+            .asFloatBuffer()
+            .put(fullVertices)
+
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, textureId)
+
+        fullBuffer.position(0)
+        GLES30.glVertexAttribPointer(positionHandle, 2, GLES30.GL_FLOAT, false, 16, fullBuffer)
+        fullBuffer.position(2)
+        GLES30.glVertexAttribPointer(texCoordHandle, 2, GLES30.GL_FLOAT, false, 16, fullBuffer)
+        GLES30.glDrawArrays(GLES30.GL_TRIANGLE_STRIP, 0, 4)
+
+        // Disable vertex attributes
+        GLES30.glDisableVertexAttribArray(positionHandle)
+        GLES30.glDisableVertexAttribArray(texCoordHandle)
+    }
+
+    private fun applyOrientationForLayout(layout: DisplayLayout) {
+        // Phones/TVs should always be landscape.
+        // VR headsets often manage orientation differently; keep it flexible.
+        requestedOrientation = when (layout) {
+            DisplayLayout.FULLSCREEN -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+            DisplayLayout.VR_STEREO -> ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+            DisplayLayout.AUTO -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+        }
+    }
+
+    private fun resolveDisplayLayout(): DisplayLayout {
+        if (displayLayout != DisplayLayout.AUTO) {
+            return displayLayout
+        }
+        if (isTelevisionDevice()) {
+            return DisplayLayout.FULLSCREEN
+        }
+        if (isVrHeadsetDevice()) {
+            return DisplayLayout.VR_STEREO
+        }
+        return DisplayLayout.FULLSCREEN
+    }
+
+    private fun isTelevisionDevice(): Boolean {
+        val uiModeManager = getSystemService(UI_MODE_SERVICE) as? UiModeManager
+        val modeType = uiModeManager?.currentModeType
+        if (modeType == Configuration.UI_MODE_TYPE_TELEVISION) {
+            return true
+        }
+        return packageManager.hasSystemFeature(PackageManager.FEATURE_LEANBACK)
+    }
+
+    private fun isVrHeadsetDevice(): Boolean {
+        val uiModeType = resources.configuration.uiMode and Configuration.UI_MODE_TYPE_MASK
+        if (uiModeType == Configuration.UI_MODE_TYPE_VR_HEADSET) {
+            return true
+        }
+
+        // Standard Android VR feature flag (present on some VR-class devices)
+        if (packageManager.hasSystemFeature(PackageManager.FEATURE_VR_MODE_HIGH_PERFORMANCE)) {
+            return true
+        }
+
+        // Fallback heuristics for common headsets.
+        val mfg = (android.os.Build.MANUFACTURER ?: "").lowercase()
+        val model = (android.os.Build.MODEL ?: "").lowercase()
+        val device = (android.os.Build.DEVICE ?: "").lowercase()
+        val product = (android.os.Build.PRODUCT ?: "").lowercase()
+        val combined = "$mfg $model $device $product"
+
+        return listOf(
+            "oculus",
+            "meta",
+            "quest",
+            "pico",
+            "vive",
+            "htc",
+            "focus",
+            "hololens",
+            "daydream"
+        ).any { combined.contains(it) }
+    }
     
     private fun updateStatus(message: String, color: Int) {
         runOnUiThread {
@@ -384,7 +532,7 @@ class MainActivity : Activity(), GLSurfaceView.Renderer {
         discoveryService?.stop()
         discoveryService = null
         
-        discoveryService = DiscoveryService(DISCOVERY_PORT, DEFAULT_STREAMING_PORT) { serverIp, serverPort ->
+        discoveryService = DiscoveryService(this, DISCOVERY_PORT, DEFAULT_STREAMING_PORT) { serverIp, serverPort ->
             runOnUiThread {
                 updateStatus("SERVER\nFOUND\nCONNECTING", Color.GREEN)
                 
@@ -570,6 +718,9 @@ class MainActivity : Activity(), GLSurfaceView.Renderer {
     override fun onResume() {
         super.onResume()
         glSurfaceView.onResume()
+
+        resolvedDisplayLayout = resolveDisplayLayout()
+        applyOrientationForLayout(resolvedDisplayLayout)
         
         // CRITICAL FIX: Restart discovery when app resumes
         // (it was stopped in onPause)
@@ -607,6 +758,7 @@ class MainActivity : Activity(), GLSurfaceView.Renderer {
  * Discovery Service - Automatically finds the VR server on the network
  */
 class DiscoveryService(
+    private val context: Context,
     private val discoveryPort: Int,
     private val streamingPort: Int = 5555,  // TCP streaming port (must match server)
     private val onServerFound: (String, Int) -> Unit
@@ -653,7 +805,9 @@ class DiscoveryService(
             while (isRunning) {
                 try {
                     // Send hello message to broadcast address (WORKING PROTOCOL)
-                    val message = "VR_HEADSET_HELLO:$deviceName"
+                    val type = detectDeviceTypeForHello()
+                    // Backwards-compatible with older servers: they will treat the whole suffix as the name.
+                    val message = "VR_HEADSET_HELLO:$deviceName:$type"
                     val broadcastAddr = java.net.InetAddress.getByName("255.255.255.255")
                     val packet = java.net.DatagramPacket(
                         message.toByteArray(),
@@ -702,6 +856,52 @@ class DiscoveryService(
             e.printStackTrace()
         } finally {
             socket?.close()
+        }
+    }
+
+    private fun detectDeviceTypeForHello(): String {
+        return try {
+            val pm = context.packageManager
+
+            val uiModeManager = context.getSystemService(Context.UI_MODE_SERVICE) as? UiModeManager
+            val modeType = uiModeManager?.currentModeType
+            if (modeType == Configuration.UI_MODE_TYPE_TELEVISION || pm.hasSystemFeature(PackageManager.FEATURE_LEANBACK)) {
+                return "tv"
+            }
+
+            val uiModeType = context.resources.configuration.uiMode and Configuration.UI_MODE_TYPE_MASK
+            if (uiModeType == Configuration.UI_MODE_TYPE_VR_HEADSET) {
+                return "vr"
+            }
+
+            if (pm.hasSystemFeature(PackageManager.FEATURE_VR_MODE_HIGH_PERFORMANCE)) {
+                return "vr"
+            }
+
+            val mfg = (android.os.Build.MANUFACTURER ?: "").lowercase()
+            val model = (android.os.Build.MODEL ?: "").lowercase()
+            val device = (android.os.Build.DEVICE ?: "").lowercase()
+            val product = (android.os.Build.PRODUCT ?: "").lowercase()
+            val combined = "$mfg $model $device $product"
+
+            if (listOf(
+                    "oculus",
+                    "meta",
+                    "quest",
+                    "pico",
+                    "vive",
+                    "htc",
+                    "focus",
+                    "hololens",
+                    "daydream"
+                ).any { combined.contains(it) }
+            ) {
+                return "vr"
+            }
+
+            "phone"
+        } catch (_: Exception) {
+            "phone"
         }
     }
     
@@ -825,8 +1025,14 @@ class NetworkReceiver(
         buffer.get(leftFrame)
         
         // Read right eye frame
-        val rightFrame = ByteArray(rightSize)
-        buffer.get(rightFrame)
+        val rightFrame = if (rightSize > 0) {
+            val rf = ByteArray(rightSize)
+            buffer.get(rf)
+            rf
+        } else {
+            // Mono packet: right eye omitted
+            leftFrame
+        }
         
         return Triple(leftFrame, rightFrame, protocol)
     }
