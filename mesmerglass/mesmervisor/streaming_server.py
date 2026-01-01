@@ -437,6 +437,42 @@ class VRStreamingServer:
         """
         logger.info(f"🎯 Client connected from {address}")
 
+        client_ip = str(address[0])
+        client_port = int(address[1])
+        client_id = f"{client_ip}:{client_port}"
+
+        # Best-effort lookup: prefer device name from UDP discovery (VR_HEADSET_HELLO).
+        device_name: Optional[str] = None
+        try:
+            ds = getattr(self, "discovery_service", None)
+            if ds is not None:
+                lock = getattr(ds, "_devices_lock", None)
+                devices = getattr(ds, "discovered_devices", None)
+                if lock is not None and devices is not None:
+                    with lock:
+                        info = devices.get(client_ip)
+                        if isinstance(info, dict):
+                            maybe = info.get("name")
+                            if maybe:
+                                device_name = str(maybe)
+        except Exception:
+            device_name = None
+
+        # Publish connection state for the Performance UI (best-effort; never fail streaming).
+        try:
+            from mesmerglass.engine.streaming_telemetry import streaming_telemetry
+
+            streaming_telemetry.set_connected(
+                client_id,
+                True,
+                address=client_id,
+                device_name=device_name,
+                protocol=(self.protocol_magic.decode("ascii", errors="ignore") if self.protocol_magic else None),
+                bitrate_bps=int(getattr(self, "bitrate", 0) or 0) or None,
+            )
+        except Exception:
+            pass
+
         # IMPORTANT: Use a fresh encoder per client.
         # If we reuse the encoder across connections, a newly connected client can start mid-GOP
         # (receiving P-frames that reference pictures it never saw), which looks like heavy mosaic
@@ -1335,6 +1371,7 @@ class VRStreamingServer:
             # Protocol: client may send control messages at any time.
             #   0x01                => NEED_IDR
             #   0x02 + int32 + int32 => STATS (buffer_ms, fps_milli) big-endian
+            #   0x02 + int32 + int32 + int32 => STATS (buffer_ms, fps_milli, decode_avg_ms)
             # Enable by default: client can send 0x01 to request an IDR.
             # This is a no-op unless the client actually sends control bytes.
             enable_control = _env_truthy_default("MESMERGLASS_VRH2_CONTROL", True)
@@ -1344,11 +1381,12 @@ class VRStreamingServer:
 
             client_buffer_ms: Optional[int] = None
             client_fps_milli: Optional[int] = None
+            client_decode_avg_ms: Optional[int] = None
             last_client_stats_at = 0.0
 
             async def _control_reader() -> None:
                 nonlocal need_idr_from_client, last_client_need_idr_at
-                nonlocal client_buffer_ms, client_fps_milli, last_client_stats_at
+                nonlocal client_buffer_ms, client_fps_milli, client_decode_avg_ms, last_client_stats_at
                 # Keep reads tiny; client messages are intentionally minimal.
                 loop = asyncio.get_event_loop()
                 rx = bytearray()
@@ -1368,16 +1406,40 @@ class VRStreamingServer:
                                     need_idr_from_client = True
                                     last_client_need_idr_at = now_s
                             elif msg == 0x02:
-                                # Need full payload: 1 + 8 bytes
+                                # Need full payload: 1 + 8 bytes (or 1 + 12 for extended stats)
                                 if len(rx) < 1 + 8:
                                     break
-                                payload = bytes(rx[1:9])
-                                del rx[:9]
                                 try:
-                                    buf_ms, fps_milli = struct.unpack("!ii", payload)
+                                    # Backward compatible parsing: accept either 2-int or 3-int payloads.
+                                    if len(rx) >= 1 + 12:
+                                        payload = bytes(rx[1 : 1 + 12])
+                                        del rx[: 1 + 12]
+                                        buf_ms, fps_milli, dec_ms = struct.unpack("!iii", payload)
+                                        client_decode_avg_ms = int(dec_ms)
+                                    else:
+                                        payload = bytes(rx[1:9])
+                                        del rx[:9]
+                                        buf_ms, fps_milli = struct.unpack("!ii", payload)
                                     client_buffer_ms = int(buf_ms)
                                     client_fps_milli = int(fps_milli)
                                     last_client_stats_at = time.time()
+
+                                    # Mirror client stats into UI telemetry.
+                                    try:
+                                        from mesmerglass.engine.streaming_telemetry import streaming_telemetry
+
+                                        streaming_telemetry.update_client_stats(
+                                            client_id,
+                                            buffer_ms=client_buffer_ms,
+                                            fps_milli=client_fps_milli,
+                                            decode_avg_ms=(
+                                                float(client_decode_avg_ms)
+                                                if client_decode_avg_ms is not None
+                                                else None
+                                            ),
+                                        )
+                                    except Exception:
+                                        pass
                                 except Exception:
                                     # Ignore malformed payload.
                                     continue
@@ -1682,6 +1744,30 @@ class VRStreamingServer:
                         logger.warning(f"   Bandwidth: {bandwidth_mbps:.2f} Mbps")
                         logger.warning(f"   Frame size: {total_kb:.1f} KB (L: {left_kb:.1f} KB, R: {right_kb:.1f} KB)")
 
+                        # Publish to UI telemetry.
+                        try:
+                            from mesmerglass.engine.streaming_telemetry import streaming_telemetry
+
+                            streaming_telemetry.update_server_stats(
+                                client_id,
+                                protocol=(
+                                    client_protocol_magic.decode("ascii", errors="ignore")
+                                    if client_protocol_magic is not None
+                                    else None
+                                ),
+                                bitrate_bps=int(client_bitrate) if client_bitrate else None,
+                                send_fps=float(window_fps),
+                                produced_fps=float(produced_fps),
+                                encode_avg_ms=float(avg_encode_ms),
+                                send_avg_ms=float(avg_send_ms),
+                                bandwidth_mbps=float(bandwidth_mbps),
+                                frame_kb=float(total_kb),
+                                client_buffer_ms=(int(client_buffer_ms) if client_buffer_ms is not None else None),
+                                client_fps_milli=(int(client_fps_milli) if client_fps_milli is not None else None),
+                            )
+                        except Exception:
+                            pass
+
                         # Adaptive bitrate: react to sustained congestion and slowly recover.
                         # Applies to VRH2/VRH3, and is rate-limited to avoid encoder thrash.
                         if adaptive_enabled and client_protocol_magic in {b"VRH2", b"VRH3"} and (not need_idr_resync):
@@ -1756,6 +1842,14 @@ class VRStreamingServer:
         except Exception as e:
             logger.error(f"Error handling client {address}: {e}", exc_info=True)
         finally:
+            # Publish disconnection state for UI telemetry.
+            try:
+                from mesmerglass.engine.streaming_telemetry import streaming_telemetry
+
+                streaming_telemetry.set_connected(client_id, False)
+            except Exception:
+                pass
+
             try:
                 if control_task is not None:
                     control_task.cancel()

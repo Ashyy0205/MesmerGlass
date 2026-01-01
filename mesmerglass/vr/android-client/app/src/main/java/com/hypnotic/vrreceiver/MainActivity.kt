@@ -678,8 +678,9 @@ class MainActivity : Activity(), GLSurfaceView.Renderer {
             if (isH264Protocol(streamProtocol)) {
                 val bufferMs = vrh2LastPlayoutBufferMs
                 val fpsMilli = (clientFPS * 1000.0).toInt()
+                val decodeAvgMs = avgDecode.toInt()
                 CoroutineScope(Dispatchers.IO).launch {
-                    networkReceiver?.sendStats(bufferMs, fpsMilli)
+                    networkReceiver?.sendStats(bufferMs, fpsMilli, decodeAvgMs)
                 }
             }
             
@@ -1607,6 +1608,7 @@ class MainActivity : Activity(), GLSurfaceView.Renderer {
 
     private fun feedDecoder(decoder: MediaCodec?, accessUnit: ByteArray, isRight: Boolean, frameId: Int, fpsMilli: Int) {
         if (decoder == null) return
+        val t0 = System.nanoTime()
         try {
             val isIdr = containsIdr(accessUnit)
             val needsIdr = if (isRight) rightNeedsIdr else leftNeedsIdr
@@ -1770,6 +1772,16 @@ class MainActivity : Activity(), GLSurfaceView.Renderer {
             drainOutputNonBlocking()
         } catch (_: Exception) {
             // Best-effort; decoder can throw during disconnects / reconfigure.
+        } finally {
+            // Best-effort per-frame codec/decode time sample for H.264.
+            // Record only on the left eye to avoid double-counting stereo frames.
+            if (!isRight) {
+                val dtMs = (System.nanoTime() - t0) / 1_000_000.0
+                decodeTimes.add(dtMs)
+                if (decodeTimes.size > 240) {
+                    decodeTimes.subList(0, decodeTimes.size - 240).clear()
+                }
+            }
         }
     }
 
@@ -2121,15 +2133,24 @@ class NetworkReceiver(
         }
     }
 
-    fun sendStats(bufferMs: Int, fpsMilli: Int) {
+    fun sendStats(bufferMs: Int, fpsMilli: Int, decodeAvgMs: Int? = null) {
         // Best-effort: framed control message.
-        // Format: 0x02 + bufferMs(int32 BE) + fpsMilli(int32 BE)
+        // Format:
+        //   0x02 + bufferMs(int32 BE) + fpsMilli(int32 BE)
+        //   0x02 + bufferMs(int32 BE) + fpsMilli(int32 BE) + decodeAvgMs(int32 BE)
         try {
             val os = outputStream ?: return
-            val bb = ByteBuffer.allocate(1 + 4 + 4).order(ByteOrder.BIG_ENDIAN)
+            val bb = if (decodeAvgMs != null) {
+                ByteBuffer.allocate(1 + 4 + 4 + 4).order(ByteOrder.BIG_ENDIAN)
+            } else {
+                ByteBuffer.allocate(1 + 4 + 4).order(ByteOrder.BIG_ENDIAN)
+            }
             bb.put(0x02)
             bb.putInt(bufferMs)
             bb.putInt(fpsMilli)
+            if (decodeAvgMs != null) {
+                bb.putInt(decodeAvgMs)
+            }
             synchronized(sendLock) {
                 os.write(bb.array())
                 os.flush()

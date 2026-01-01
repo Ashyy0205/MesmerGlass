@@ -21,4 +21,5 @@ pytest-qt
 PyOpenGL>=3.1.6
 PyOpenGL_accelerate>=3.1.6
 psutil>=5.9
+pyqtgraph>=0.13
 

@@ -41,20 +41,6 @@ class Audio2:
         self.snd1_path: str | None = None
         self.snd2_path: str | None = None
 
-@dataclass
-class StreamingHandle:
-    """Tracks async streaming start jobs so callers can poll completion."""
-
-    file_path: str
-    volume: float
-    fade_ms: float
-    loop: bool
-    submitted_at: float = field(default_factory=time.perf_counter)
-    cancel_event: threading.Event = field(default_factory=threading.Event)
-    future: Optional[Future] = None
-
-    def done(self) -> bool:
-        return bool(self.future and self.future.done())
     # -------- loading --------------------------------------------------------
     def load1(self, path: str):
         if not self.init_ok: return
@@ -143,6 +129,21 @@ class StreamingHandle:
             "audio2_bytes": _size(self.snd2_path),
             "audio1_streaming": bool(self.music1_path is not None),
         }
+
+@dataclass
+class StreamingHandle:
+    """Tracks async streaming start jobs so callers can poll completion."""
+
+    file_path: str
+    volume: float
+    fade_ms: float
+    loop: bool
+    submitted_at: float = field(default_factory=time.perf_counter)
+    cancel_event: threading.Event = field(default_factory=threading.Event)
+    future: Optional[Future] = None
+
+    def done(self) -> bool:
+        return bool(self.future and self.future.done())
 
 
 # ============================================================================

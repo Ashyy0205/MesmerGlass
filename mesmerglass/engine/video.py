@@ -67,8 +67,8 @@ def read_next_if_due(self: VideoStream):  # type: ignore[valid-type]
     import cv2 as _cv2
     frame = _cv2.cvtColor(frame, _cv2.COLOR_BGR2RGB)
     with self.lock: self.frame_rgb = frame
-    if dt is not None:
-        perf_metrics.record_frame(dt)
+    # NOTE: Perf metrics are compositor-driven (local output pacing).
+    # Avoid mixing in video-read cadence here.
 VideoStream.read_next_if_due = read_next_if_due  # patch method
 
 def get_qpixmap(self: VideoStream, target_size: QSize):  # type: ignore[valid-type]

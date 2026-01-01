@@ -25,6 +25,7 @@ from .tabs.cuelists_tab import CuelistsTab
 from .tabs.playbacks_tab import PlaybacksTab
 from .tabs.display_tab import DisplayTab
 from .tabs.devices_tab import DevicesTab
+from .pages.performance import PerformancePage
 from ..content.simple_video_streamer import SimpleVideoStreamer
 from ..content.media_scan import scan_media_directory, scan_font_directory
 from ..content.themebank import ThemeBank
@@ -338,13 +339,9 @@ class MainApplication(QMainWindow):
         self.devices_tab = DevicesTab(self)
         self.tabs.addTab(self.devices_tab, "🔗 Device")
         
-        # Tab 6: Performance monitoring (placeholder)
-        placeholder = QWidget()
-        layout = QVBoxLayout(placeholder)
-        label = QLabel("📊 Performance tab\n\nComing soon...")
-        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(label)
-        self.tabs.addTab(placeholder, "📊 Performance")
+        # Tab 6: Performance monitoring
+        self.performance_tab = PerformancePage(parent=self)
+        self.tabs.addTab(self.performance_tab, "📊 Performance")
         
         # Tab 7: DevTools (placeholder)
         placeholder = QWidget()

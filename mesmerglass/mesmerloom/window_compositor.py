@@ -7,6 +7,7 @@ import logging
 import time
 import os
 import sys
+from collections import deque
 from typing import Any, Optional, Dict, Union, Tuple
 from PyQt6.QtCore import QTimer, Qt, pyqtSignal
 from PyQt6.QtOpenGL import QOpenGLWindow, QOpenGLBuffer, QOpenGLShaderProgram, QOpenGLVertexArrayObject
@@ -14,6 +15,7 @@ from PyQt6.QtGui import QSurfaceFormat, QColor, QGuiApplication, QOpenGLContext,
 from OpenGL import GL
 import numpy as np
 from mesmerglass.logging_utils import BurstSampler
+from mesmerglass.engine.perf import perf_metrics
 
 # Windows-specific imports for forcing window to top
 if sys.platform == "win32":
@@ -67,6 +69,18 @@ class LoomWindowCompositor(QOpenGLWindow):
         self._log_interval = 60
         self._active = True
         self.available = False
+
+        # Compositor frame pacing instrumentation
+        self._last_paint_t: float | None = None
+
+        # GPU instrumentation (best-effort, compositor-context based)
+        self._gpu_timer_supported = False
+        self._gpu_query_ids: list[int] = []
+        self._gpu_query_next_idx: int = 0
+        self._gpu_query_in_flight_idx: int | None = None
+        # Pending completed queries waiting for results: (idx, ended_at_perf_counter)
+        self._gpu_query_pending: deque[tuple[int, float]] = deque()
+        self._gpu_vram_last_poll_t: float = 0.0
         # VR safe mirror settings (offscreen FBO tap)
         self._vr_safe = bool(os.environ.get("MESMERGLASS_VR_SAFE") in ("1", "true", "True"))
         self._vr_fbo = None
@@ -468,6 +482,15 @@ class LoomWindowCompositor(QOpenGLWindow):
             
             # Build shader program
             self._build_shader_program()
+
+            # GPU instrumentation setup (timers + best-effort VRAM)
+            self._init_gpu_instrumentation()
+            try:
+                # Populate VRAM metrics as soon as the GL context is valid.
+                # Otherwise they won't appear until the first paintGL.
+                self._gpu_vram_poll()
+            except Exception:
+                pass
             
             # Setup geometry
             self._setup_geometry()
@@ -701,12 +724,155 @@ class LoomWindowCompositor(QOpenGLWindow):
                     pass  # update() already scheduled it
         except Exception:
             pass
+
+    # ------------------------------------------------------------------
+    # GPU instrumentation (context-based, no OS GPU preference required)
+    def _init_gpu_instrumentation(self) -> None:
+        self._gpu_timer_supported = False
+        self._gpu_query_ids = []
+        self._gpu_query_next_idx = 0
+        self._gpu_query_in_flight_idx = None
+        self._gpu_query_pending.clear()
+        self._gpu_vram_last_poll_t = 0.0
+
+        try:
+            # TIME_ELAPSED query is core in modern GL and is the most reliable
+            # per-app GPU work measurement we can get from OpenGL.
+            # Use a small ring so we can keep sampling even if results lag a frame or two.
+            ids = GL.glGenQueries(4)
+            if isinstance(ids, int):
+                # PyOpenGL may return a single int in some edge cases; still usable.
+                self._gpu_query_ids = [int(ids)]
+            else:
+                self._gpu_query_ids = [int(x) for x in ids]
+            self._gpu_timer_supported = len(self._gpu_query_ids) >= 1
+        except Exception:
+            self._gpu_timer_supported = False
+            self._gpu_query_ids = []
+
+    def _gpu_timer_poll_result(self) -> None:
+        if not self._gpu_timer_supported:
+            return
+        if not self._gpu_query_pending:
+            return
+
+        now = time.perf_counter()
+        # Drain a few results per frame (avoid long loops).
+        # Rotate when not ready so one stuck query doesn't block all others.
+        for _ in range(min(4, len(self._gpu_query_pending))):
+            idx, ended_at = self._gpu_query_pending[0]
+            # Drop stale queries (driver/context hiccups) to prevent permanent blockage.
+            if now - ended_at > 0.5:
+                self._gpu_query_pending.popleft()
+                continue
+            try:
+                qid = self._gpu_query_ids[idx]
+                avail = GL.glGetQueryObjectiv(qid, GL.GL_QUERY_RESULT_AVAILABLE)
+                available = int(avail[0]) if hasattr(avail, "__len__") else int(avail)
+                if not available:
+                    # Not ready yet; rotate to the back.
+                    self._gpu_query_pending.rotate(-1)
+                    continue
+
+                # Prefer 64-bit nanoseconds if supported
+                if hasattr(GL, "glGetQueryObjectui64v"):
+                    ns = GL.glGetQueryObjectui64v(qid, GL.GL_QUERY_RESULT)
+                else:
+                    ns = GL.glGetQueryObjectuiv(qid, GL.GL_QUERY_RESULT)
+
+                ns_val = int(ns[0]) if hasattr(ns, "__len__") else int(ns)
+                gpu_ms = float(ns_val) / 1_000_000.0
+                perf_metrics.record_gpu_time_ms(gpu_ms)
+            except Exception:
+                # Drop this query from the queue on error so we don't get stuck.
+                self._gpu_query_pending.popleft()
+            else:
+                # Successful read: remove this query from the queue.
+                self._gpu_query_pending.popleft()
+
+    def _gpu_timer_begin(self) -> None:
+        if not self._gpu_timer_supported or not self._gpu_query_ids:
+            return
+        if self._gpu_query_in_flight_idx is not None:
+            return
+        try:
+            # Pick the next query ID that isn't pending.
+            n = len(self._gpu_query_ids)
+            idx = None
+            for _ in range(n):
+                cand = self._gpu_query_next_idx % n
+                self._gpu_query_next_idx = (self._gpu_query_next_idx + 1) % n
+                if all(p[0] != cand for p in self._gpu_query_pending):
+                    idx = cand
+                    break
+            if idx is None:
+                return
+
+            qid = self._gpu_query_ids[idx]
+            GL.glBeginQuery(GL.GL_TIME_ELAPSED, qid)
+            self._gpu_query_in_flight_idx = idx
+        except Exception:
+            self._gpu_query_in_flight_idx = None
+
+    def _gpu_timer_end(self) -> None:
+        if not self._gpu_timer_supported:
+            return
+        if self._gpu_query_in_flight_idx is None:
+            return
+        try:
+            GL.glEndQuery(GL.GL_TIME_ELAPSED)
+            # Mark completed query as pending for result polling.
+            self._gpu_query_pending.append((self._gpu_query_in_flight_idx, time.perf_counter()))
+        except Exception:
+            pass
+        finally:
+            self._gpu_query_in_flight_idx = None
+
+    def _gpu_vram_poll(self) -> None:
+        # Poll at most ~1 Hz.
+        now = time.perf_counter()
+        if now - self._gpu_vram_last_poll_t < 1.0:
+            return
+        self._gpu_vram_last_poll_t = now
+
+        # NVX_gpu_memory_info
+        try:
+            GL_GPU_MEMORY_INFO_DEDICATED_VIDMEM_NVX = 0x9047
+            GL_GPU_MEMORY_INFO_CURRENT_AVAILABLE_VIDMEM_NVX = 0x9049
+            total_kb = int(GL.glGetIntegerv(GL_GPU_MEMORY_INFO_DEDICATED_VIDMEM_NVX))
+            free_kb = int(GL.glGetIntegerv(GL_GPU_MEMORY_INFO_CURRENT_AVAILABLE_VIDMEM_NVX))
+            perf_metrics.set_gpu_vram_mb(
+                total_mb=float(total_kb) / 1024.0,
+                free_mb=float(free_kb) / 1024.0,
+            )
+            return
+        except Exception:
+            pass
+
+        # ATI_meminfo (free only, no total)
+        try:
+            GL_TEXTURE_FREE_MEMORY_ATI = 0x87FC
+            vals = GL.glGetIntegerv(GL_TEXTURE_FREE_MEMORY_ATI)
+            # Returns 4 ints; first is free texture memory in kB.
+            free_kb = int(vals[0]) if hasattr(vals, "__len__") else int(vals)
+            perf_metrics.set_gpu_vram_mb(total_mb=None, free_mb=float(free_kb) / 1024.0)
+        except Exception:
+            perf_metrics.set_gpu_vram_mb(total_mb=None, free_mb=None)
     
     def paintGL(self):
         """Render the spiral; if VR safe mode is enabled, render to offscreen FBO then blit to window."""
         if not self.initialized or not self.program_id or not self._active:
             return
             
+        now_t = time.perf_counter()
+        if self._last_paint_t is not None:
+            perf_metrics.record_frame(now_t - self._last_paint_t)
+        self._last_paint_t = now_t
+
+        # GPU timing: read previous result and begin a new timer query.
+        self._gpu_timer_poll_result()
+        self._gpu_timer_begin()
+
         self.frame_count += 1
         
         # Setup viewport and optional VR FBO (physical pixels)
@@ -908,6 +1074,10 @@ class LoomWindowCompositor(QOpenGLWindow):
                 GL.glBindFramebuffer(GL.GL_DRAW_FRAMEBUFFER, 0)
             except Exception:
                 pass
+
+        # GPU timing end (exclude readPixels/capture sync work)
+        self._gpu_timer_end()
+        self._gpu_vram_poll()
 
         # Capture frame for VR streaming / GUI preview BEFORE swapping buffers (GL context is current here)
         try:
