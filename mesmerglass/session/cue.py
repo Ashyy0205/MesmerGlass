@@ -131,6 +131,7 @@ class AudioRole(str, Enum):
     """Enumerated purpose for a cue-level audio track."""
     HYPNO = "hypno"
     BACKGROUND = "background"
+    SHEPARD = "shepard"
     GENERIC = "generic"
 
 
@@ -309,6 +310,11 @@ class Cue:
     vibration_intensity: float = 0.5  # 0.0 to 1.0
     enable_video_audio: bool = False
     video_audio_volume: float = 1.0
+
+    # Generated audio bed (no file): Shepard tone.
+    shepard_enabled: bool = False
+    shepard_volume: float = 0.15
+    shepard_direction: str = "ascending"  # "ascending" | "descending"
     
     def validate(self) -> tuple[bool, str]:
         """
@@ -370,6 +376,14 @@ class Cue:
 
         if not (0.0 <= float(self.video_audio_volume) <= 1.0):
             return False, f"video_audio_volume must be 0.0-1.0, got {self.video_audio_volume}"
+
+        if not isinstance(self.shepard_enabled, bool):
+            return False, f"shepard_enabled must be a boolean, got {type(self.shepard_enabled)}"
+        if not (0.0 <= float(self.shepard_volume) <= 1.0):
+            return False, f"shepard_volume must be 0.0-1.0, got {self.shepard_volume}"
+        direction = str(self.shepard_direction or "").strip().lower()
+        if direction and not (direction.startswith("asc") or direction.startswith("desc")):
+            return False, f"shepard_direction must be 'ascending' or 'descending', got {self.shepard_direction}"
         
         return True, ""
     
@@ -399,6 +413,17 @@ class Cue:
                     audio_layer["background"] = track.to_dict()
             if audio_layer:
                 data["audio"] = audio_layer
+
+        if self.shepard_enabled:
+            audio_layer = data.get("audio")
+            if not isinstance(audio_layer, dict):
+                audio_layer = {}
+                data["audio"] = audio_layer
+            audio_layer["shepard"] = {
+                "enabled": True,
+                "volume": float(self.shepard_volume),
+                "direction": str(self.shepard_direction or "ascending"),
+            }
         
         if self.text_messages is not None:
             data["text_messages"] = self.text_messages
@@ -450,6 +475,23 @@ class Cue:
                 bg_track.role = AudioRole.BACKGROUND
                 tracks.append(bg_track)
 
+        # Optional generated bed: Shepard tone
+        shepard_enabled = False
+        shepard_volume = 0.15
+        shepard_direction = "ascending"
+        if isinstance(audio_block, dict):
+            shepard_block = audio_block.get("shepard")
+            if isinstance(shepard_block, dict):
+                # If the block exists without an explicit enabled flag, treat as enabled.
+                shepard_enabled = bool(shepard_block.get("enabled", True))
+                try:
+                    shepard_volume = float(shepard_block.get("volume", shepard_volume))
+                except (TypeError, ValueError):
+                    pass
+                shepard_direction = str(shepard_block.get("direction", shepard_direction))
+        shepard_volume = max(0.0, min(1.0, float(shepard_volume)))
+        shepard_direction = str(shepard_direction or "ascending")
+
         # Legacy schema: "audio_tracks" list
         if not tracks:
             legacy_tracks = [
@@ -498,6 +540,9 @@ class Cue:
             vibration_intensity=data.get("vibration_intensity", 0.5),
             enable_video_audio=enable_video_audio,
             video_audio_volume=video_audio_volume,
+            shepard_enabled=shepard_enabled,
+            shepard_volume=shepard_volume,
+            shepard_direction=shepard_direction,
         )
 
     # Convenience helpers -------------------------------------------------

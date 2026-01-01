@@ -187,7 +187,7 @@ class MainApplication(QMainWindow):
             
             # 5. Create AudioEngine (multi-channel audio for sessions)
             from ..engine.audio import AudioEngine
-            self.audio_engine = AudioEngine(num_channels=2)
+            self.audio_engine = AudioEngine(num_channels=3)
             self.logger.info("AudioEngine initialized")
             
             # 6. Create DeviceManager (optional - may not be available)

@@ -64,6 +64,8 @@ class CueEditor(QDialog):
 
         self._audio_state: Dict[AudioRole, Dict[str, Any]] = {}
         self._audio_widgets: Dict[AudioRole, Dict[str, Any]] = {}
+        self._shepard_state: Dict[str, Any] = {}
+        self._shepard_widgets: Dict[str, Any] = {}
         self._hypno_duration_suggestion: Optional[float] = None
         self._duration_manual_override = False
         self._updating_duration_spin = False
@@ -155,10 +157,47 @@ class CueEditor(QDialog):
                 "duration": None,
             },
         }
+        self._shepard_state = {
+            "enabled": False,
+            "volume": 0.15,
+            "direction": "ascending",
+        }
         if not preserve_widgets:
             self._audio_widgets = {}
+            self._shepard_widgets = {}
         self._hypno_duration_suggestion = None
         self._duration_manual_override = False
+
+    def _build_shepard_section(self, parent_layout: QVBoxLayout) -> None:
+        box = QGroupBox("Shepard Tone")
+        form = QFormLayout(box)
+
+        enabled_cb = QCheckBox("Enable")
+        enabled_cb.toggled.connect(self._on_shepard_enabled_changed)
+        form.addRow("", enabled_cb)
+
+        volume_spin = QSpinBox()
+        volume_spin.setRange(0, 100)
+        volume_spin.setSuffix(" %")
+        volume_spin.valueChanged.connect(self._on_shepard_volume_changed)
+        form.addRow("Volume:", volume_spin)
+
+        direction_combo = QComboBox()
+        direction_combo.addItems(["ascending", "descending"])
+        direction_combo.currentTextChanged.connect(self._on_shepard_direction_changed)
+        form.addRow("Direction:", direction_combo)
+
+        desc_label = QLabel("Synthesized looping tone bed (quiet under other audio).")
+        desc_label.setWordWrap(True)
+        desc_label.setStyleSheet("color: #888888;")
+        form.addRow(desc_label)
+
+        parent_layout.addWidget(box)
+        self._shepard_widgets = {
+            "enabled_cb": enabled_cb,
+            "volume_spin": volume_spin,
+            "direction_combo": direction_combo,
+        }
 
     def _setup_ui(self):
         """Build the editor UI."""
@@ -251,6 +290,7 @@ class CueEditor(QDialog):
             "Background Track",
             "Ambient loop that automatically repeats to cover the hypno track."
         )
+        self._build_shepard_section(audio_layout)
         layout.addWidget(audio_group)
 
         # === TEXT MESSAGES ===
@@ -469,6 +509,7 @@ class CueEditor(QDialog):
 
         self._hydrate_audio_state_from_data()
         self._refresh_audio_fields()
+        self._refresh_shepard_fields()
         hypno_state = self._audio_state.get(AudioRole.HYPNO)
         suggestion = hypno_state.get("duration") if hypno_state else None
         if suggestion:
@@ -484,6 +525,7 @@ class CueEditor(QDialog):
         """Load audio configuration from cue_data into UI state."""
         raw_tracks: list[Dict[str, Any]] = []
         audio_block = self.cue_data.get("audio")
+        shepard_state_from_data: Dict[str, Any] | None = None
         if isinstance(audio_block, dict):
             hypno_block = audio_block.get("hypno")
             if isinstance(hypno_block, dict):
@@ -496,10 +538,20 @@ class CueEditor(QDialog):
                 temp.setdefault("role", AudioRole.BACKGROUND.value)
                 raw_tracks.append(temp)
 
+            shepard_block = audio_block.get("shepard")
+            if isinstance(shepard_block, dict):
+                shepard_state_from_data = {
+                    "enabled": bool(shepard_block.get("enabled", True)),
+                    "volume": normalize_volume(shepard_block.get("volume", 0.15)),
+                    "direction": str(shepard_block.get("direction", "ascending")),
+                }
+
         if not raw_tracks:
             raw_tracks = self.cue_data.get("audio_tracks", []) or []
 
         self._reset_audio_state()
+        if shepard_state_from_data is not None:
+            self._shepard_state.update(shepard_state_from_data)
         for idx, track_data in enumerate(raw_tracks):
             role_value = track_data.get("role")
             role = None
@@ -521,6 +573,49 @@ class CueEditor(QDialog):
             state["fade_in_ms"] = track_data.get("fade_in_ms", state["fade_in_ms"])
             state["fade_out_ms"] = track_data.get("fade_out_ms", state["fade_out_ms"])
             state["duration"] = track_data.get("duration")
+
+    def _refresh_shepard_fields(self) -> None:
+        widgets = self._shepard_widgets
+        if not widgets:
+            return
+
+        enabled = bool(self._shepard_state.get("enabled", False))
+        widgets["enabled_cb"].blockSignals(True)
+        widgets["enabled_cb"].setChecked(enabled)
+        widgets["enabled_cb"].blockSignals(False)
+
+        volume = normalize_volume(self._shepard_state.get("volume", 0.15))
+        self._shepard_state["volume"] = volume
+        widgets["volume_spin"].blockSignals(True)
+        widgets["volume_spin"].setValue(int(round(volume * 100)))
+        widgets["volume_spin"].blockSignals(False)
+
+        direction = str(self._shepard_state.get("direction", "ascending") or "ascending").strip().lower()
+        if direction not in {"ascending", "descending"}:
+            direction = "ascending"
+        self._shepard_state["direction"] = direction
+        widgets["direction_combo"].blockSignals(True)
+        widgets["direction_combo"].setCurrentText(direction)
+        widgets["direction_combo"].blockSignals(False)
+
+        widgets["volume_spin"].setEnabled(enabled)
+        widgets["direction_combo"].setEnabled(enabled)
+
+    def _on_shepard_enabled_changed(self, checked: bool) -> None:
+        self._shepard_state["enabled"] = bool(checked)
+        self._refresh_shepard_fields()
+        self._mark_modified()
+
+    def _on_shepard_volume_changed(self, value: int) -> None:
+        self._shepard_state["volume"] = normalize_volume(value / 100.0)
+        self._mark_modified()
+
+    def _on_shepard_direction_changed(self, text: str) -> None:
+        value = str(text or "ascending").strip().lower()
+        if value not in {"ascending", "descending"}:
+            value = "ascending"
+        self._shepard_state["direction"] = value
+        self._mark_modified()
 
     def _refresh_audio_fields(self) -> None:
         """Apply audio state to widgets and update suggestions."""
@@ -733,11 +828,22 @@ class CueEditor(QDialog):
             key = "hypno" if role == AudioRole.HYPNO else "background"
             audio_block[key] = track_dict
 
+        # Shepard tone (generated)
+        if bool(self._shepard_state.get("enabled", False)):
+            audio_block["shepard"] = {
+                "enabled": True,
+                "volume": round(normalize_volume(self._shepard_state.get("volume", 0.15)), 4),
+                "direction": str(self._shepard_state.get("direction", "ascending") or "ascending"),
+            }
+
         if audio_tracks:
             self.cue_data["audio_tracks"] = audio_tracks
-            self.cue_data["audio"] = audio_block
         else:
             self.cue_data.pop("audio_tracks", None)
+
+        if audio_block:
+            self.cue_data["audio"] = audio_block
+        else:
             self.cue_data.pop("audio", None)
 
         self.cue_data.pop("video_audio", None)

@@ -1765,7 +1765,7 @@ def _run_cuelist_diag(
     if get_log_mode() is not LogMode.PERF:
         set_log_mode(LogMode.PERF)
 
-    audio_engine = AudioEngine(num_channels=2)
+    audio_engine = AudioEngine(num_channels=3)
     if not getattr(audio_engine, "init_ok", True):
         return {"error": "AudioEngine failed to initialize (pygame mixer unavailable)", "code": 2}
 

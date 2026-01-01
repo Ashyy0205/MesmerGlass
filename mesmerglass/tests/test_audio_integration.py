@@ -18,6 +18,7 @@ from unittest.mock import MagicMock, patch, call
 from mesmerglass.engine.audio import AudioEngine
 from mesmerglass.session.cue import Cue, PlaybackEntry, AudioTrack, AudioRole
 from mesmerglass.session.cuelist import Cuelist
+from mesmerglass.session.cuelist import CuelistTransitionMode
 from mesmerglass.session.runner import SessionRunner
 from mesmerglass.session.audio_prefetch import (
     gather_audio_paths_for_cuelist,
@@ -848,6 +849,73 @@ class TestSessionRunnerAudioIntegration:
         runner._end_cue()
 
         mock_audio_engine.stop_streaming_track.assert_called()
+
+    def test_fade_transition_ends_old_cue_audio_channels(
+        self,
+        tmp_path,
+    ):
+        """FADE transitions must end old cue audio (e.g., looping Shepard) before starting next cue."""
+        playback_dir = tmp_path / "playbacks"
+        playback_dir.mkdir()
+
+        playback1 = playback_dir / "test1.json"
+        playback1.write_text('{"name": "Test 1"}')
+        playback2 = playback_dir / "test2.json"
+        playback2.write_text('{"name": "Test 2"}')
+
+        cue1 = Cue(
+            name="Cue 1",
+            duration_seconds=1.0,
+            playback_pool=[PlaybackEntry(playback_path=playback1, weight=1.0)],
+        )
+        cue2 = Cue(
+            name="Cue 2",
+            duration_seconds=1.0,
+            playback_pool=[PlaybackEntry(playback_path=playback2, weight=1.0)],
+        )
+
+        cuelist = Cuelist(
+            name="Fade Transition Test",
+            cues=[cue1, cue2],
+            transition_mode=CuelistTransitionMode.FADE,
+            transition_duration_ms=250,
+        )
+
+        mock_visual_director = MagicMock()
+        mock_visual_director.load_playback.return_value = True
+        mock_visual_director.get_cycle_count.return_value = 0
+
+        mock_audio_engine = MagicMock(spec=AudioEngine)
+        mock_audio_engine.num_channels = 3
+        mock_audio_engine.is_playing.side_effect = lambda ch: ch == 2
+        mock_audio_engine.fade_out_and_stop.return_value = True
+        mock_audio_engine.fade_in_and_play.return_value = True
+        mock_audio_engine.load_channel.return_value = True
+        mock_audio_engine.get_channel_length.return_value = 30.0
+        mock_audio_engine.prefetch_tracks.return_value = {}
+        mock_audio_engine.should_stream.return_value = False
+        mock_audio_engine.play_streaming_track.return_value = False
+        mock_audio_engine.stop_streaming_track.return_value = False
+        mock_audio_engine.is_streaming_active.return_value = False
+        mock_audio_engine.set_stream_threshold_mb.return_value = None
+        mock_audio_engine.preload_sound.return_value = True
+        mock_audio_engine.estimate_track_duration.return_value = 1.0
+        mock_audio_engine.drop_cached_sound.return_value = None
+
+        runner = SessionRunner(
+            cuelist=cuelist,
+            visual_director=mock_visual_director,
+            audio_engine=mock_audio_engine,
+        )
+
+        runner.start()
+        mock_audio_engine.fade_out_and_stop.reset_mock()
+
+        runner._execute_transition(1)
+
+        # Old cue audio (channel 2) must be faded out when transition begins.
+        mock_audio_engine.fade_out_and_stop.assert_called_once()
+        assert mock_audio_engine.fade_out_and_stop.call_args.args[0] == 2
 
     def test_streaming_forced_when_channel_load_fails(
         self,

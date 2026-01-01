@@ -6,6 +6,7 @@ import logging
 import os
 import time
 import threading
+import numpy as np
 from concurrent.futures import ThreadPoolExecutor, Future
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -653,6 +654,56 @@ class AudioEngine:
         self._lengths[channel] = length
         self.logger.debug(f"Loaded audio into channel {channel}: {file_path} (cached={length > 0.0})")
         return True
+
+    def load_channel_pcm(self, channel: int, pcm_int16_stereo: 'np.ndarray', *, tag: str = "generated") -> bool:
+        """Load an in-memory PCM buffer (int16 stereo) into a channel.
+
+        This supports synthesized/generated layers without going through a file.
+
+        Args:
+            channel: Channel index (0..num_channels-1)
+            pcm_int16_stereo: numpy array shaped (n_samples, 2) dtype int16
+            tag: Debug label stored in _paths
+        """
+        if not self.init_ok:
+            self.logger.warning("AudioEngine not initialized, cannot load generated audio")
+            return False
+
+        if not 0 <= channel < self.num_channels:
+            self.logger.error(f"Invalid channel {channel}, valid range: 0-{self.num_channels-1}")
+            return False
+
+        try:
+            if not isinstance(pcm_int16_stereo, np.ndarray):
+                self.logger.error("pcm_int16_stereo must be a numpy array")
+                return False
+            if pcm_int16_stereo.dtype != np.int16:
+                self.logger.error("pcm_int16_stereo must be int16")
+                return False
+            if pcm_int16_stereo.ndim != 2 or pcm_int16_stereo.shape[1] != 2:
+                self.logger.error("pcm_int16_stereo must have shape (n_samples, 2)")
+                return False
+
+            # Stop any existing playback on this channel
+            self.stop_channel(channel)
+
+            sound = pygame.sndarray.make_sound(pcm_int16_stereo)
+            self._sounds[channel] = sound
+            self._paths[channel] = str(tag)
+
+            # Mixer is initialized at 44100Hz; estimate length from sample count.
+            try:
+                length = float(pcm_int16_stereo.shape[0]) / 44100.0
+            except Exception:
+                length = 0.0
+            self._lengths[channel] = length
+            return True
+        except Exception as exc:
+            self.logger.error(f"Failed to load generated PCM into channel {channel}: {exc}")
+            self._sounds[channel] = None
+            self._paths[channel] = None
+            self._lengths[channel] = 0.0
+            return False
     
     def fade_in_and_play(
         self,

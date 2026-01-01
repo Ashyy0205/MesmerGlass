@@ -1449,12 +1449,13 @@ class SessionRunner:
         self.logger.info(f"[session] Playback started: {playback_path.name}")
         
         # === AUDIO INTEGRATION: Start audio tracks for this cue ===
-        if self.audio_engine and cue.audio_tracks:
+        shepard_enabled = bool(getattr(cue, "shepard_enabled", False))
+        if self.audio_engine and (cue.audio_tracks or shepard_enabled):
             with self._perf_span(
                 "cue_audio_start",
                 category="audio",
                 cue_index=cue_index,
-                track_count=len(cue.audio_tracks),
+                track_count=len(cue.audio_tracks) + (1 if shepard_enabled else 0),
             ) as audio_span:
                 audio_start = time.perf_counter()
                 self._audio_role_channels.clear()
@@ -1498,7 +1499,11 @@ class SessionRunner:
                             fade_ms=track.fade_in_ms,
                             loop=loop_flag,
                         )
-                        if handle:
+                        try:
+                            from ..engine.audio import StreamingHandle
+                        except Exception:
+                            StreamingHandle = None  # type: ignore[assignment]
+                        if StreamingHandle is not None and isinstance(handle, StreamingHandle):
                             self._pending_streams[role] = {
                                 "handle": handle,
                                 "track": Path(track.file_path).name,
@@ -1649,6 +1654,49 @@ class SessionRunner:
                     )
 
                     channel_index += 1
+
+                # Shepard tone bed (generated, no file).
+                if shepard_enabled:
+                    if max_channels < 3:
+                        self.logger.warning(
+                            "[session] Shepard tone enabled but AudioEngine has only %d channels (need 3)",
+                            max_channels,
+                        )
+                    else:
+                        try:
+                            from ..engine.shepard_tone import generate_shepard_tone_int16_stereo
+
+                            shepard_channel = 2
+                            direction = getattr(cue, "shepard_direction", "ascending")
+                            volume = float(getattr(cue, "shepard_volume", 0.15))
+                            volume = max(0.0, min(1.0, volume))
+
+                            pcm = generate_shepard_tone_int16_stereo(
+                                duration_s=60.0,
+                                sample_rate=44100,
+                                direction=str(direction),
+                                peak=0.18,
+                            )
+                            if self.audio_engine.load_channel_pcm(
+                                shepard_channel,
+                                pcm,
+                                tag=f"shepard:{str(direction)}",
+                            ):
+                                if self.audio_engine.fade_in_and_play(
+                                    channel=shepard_channel,
+                                    fade_ms=600,
+                                    volume=volume,
+                                    loop=True,
+                                ):
+                                    self._audio_role_channels[AudioRole.SHEPARD] = shepard_channel
+                                    self.logger.debug(
+                                        "[session] Started shepard audio (ch=%d): dir=%s vol=%.2f",
+                                        shepard_channel,
+                                        str(direction),
+                                        volume,
+                                    )
+                        except Exception as exc:
+                            self.logger.warning("[session] Failed to start shepard tone: %s", exc)
 
                 total_audio_ms = (time.perf_counter() - audio_start) * 1000.0
                 if total_audio_ms > 40.0:
@@ -2268,9 +2316,14 @@ class SessionRunner:
                 fade_duration_s = (self.cuelist.transition_duration_ms or 2000.0) / 1000.0
                 self.logger.info(f"[session] Starting FADE transition to cue {next_cue_index} (duration: {fade_duration_s:.2f}s)")
                 span.annotate(fade_duration_s=fade_duration_s)
-                
-                # Start next cue (but keep old cue's visuals visible during fade)
-                # Note: We don't call _end_cue() yet - we'll fade out the old cue
+
+                # End current cue before starting the next one.
+                # NOTE: FADE mode currently only tracks a visual fade state; audio has no
+                # per-cue crossfade mixing. If we do not end the cue here, looping tracks
+                # (including Shepard) can continue indefinitely.
+                self._end_cue()
+
+                # Start next cue
                 success = self._start_cue(next_cue_index)
                 span.annotate(success=success)
                 
