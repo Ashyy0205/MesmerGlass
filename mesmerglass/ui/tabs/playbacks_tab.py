@@ -39,8 +39,8 @@ class PlaybackCard(QFrame):
         
         # Make clickable
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setFrameStyle(QFrame.Shape.Box | QFrame.Shadow.Raised)
-        self.setLineWidth(1)
+        # Styling is handled by PlaybacksTab stylesheet via the "selected" property.
+        self.setProperty("selected", False)
     
     def _setup_ui(self):
         """Build card layout."""
@@ -97,6 +97,19 @@ class PlaybackCard(QFrame):
         """Handle double-click."""
         self.tab_widget._on_card_double_click(self.playback_key, self.playback_data)
 
+    def mousePressEvent(self, event):
+        """Handle single click selection."""
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.tab_widget._select_playback(self.playback_key)
+        super().mousePressEvent(event)
+
+    def set_selected(self, selected: bool) -> None:
+        self.setProperty("selected", bool(selected))
+        # Re-polish so Qt reapplies QSS for the new property value.
+        self.style().unpolish(self)
+        self.style().polish(self)
+        self.update()
+
 
 class PlaybacksTab(BaseTab):
     """Tab for browsing playback definitions from session."""
@@ -110,10 +123,49 @@ class PlaybacksTab(BaseTab):
         self.session_data: Optional[Dict[str, Any]] = None
         self.playbacks: List[tuple[str, Dict[str, Any]]] = []  # List of (key, data) tuples
         self.view_mode: str = "grid"  # "grid" or "list"
+        self._selected_playback_key: Optional[str] = None
+        self._card_widgets_by_key: dict[str, PlaybackCard] = {}
         self._setup_ui()
     
     def _setup_ui(self):
         """Build the playbacks tab UI."""
+        # Local QSS: keep card selection subtle and consistent with the app theme.
+        # Uses the same accent color already present across the app.
+        self.setStyleSheet(
+            "PlaybackCard {"
+            "  background-color: #252526;"
+            "  border: 1px solid #3c3c3c;"
+            "  border-radius: 6px;"
+            "}"
+            "PlaybackCard[selected=\"true\"] {"
+            "  border-left: 3px solid #FF8A00;"
+            "  border-top: 1px solid #3c3c3c;"
+            "  border-right: 1px solid #3c3c3c;"
+            "  border-bottom: 1px solid #3c3c3c;"
+            "  background-color: #1e1e1e;"
+            "}"
+            "PlaybackCard:hover {"
+            "  border-color: #555555;"
+            "}"
+            "QTableWidget {"
+            "  gridline-color: #333333;"
+            "  background-color: #1e1e1e;"
+            "  alternate-background-color: #252526;"
+            "}"
+            "QHeaderView::section {"
+            "  background-color: #252526;"
+            "  border: 0px;"
+            "  padding: 6px;"
+            "}"
+            "QTableWidget::item {"
+            "  padding: 6px;"
+            "}"
+            "QTableWidget::item:selected {"
+            "  background-color: rgba(255, 138, 0, 55);"
+            "  color: #ffffff;"
+            "}"
+        )
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(12)
@@ -137,6 +189,7 @@ class PlaybacksTab(BaseTab):
         header_layout.addWidget(self.radio_grid)
         
         self.radio_list = QRadioButton("List")
+        self.radio_list.toggled.connect(self._on_view_mode_changed)
         header_layout.addWidget(self.radio_list)
         
         header_layout.addSpacing(20)
@@ -144,6 +197,10 @@ class PlaybacksTab(BaseTab):
         btn_new = QPushButton("➕ New Playback")
         btn_new.clicked.connect(self._on_new_playback)
         header_layout.addWidget(btn_new)
+
+        btn_delete = QPushButton("🗑️ Delete Playback")
+        btn_delete.clicked.connect(self._on_delete_selected_playback)
+        header_layout.addWidget(btn_delete)
         
         btn_refresh = QPushButton("🔄 Refresh")
         btn_refresh.clicked.connect(self._on_refresh)
@@ -187,11 +244,16 @@ class PlaybacksTab(BaseTab):
         self.table.setHorizontalHeaderLabels([
             "Name", "Description", "Spiral Type", "Media Mode", "Actions"
         ])
+
+        self.table.setAlternatingRowColors(True)
+        self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setDefaultSectionSize(44)
         
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.doubleClicked.connect(self._on_table_double_click)
+        self.table.itemSelectionChanged.connect(self._on_table_selection_changed)
         
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
@@ -199,10 +261,20 @@ class PlaybacksTab(BaseTab):
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
-        self.table.setColumnWidth(4, 100)
-        
-        self.content_layout.addWidget(self.table)
-        self.table.hide()  # Start with grid view
+        self.table.setColumnWidth(4, 170)
+
+        # Center the list/table view so rows don't become a full-width "long bar".
+        self.table.setMaximumWidth(1200)
+        self.table_container = QWidget()
+        table_container_layout = QHBoxLayout(self.table_container)
+        table_container_layout.setContentsMargins(0, 0, 0, 0)
+        table_container_layout.setSpacing(0)
+        table_container_layout.addStretch(1)
+        table_container_layout.addWidget(self.table, 10)
+        table_container_layout.addStretch(1)
+
+        self.content_layout.addWidget(self.table_container)
+        self.table_container.hide()  # Start with grid view
         
         layout.addWidget(self.content_widget, 1)
         
@@ -269,6 +341,8 @@ class PlaybacksTab(BaseTab):
     
     def _update_grid(self, filter_text: str = ""):
         """Update grid view with playback cards."""
+        self._card_widgets_by_key = {}
+
         # Clear existing cards
         while self.grid_layout.count():
             item = self.grid_layout.takeAt(0)
@@ -291,6 +365,8 @@ class PlaybacksTab(BaseTab):
         col = 0
         for key, data in filtered:
             card = PlaybackCard(key, data, self, self)
+            card.set_selected(bool(self._selected_playback_key == key))
+            self._card_widgets_by_key[key] = card
             self.grid_layout.addWidget(card, row, col)
             
             col += 1
@@ -350,9 +426,25 @@ class PlaybacksTab(BaseTab):
             self.table.setItem(row, 3, media_item)
             
             # Actions
-            actions_item = QTableWidgetItem("Edit | Delete")
-            actions_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.table.setItem(row, 4, actions_item)
+            actions_widget = QWidget()
+            actions_layout = QHBoxLayout(actions_widget)
+            actions_layout.setContentsMargins(0, 0, 0, 0)
+            actions_layout.setSpacing(8)
+
+            actions_layout.addStretch(1)
+
+            btn_edit = QPushButton("Edit")
+            btn_edit.setFixedWidth(52)
+            btn_edit.clicked.connect(lambda _checked=False, k=key, d=data: self._on_card_double_click(k, d))
+            actions_layout.addWidget(btn_edit)
+
+            btn_delete = QPushButton("Delete")
+            btn_delete.setFixedWidth(62)
+            btn_delete.clicked.connect(lambda _checked=False, k=key: self._delete_playback(k))
+            actions_layout.addWidget(btn_delete)
+
+            actions_layout.addStretch(1)
+            self.table.setCellWidget(row, 4, actions_widget)
     
     def _on_view_mode_changed(self, checked: bool):
         """Handle view mode toggle."""
@@ -362,11 +454,11 @@ class PlaybacksTab(BaseTab):
         if self.radio_grid.isChecked():
             self.view_mode = "grid"
             self.grid_scroll.show()
-            self.table.hide()
+            self.table_container.hide()
         else:
             self.view_mode = "list"
             self.grid_scroll.hide()
-            self.table.show()
+            self.table_container.show()
         
         # Update view
         self._update_view(self.search_box.text())
@@ -379,6 +471,114 @@ class PlaybacksTab(BaseTab):
     def _on_refresh(self):
         """Refresh playback list."""
         self._load_playbacks()
+
+    def _on_table_selection_changed(self) -> None:
+        if self.view_mode != "list":
+            return
+        key = self._get_selected_playback_key_from_table()
+        if key:
+            self._selected_playback_key = key
+
+    def _get_selected_playback_key_from_table(self) -> Optional[str]:
+        current_row = self.table.currentRow()
+        if current_row < 0:
+            return None
+
+        filter_text = self.search_box.text().lower()
+        filtered = self.playbacks
+        if filter_text:
+            filtered = [
+                (key, data) for key, data in self.playbacks
+                if filter_text in data.get("name", "").lower() or
+                   filter_text in data.get("description", "").lower() or
+                   filter_text in str(data.get("spiral", {}).get("type", "")).lower()
+            ]
+
+        if current_row >= len(filtered):
+            return None
+        key, _data = filtered[current_row]
+        return key
+
+    def _select_playback(self, playback_key: str) -> None:
+        self._selected_playback_key = playback_key
+        for key, card in self._card_widgets_by_key.items():
+            card.set_selected(bool(key == playback_key))
+
+    def _on_delete_selected_playback(self) -> None:
+        key = None
+        if self.view_mode == "list":
+            key = self._get_selected_playback_key_from_table()
+        else:
+            key = self._selected_playback_key
+
+        if not key:
+            QMessageBox.information(self, "Delete Playback", "Select a playback to delete.")
+            return
+
+        self._delete_playback(key)
+
+    def _count_playback_references(self, playback_key: str) -> int:
+        if not self.session_data:
+            return 0
+        cuelists = self.session_data.get("cuelists", {})
+        if not isinstance(cuelists, dict):
+            return 0
+
+        refs = 0
+        for _cuelist_key, cuelist_data in cuelists.items():
+            if not isinstance(cuelist_data, dict):
+                continue
+            for cue in cuelist_data.get("cues", []) or []:
+                if not isinstance(cue, dict):
+                    continue
+                pool = cue.get("playback_pool", []) or []
+                for entry in pool:
+                    if isinstance(entry, dict) and entry.get("playback") == playback_key:
+                        refs += 1
+        return refs
+
+    def _delete_playback(self, playback_key: str) -> bool:
+        if not self.session_data:
+            QMessageBox.warning(self, "Delete Playback", "No session loaded.")
+            return False
+
+        playbacks = self.session_data.get("playbacks")
+        if not isinstance(playbacks, dict) or playback_key not in playbacks:
+            QMessageBox.warning(self, "Delete Playback", f"Playback '{playback_key}' not found in session.")
+            return False
+
+        ref_count = self._count_playback_references(playback_key)
+        if ref_count > 0:
+            QMessageBox.warning(
+                self,
+                "Delete Playback",
+                f"Cannot delete '{playback_key}' because it is referenced by {ref_count} cue entry(ies).\n\n"
+                f"Remove it from cuelists first, then delete.",
+            )
+            return False
+
+        name = playbacks.get(playback_key, {}).get("name", playback_key)
+        reply = QMessageBox.question(
+            self,
+            "Delete Playback",
+            f"Delete playback '{name}'?\n\nThis will remove it from the current session.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return False
+
+        try:
+            del playbacks[playback_key]
+            if self._selected_playback_key == playback_key:
+                self._selected_playback_key = None
+            self._load_playbacks()
+            self.data_changed.emit()
+            return True
+        except Exception as exc:
+            self.logger.error("Failed to delete playback %s: %s", playback_key, exc, exc_info=True)
+            QMessageBox.critical(self, "Delete Playback", f"Failed to delete playback:\n{exc}")
+            return False
     
     def _on_new_playback(self):
         """Create a new playback."""

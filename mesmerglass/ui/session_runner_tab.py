@@ -728,7 +728,15 @@ class SessionRunnerTab(QWidget):
         total_duration = self.cuelist.total_duration()
         minutes = int(total_duration // 60)
         seconds = int(total_duration % 60)
-        self.label_duration.setText(f"Duration: {minutes:02d}:{seconds:02d}")
+
+        loop_mode = getattr(self.cuelist, "loop_mode", None)
+        loop_mode_value = getattr(loop_mode, "value", loop_mode)
+        is_looping = str(loop_mode_value).lower() in ("loop", "ping_pong")
+
+        dur = f"{minutes:02d}:{seconds:02d}"
+        if is_looping:
+            dur = f"{dur} ∞"
+        self.label_duration.setText(f"Duration: {dur}")
         
         self.label_cue_count.setText(f"Cues: {len(self.cuelist.cues)}")
     
@@ -771,6 +779,9 @@ class SessionRunnerTab(QWidget):
         
         # Update progress bar
         total_duration = self.cuelist.total_duration()
+        loop_mode = getattr(self.cuelist, "loop_mode", None)
+        loop_mode_value = getattr(loop_mode, "value", loop_mode)
+        is_looping = str(loop_mode_value).lower() in ("loop", "ping_pong")
         current_cue_idx = self.session_runner.get_current_cue_index()
         
         elapsed = sum(
@@ -780,14 +791,31 @@ class SessionRunnerTab(QWidget):
         elapsed += self.session_runner._get_cue_elapsed_time()  # Private method but needed
         
         if total_duration > 0:
-            progress_pct = min(100, int((elapsed / total_duration) * 100))
-            self.progress_bar.setValue(progress_pct)
-            
+            elapsed_for_progress = elapsed
+            if is_looping:
+                # For looping modes, show per-cycle progress (wrap around each loop).
+                elapsed_for_progress = elapsed % total_duration
+                # If we land exactly on a cycle boundary, show 100% briefly.
+                if elapsed > 0 and elapsed_for_progress == 0:
+                    elapsed_for_progress = total_duration
+
+            # Use a millisecond-scale bar so it advances smoothly even for long cuelists.
+            max_ms = max(1, int(round(total_duration * 1000.0)))
+            value_ms = int(round(min(total_duration, max(0.0, elapsed_for_progress)) * 1000.0))
+            self.progress_bar.setMinimum(0)
+            self.progress_bar.setMaximum(max_ms)
+            self.progress_bar.setValue(value_ms)
+
+            progress_pct = min(100.0, (value_ms / max_ms) * 100.0)
+
             # Format time remaining (clamp to 0 to prevent negative display)
-            remaining = max(0, total_duration - elapsed)
+            remaining = max(0.0, total_duration - (value_ms / 1000.0))
             mins_remaining = int(remaining // 60)
             secs_remaining = int(remaining % 60)
-            self.progress_bar.setFormat(f"{progress_pct}% - {mins_remaining}:{secs_remaining:02d} remaining")
+            if is_looping:
+                self.progress_bar.setFormat(f"{progress_pct:0.1f}% - {mins_remaining}:{secs_remaining:02d} remaining ∞")
+            else:
+                self.progress_bar.setFormat(f"{progress_pct:0.1f}% - {mins_remaining}:{secs_remaining:02d} remaining")
     
     def set_session_runner(self, runner):
         """Set the SessionRunner instance for this tab (deprecated - use constructor)."""
