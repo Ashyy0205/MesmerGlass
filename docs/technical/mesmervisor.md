@@ -233,7 +233,8 @@ Example: "VR_SERVER_INFO:5555"
 │  │ Packet Size (4 bytes, big-endian uint32)        │ │
 │  ├──────────────────────────────────────────────────┤ │
 │  │ Magic Bytes (4 bytes ASCII)                      │ │
-│  │   - "VRH2" = H.264 encoding                      │ │
+│  │   - "VRH3" = H.264 encoding (default; includes fps_milli) │ │
+│  │   - "VRH2" = H.264 encoding (legacy)              │ │
 │  │   - "VRHP" = JPEG encoding                       │ │
 │  ├──────────────────────────────────────────────────┤ │
 │  │ Frame ID (4 bytes, big-endian uint32)           │ │
@@ -267,7 +268,8 @@ Example: "VR_SERVER_INFO:5555"
 **Example Packet (NVENC):**
 ```
 Packet Size: 0x00003A42 (14914 bytes)
-Magic:       0x56524832 ("VRH2")
+Magic:       0x56524833 ("VRH3")  (default)
+             0x56524832 ("VRH2")  (legacy)
 Frame ID:    0x0000007B (123)
 Left Size:   0x00001D21 (7457 bytes)
 Right Size:  0x00001D21 (7457 bytes)

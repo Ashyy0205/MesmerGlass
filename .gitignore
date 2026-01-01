@@ -70,3 +70,5 @@ mesmerglass/sessions/
 keystore.properties
 *.keystore
 *.jks
+
+/dumps

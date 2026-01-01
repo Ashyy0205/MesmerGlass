@@ -340,6 +340,23 @@ class AudioEngine:
             return True
         if not self._streaming_enabled:
             return False
+
+        # Compressed music-like formats can take a long time to fully decode via
+        # pygame.mixer.Sound (observed multi-second stalls). Prefer streaming
+        # for these to keep the render/update loop smooth.
+        try:
+            ext = Path(normalized).suffix.lower()
+        except Exception:
+            ext = ""
+        stream_compressed = os.environ.get("MESMERGLASS_AUDIO_STREAM_COMPRESSED", "1").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if stream_compressed and ext in {".mp3", ".m4a", ".aac"}:
+            return True
+
         size = self._get_file_size(file_path)
         if size is None:
             return False

@@ -817,7 +817,7 @@ class SessionRunner:
                         width=1920,
                         height=1080,
                         fps=30,
-                        encoder_type=EncoderType.JPEG,
+                        encoder_type=EncoderType.AUTO,
                         quality=25,  # Optimized for Oculus Go
                         frame_callback=capture_frame
                     )

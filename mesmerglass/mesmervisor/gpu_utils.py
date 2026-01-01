@@ -29,15 +29,16 @@ def has_nvenc_support() -> bool:
     """
     try:
         import av
-        
+    except ImportError as e:
+        logger.info(f"NVENC not available (PyAV not installed): {e}")
+        return False
+
+    try:
         # Try to find h264_nvenc codec
-        codec = av.codec.Codec('h264_nvenc', 'w')
-        
-        # NVENC available
+        av.codec.Codec('h264_nvenc', 'w')
         logger.info("NVENC (NVIDIA hardware encoder) detected and available")
         return True
-        
-    except (ImportError, av.AVError) as e:
+    except av.AVError as e:
         logger.info(f"NVENC not available: {e}")
         return False
     except Exception as e:

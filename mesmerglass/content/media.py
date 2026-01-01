@@ -385,6 +385,7 @@ class ImageCache:
         self._cache_size = cache_size
         self._cache: dict[Path, CachedImage] = {}
         self._lru_order: deque[Path] = deque()
+        self._lock = threading.RLock()
         throttle_sec = max(0.0, loader_throttle_ms) / 1000.0
         self._perf = perf_tracer
         self._perf_name = cache_name or "image_cache"
@@ -427,26 +428,75 @@ class ImageCache:
         import time
         
         # Check cache
-        if path in self._cache:
-            # Move to front of LRU
-            try:
-                self._lru_order.remove(path)
-            except ValueError:
-                pass
-            self._lru_order.appendleft(path)
-            
-            # Update access time
-            cached = self._cache[path]
-            cached.last_used = time.time()
-            return cached.image_data
+        with self._lock:
+            if path in self._cache:
+                # Move to front of LRU
+                try:
+                    self._lru_order.remove(path)
+                except ValueError:
+                    pass
+                self._lru_order.appendleft(path)
+
+                # Update access time
+                cached = self._cache[path]
+                cached.last_used = time.time()
+                return cached.image_data
         
         # Not in cache - request async load
         logger = logging.getLogger(__name__)
         success = self._loader.request_load(path)
         logger.debug(f"[ImageCache] Requested async load: {path} (queued={success})")
         return None
+
+    def peek_cached(self, path: Path) -> Optional[ImageData]:
+        """Return cached image data without requesting a load."""
+        with self._lock:
+            cached = self._cache.get(path)
+            return cached.image_data if cached else None
+
+    def add_preloaded_image(
+        self,
+        path: Path,
+        image_data: ImageData,
+        *,
+        on_evict_texture_id: Optional[Callable[[int], None]] = None,
+    ) -> bool:
+        """Insert a decoded image into the cache (used by ThemeBank background preload).
+
+        Returns:
+            True if inserted, False if already present.
+        """
+
+        evicted_texture_ids: list[int] = []
+        with self._lock:
+            if path in self._cache:
+                return False
+
+            while len(self._cache) >= self._cache_size:
+                if not self._lru_order:
+                    break
+                oldest_path = self._lru_order.pop()
+                evicted_item = self._cache.pop(oldest_path, None)
+                if evicted_item and evicted_item.gpu_texture_id is not None:
+                    evicted_texture_ids.append(evicted_item.gpu_texture_id)
+
+            self._cache[path] = CachedImage(
+                image_data=image_data,
+                gpu_texture_id=None,
+                last_used=time.time(),
+            )
+            self._lru_order.appendleft(path)
+
+        if on_evict_texture_id:
+            for texture_id in evicted_texture_ids:
+                try:
+                    on_evict_texture_id(int(texture_id))
+                except Exception:
+                    continue
+
+        return True
     
-    def process_loaded_images(self) -> int:
+    def process_loaded_images(self, *, max_items: int = 8) -> int:
         """Process images that finished loading.
         
         Returns:
@@ -457,7 +507,10 @@ class ImageCache:
         logger = logging.getLogger(__name__)
         count = 0
         
+        max_items = max(0, int(max_items))
         while True:
+            if max_items and count >= max_items:
+                break
             result = self._loader.get_loaded_image()
             if result is None:
                 break
@@ -470,36 +523,46 @@ class ImageCache:
                     span.annotate(result="none")
                     continue
                 
-                logger.info(f"[ImageCache] Processing loaded image: {path} ({image_data.width}x{image_data.height})")
-                if path not in self._cache:
-                    evicted = 0
-                    while len(self._cache) >= self._cache_size:
-                        if not self._lru_order:
-                            break
-                        oldest_path = self._lru_order.pop()
-                        if oldest_path in self._cache:
-                            evicted_item = self._cache[oldest_path]
-                            if evicted_item.gpu_texture_id is not None:
-                                from .texture import delete_texture
+                logger.debug(f"[ImageCache] Processing loaded image: {path} ({image_data.width}x{image_data.height})")
 
-                                delete_texture(evicted_item.gpu_texture_id)
-                            del self._cache[oldest_path]
-                            evicted += 1
-                    self._cache[path] = CachedImage(
-                        image_data=image_data,
-                        gpu_texture_id=None,
-                        last_used=time.time(),
-                    )
-                    self._lru_order.appendleft(path)
-                    count += 1
-                    span.annotate(
-                        result="cached",
-                        cache_fill=len(self._cache),
-                        cache_limit=self._cache_size,
-                        evicted=evicted,
-                    )
-                else:
-                    span.annotate(result="duplicate")
+                evicted_texture_ids: list[int] = []
+                with self._lock:
+                    if path not in self._cache:
+                        evicted = 0
+                        while len(self._cache) >= self._cache_size:
+                            if not self._lru_order:
+                                break
+                            oldest_path = self._lru_order.pop()
+                            evicted_item = self._cache.pop(oldest_path, None)
+                            if evicted_item and evicted_item.gpu_texture_id is not None:
+                                evicted_texture_ids.append(evicted_item.gpu_texture_id)
+                            if evicted_item:
+                                evicted += 1
+
+                        self._cache[path] = CachedImage(
+                            image_data=image_data,
+                            gpu_texture_id=None,
+                            last_used=time.time(),
+                        )
+                        self._lru_order.appendleft(path)
+                        count += 1
+                        span.annotate(
+                            result="cached",
+                            cache_fill=len(self._cache),
+                            cache_limit=self._cache_size,
+                            evicted=evicted,
+                        )
+                    else:
+                        span.annotate(result="duplicate")
+
+                if evicted_texture_ids:
+                    from .texture import delete_texture
+
+                    for texture_id in evicted_texture_ids:
+                        try:
+                            delete_texture(texture_id)
+                        except Exception:
+                            continue
         
         return count
     
@@ -513,7 +576,9 @@ class ImageCache:
         for i, path in enumerate(paths):
             if max_count is not None and i >= max_count:
                 break
-            if path not in self._cache:
+            with self._lock:
+                in_cache = path in self._cache
+            if not in_cache:
                 self._loader.request_load(path)
     
     def clear(self) -> None:

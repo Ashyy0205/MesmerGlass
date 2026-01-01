@@ -138,7 +138,7 @@ Server → Client: "VR_SERVER_INFO:5555"
 ```
 Packet Structure:
 [4 bytes] Packet size (big-endian int)
-[4 bytes] Magic: "VRH2" (H.264) or "VRHP" (JPEG)
+[4 bytes] Magic: "VRH3" (H.264 default), "VRH2" (H.264 legacy), or "VRHP" (JPEG)
 [4 bytes] Frame ID
 [4 bytes] Left eye data size
 [4 bytes] Right eye data size

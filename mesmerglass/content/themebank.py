@@ -212,8 +212,15 @@ class ThemeBank:
         self._preload_thread: Optional[threading.Thread] = None
         self._preload_lock = threading.Lock()
         self._preloading_in_progress = False
+
+        # Texture deletion must happen on the main/GL thread. Background preload
+        # can evict cached items, but must queue GPU deletes for async_update.
+        self._pending_texture_deletes: deque[int] = deque()
+        self._pending_texture_deletes_lock = threading.Lock()
+        self._texture_delete_budget_per_update = 8
         
-        # Garbage collection throttle (only collect every N evictions to avoid blocking)
+        # Garbage collection throttle. IMPORTANT: calling gc.collect() from a
+        # background preload thread can still stall the whole process.
         self._eviction_count = 0
         self._gc_interval = 50  # Collect garbage every 50 evictions
 
@@ -245,6 +252,16 @@ class ThemeBank:
             self._max_preload_ms,
             self._throttle.loader_queue_size,
         )
+
+    def _queue_texture_delete(self, texture_id: Optional[int]) -> None:
+        if texture_id is None:
+            return
+        try:
+            value = int(texture_id)
+        except Exception:
+            return
+        with self._pending_texture_deletes_lock:
+            self._pending_texture_deletes.append(value)
     
     # ===== Font Library Support =====
 
@@ -595,7 +612,7 @@ class ThemeBank:
         source = "cache"
         with span:
             # Process any newly loaded images before touching the cache
-            cache.process_loaded_images()
+            cache.process_loaded_images(max_items=4)
 
             # Select next image using weighted shuffler
             image_index = shuffler.next()
@@ -647,40 +664,11 @@ class ThemeBank:
                     sync_span.annotate(result="ok" if image_data else "fail", slow=slow)
 
                 if image_data is not None:
-                    # EVICT oldest if cache is full (LRU) - enforce cache limit!
-                    while len(cache._cache) >= cache._cache_size:
-                        if not cache._lru_order:
-                            break
-                        oldest_path = cache._lru_order.pop()
-                        if oldest_path in cache._cache:
-                            evicted_item = cache._cache[oldest_path]
-                            if hasattr(evicted_item, "gpu_texture_id") and evicted_item.gpu_texture_id is not None:
-                                from .texture import delete_texture
-
-                                delete_texture(evicted_item.gpu_texture_id)
-                                logger.debug(
-                                    f"[ThemeBank] Released GPU texture {evicted_item.gpu_texture_id} for {oldest_path.name}"
-                                )
-
-                            del cache._cache[oldest_path]
-                            logger.debug(
-                                f"[ThemeBank] Evicted {oldest_path.name} from cache (limit: {cache._cache_size})"
-                            )
-                            self._eviction_count += 1
-
-                    if self._eviction_count >= self._gc_interval:
-                        gc.collect()
-                        self._eviction_count = 0
-
-                    cache._cache[image_path] = type(
-                        "obj",
-                        (object,),
-                        {
-                            "image_data": image_data,
-                            "gpu_texture_id": None,
-                        },
-                    )()
-                    cache._lru_order.appendleft(image_path)
+                    cache.add_preloaded_image(
+                        image_path,
+                        image_data,
+                        on_evict_texture_id=self._queue_texture_delete,
+                    )
                     if verbose:
                         logger.debug(
                             "[ThemeBank] Sync load %sx%s cache=%d/%d",
@@ -869,38 +857,20 @@ class ThemeBank:
                     
                     path_str = theme.image_path[idx]
                     image_path = Path(path_str) if Path(path_str).is_absolute() else self._root_path / path_str
-                    
-                    if cache.get_image(image_path) is not None:
+
+                    if cache.peek_cached(image_path) is not None:
                         continue
                     
                     from .media import load_image_sync
 
                     image_data = load_image_sync(image_path, perf_tracer=self._perf)
                     if image_data is not None:
-                        with self._preload_lock:
-                            while len(cache._cache) >= cache._cache_size:
-                                if not cache._lru_order:
-                                    break
-                                oldest_path = cache._lru_order.pop()
-                                if oldest_path in cache._cache:
-                                    evicted_item = cache._cache[oldest_path]
-                                    if hasattr(evicted_item, 'gpu_texture_id') and evicted_item.gpu_texture_id is not None:
-                                        from .texture import delete_texture
-
-                                        delete_texture(evicted_item.gpu_texture_id)
-                                    
-                                    del cache._cache[oldest_path]
-                                    self._eviction_count += 1
-                            
-                            if self._eviction_count >= self._gc_interval:
-                                gc.collect()
-                                self._eviction_count = 0
-                            
-                            cache._cache[image_path] = type('obj', (object,), {
-                                'image_data': image_data,
-                                'gpu_texture_id': None
-                            })()
-                            cache._lru_order.appendleft(image_path)
+                        inserted = cache.add_preloaded_image(
+                            image_path,
+                            image_data,
+                            on_evict_texture_id=self._queue_texture_delete,
+                        )
+                        if inserted:
                             preloaded += 1
 
                     elapsed_ms = (time.perf_counter() - preload_start) * 1000.0
@@ -1113,10 +1083,29 @@ class ThemeBank:
         Should be called regularly (e.g. every frame).
         """
         self._async_update_count += 1
+
+        # Process any queued GPU texture deletions (budgeted per frame).
+        deletes: list[int] = []
+        with self._pending_texture_deletes_lock:
+            budget = min(self._texture_delete_budget_per_update, len(self._pending_texture_deletes))
+            for _ in range(budget):
+                deletes.append(self._pending_texture_deletes.popleft())
+        if deletes:
+            try:
+                from .texture import delete_texture
+
+                for tex_id in deletes:
+                    try:
+                        delete_texture(tex_id)
+                    except Exception:
+                        pass
+            except Exception:
+                # Defensive: texture module may be unavailable in headless contexts.
+                pass
         
         # Process loaded images for all active caches
         for cache in self._image_caches.values():
-            cache.process_loaded_images()
+            cache.process_loaded_images(max_items=2)
         
         # Keep hot cache full - refill every N frames
         # This ensures images are always ready for fast cycling
