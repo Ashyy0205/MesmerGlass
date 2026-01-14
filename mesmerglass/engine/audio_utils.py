@@ -27,6 +27,10 @@ def _ensure_mixer() -> bool:
         return False
     try:
         if not pygame.mixer.get_init():
+            # Keep mixer config consistent with the main AudioEngine so that
+            # later synthesized buffers (e.g. Shepard tone bed) match channel
+            # depth expectations.
+            pygame.mixer.pre_init(44100, -16, 2, 512)
             pygame.mixer.init()
         return True
     except Exception as exc:  # pragma: no cover - depends on host audio stack

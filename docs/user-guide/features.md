@@ -1,159 +1,38 @@
-# Features Documentation
+# Features
 
-## Interface Components
+MesmerGlass is a **session runner + realtime compositor**. Sessions are saved as `.session.json` and can be run either through the GUI or headlessly via CLI tools.
 
-### Media Controls
+## Visuals (MesmerLoom)
 
-#### Primary Video
-- File selection supports MP4, MOV, AVI formats
-- Opacity range: 0-100%
-- Always-on-top overlay
-- Click-through capability
-- Multi-monitor support
+- GPU-driven spiral rendering with configurable type/speed/opacity
+- Media compositing:
+  - Images (ThemeBank-driven cache + lookahead)
+  - Videos (buffered streaming)
+- Text overlays (synchronized with media cycles or on their own cadence)
 
-#### Secondary Video
-- Optional overlay layer
-- Independent opacity control
-- Blends with primary video
-- Same format support as primary
+## Sessions, cues, and playbacks
 
-### Text Effects
+- **Playbacks**: reusable “render recipes” (spiral + media + text + zoom)
+- **Cuelists**: ordered cues with durations and audio
+- **Session Runner**: start/pause/stop/skip with a live preview
 
-#### Text Properties
-- Custom message input
-- Font selection (TTF/OTF support)
-- Color picker with alpha channel
-- Auto-sizing to screen height
-- Centered positioning
+## Audio
 
-#### Effect Modes
-1. **Breath + Sway**
-   - Smooth opacity pulsing
-   - Gentle horizontal movement
-   - Configurable intensity
+- Multi-track audio roles (e.g. hypno/background)
+- Looping, fades, and streaming fallback for oversized files
 
-2. **Shimmer**
-   - Rapid opacity fluctuation
-   - Sparkle-like effect
-   - Adjustable speed
+## Device synchronization (optional)
 
-3. **Tunnel**
-   - Zoom-based animation
-   - Depth perception effect
-   - Scale control
+- Built-in Bluetooth device control via **MesmerIntiface** (no external server required)
+- Buttplug protocol support for interoperability and testing
 
-4. **Subtle**
-   - Minimal movement
-   - Slight opacity changes
-   - Low-intensity option
+## VR options (optional)
 
-#### Flash Controls
-- Interval timing (ms)
-- Flash width duration
-- Opacity boost during flash
-- Screen blend mode
+- **VR Bridge**: head-locked VR via OpenXR (with mock fallback)
+- **Wireless VR streaming (MesmerVisor)**: LAN discovery + TCP streaming to Android VR clients
 
-### Audio System
+## CLI automation + diagnostics
 
-#### Dual Track Support
-- Primary audio track
-- Secondary audio track
-- Independent volume controls
-- Loop functionality
-- Format support:
-  - MP3 (recommended)
-  - WAV
-  - OGG
-
-### Device Integration
-
-#### Buttplug/Intiface Protocol
-- WebSocket connection
-- Auto-reconnection
-- Safe disconnection
-- Device discovery
-
-#### Control Modes
-
-##### Buzz on Flash
-- Synced with text flashes
-- Intensity control
-- Duration = Flash Width
-- Immediate response
-
-##### Random Bursts
-- Min/Max delay settings
-- Peak intensity control
-- Duration limits
-- Pattern types:
-  - Hit (quick pulse)
-  - Wave (gradual)
-  - Edge (build-up)
-
-### Display Management
-
-#### Multi-Monitor
-- Individual display selection
-- Full-screen overlay
-- Independent instances
-- Synchronized timing
-
-#### Window Properties
-- Always-on-top
-- Click-through
-- Zero-impact mode
-- Clean exit handling
-
-## Advanced Features
-
-### Performance Optimization
-- GPU acceleration
-- Memory management
-- Resource cleanup
-- Efficient rendering
-
-### Safety Features
-- Graceful shutdown
-- Device zeroing on exit
-- Connection resilience
-- Error recovery
-
-## Configuration
-
-### Persistence
-- Settings saved between sessions
-- Display preferences remembered
-- Last used directories
-- Effect parameters
-
-### Customization
-- Custom font support
-- User media folders
-- Device configurations
-- Effect parameters
-
-## Technical Details
-
-### Video Processing
-- OpenCV backend
-- Hardware acceleration
-- Format conversion
-- Frame synchronization
-
-### Audio Engine
-- pygame mixer
-- Dual channel mixing
-- Volume normalization
-- Efficient looping
-
-### Device Protocol
-- Buttplug v3 spec
-- WebSocket transport
-- Command queueing
-- State management
-
-### UI Framework
-- PyQt6 based
-- Native controls
-- Responsive layout
-- Theme support
+- `instructions` runner for deterministic repro scripts
+- `themebank` readiness checks
+- `cuelist` / `mode-verify` / `spiral-measure` tools for headless validation

@@ -656,7 +656,7 @@ class AudioEngine:
         return True
 
     def load_channel_pcm(self, channel: int, pcm_int16_stereo: 'np.ndarray', *, tag: str = "generated") -> bool:
-        """Load an in-memory PCM buffer (int16 stereo) into a channel.
+        """Load an in-memory PCM buffer into a channel.
 
         This supports synthesized/generated layers without going through a file.
 
@@ -680,20 +680,51 @@ class AudioEngine:
             if pcm_int16_stereo.dtype != np.int16:
                 self.logger.error("pcm_int16_stereo must be int16")
                 return False
-            if pcm_int16_stereo.ndim != 2 or pcm_int16_stereo.shape[1] != 2:
-                self.logger.error("pcm_int16_stereo must have shape (n_samples, 2)")
+
+            mixer_init = pygame.mixer.get_init()
+            mixer_rate = int(mixer_init[0]) if mixer_init else 44100
+            mixer_channels = int(mixer_init[2]) if mixer_init else 2
+
+            pcm_for_mixer = pcm_int16_stereo
+            # Accept either mono (n,) or stereo (n,2); coerce to match mixer.
+            if pcm_for_mixer.ndim == 1:
+                if mixer_channels == 1:
+                    pass
+                elif mixer_channels == 2:
+                    pcm_for_mixer = np.stack([pcm_for_mixer, pcm_for_mixer], axis=1)
+                else:
+                    pcm_for_mixer = np.repeat(pcm_for_mixer[:, None], mixer_channels, axis=1)
+            elif pcm_for_mixer.ndim == 2:
+                if pcm_for_mixer.shape[1] == mixer_channels:
+                    pass
+                elif pcm_for_mixer.shape[1] == 2 and mixer_channels == 1:
+                    # Downmix stereo -> mono. Keep int16 range.
+                    pcm_for_mixer = (pcm_for_mixer.astype(np.int32).mean(axis=1)).astype(np.int16)
+                elif pcm_for_mixer.shape[1] == 1 and mixer_channels == 2:
+                    pcm_for_mixer = np.repeat(pcm_for_mixer, 2, axis=1)
+                elif pcm_for_mixer.shape[1] == 2 and mixer_channels > 2:
+                    pcm_for_mixer = np.repeat(pcm_for_mixer[:, :1], mixer_channels, axis=1)
+                else:
+                    self.logger.error(
+                        "pcm buffer channels (%s) do not match mixer channels (%s)",
+                        pcm_for_mixer.shape[1],
+                        mixer_channels,
+                    )
+                    return False
+            else:
+                self.logger.error("pcm buffer must be 1D (mono) or 2D (multi-channel)")
                 return False
 
             # Stop any existing playback on this channel
             self.stop_channel(channel)
 
-            sound = pygame.sndarray.make_sound(pcm_int16_stereo)
+            sound = pygame.sndarray.make_sound(pcm_for_mixer)
             self._sounds[channel] = sound
             self._paths[channel] = str(tag)
 
-            # Mixer is initialized at 44100Hz; estimate length from sample count.
+            # Estimate length from mixer sample rate.
             try:
-                length = float(pcm_int16_stereo.shape[0]) / 44100.0
+                length = float(pcm_for_mixer.shape[0]) / float(mixer_rate or 44100)
             except Exception:
                 length = 0.0
             self._lengths[channel] = length

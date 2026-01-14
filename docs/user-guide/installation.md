@@ -1,152 +1,78 @@
 # Installation Guide
 
+MesmerGlass is primarily a **Python desktop app** (PyQt6 + OpenGL). Most users only need Python, a working GPU driver, and optional media folders.
+
 ## Prerequisites
 
-### Python Requirements
-- Python 3.12 (64-bit) from [python.org](https://www.python.org/downloads/)
-- Virtual environment setup
-- pip and wheel packages
+### System requirements (recommended)
 
-### System Requirements
-- Windows 10/11
-- 4GB RAM minimum (8GB recommended)
-- OpenGL 2.0+ capable GPU
-- DirectX 11+ for multi-monitor support
+- Windows 10/11 (other OSes may work, but Windows is the main target)
+- Python 3.12 (64-bit)
+- A GPU/driver that supports OpenGL (for the compositor)
 
-## Step-by-Step Installation
+### Optional hardware
 
-### 1. Python Installation
-1. Download Python 3.12 (64-bit) from [python.org](https://www.python.org/downloads/)
-2. Run installer
-   - ✅ Check "Add python.exe to PATH"
-   - ✅ Check "Create shortcuts for installed applications"
-   - ✅ Check "Add Python to environment variables"
+- Bluetooth LE adapter (only if you want device synchronization)
+- VR headset(s) (only if you want VR Bridge or wireless streaming)
 
-### 2. Virtual Environment Setup
+## Install (Windows)
+
+From the repo root:
+
 ```powershell
-# Create project directory
-mkdir MesmerGlass
-cd MesmerGlass
-
-# Create virtual environment
 py -3.12 -m venv .venv
-
-# Activate virtual environment
 .\.venv\Scripts\Activate.ps1
-
-# Upgrade pip and wheel
-python -m pip install --upgrade pip wheel
-```
-
-### 3. Dependencies Installation
-
-#### Method 1: Using requirements.txt
-```powershell
+python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-#### Method 2: Manual Installation
+## Launch
+
 ```powershell
-pip install pyqt6
-pip install opencv-python
-pip install av
-pip install pygame
-pip install websockets
-pip install numpy
-```
+python -m mesmerglass run
 
-### 4. Device Integration (Optional)
-
-#### Intiface Setup
-1. Download Intiface Central from [intiface.com](https://intiface.com/central/)
-2. Install and run Intiface Central
-3. Configure server:
-   - Default endpoint: `ws://127.0.0.1:12345`
-   - Click "Start Server"
-4. Device pairing:
-   - Open Device Manager
-   - Click "Start Scanning"
-   - Follow device-specific pairing instructions
-   - Verify device shows as "Connected"
-
-### 5. Media Setup
-1. Create directories:
-   ```
-   MesmerGlass/
-   ├── media/
-   │   ├── video/
-   │   ├── audio/
-   │   └── fonts/
-   ```
-2. Add your media files:
-   - Videos: MP4, MOV, AVI formats supported
-   - Audio: MP3, WAV, OGG formats supported
-   - Fonts: TTF, OTF formats supported
-
-## Troubleshooting Common Installation Issues
-
-### Python PATH Issues
-```powershell
-# Check Python installation
-py --version
-
-# Check pip installation
-py -3.12 -m pip --version
-
-# Repair PATH if needed
-py -3.12 -m ensurepip
-```
-
-### Virtual Environment Problems
-```powershell
-# Deactivate if active
-deactivate
-
-# Remove and recreate
-Remove-Item -Recurse -Force .venv
-py -3.12 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-```
-
-### Dependency Installation Failures
-```powershell
-# Clear pip cache
-pip cache purge
-
-# Force reinstall dependencies
-pip install --force-reinstall -r requirements.txt
-```
-
-## Post-Installation Verification
-
-### Test Environment
-```powershell
-# Activate environment
-.\.venv\Scripts\Activate.ps1
-
-# Run application
+# Legacy entry point (still supported)
 python run.py
-
-# Run tests
-python -m pytest
 ```
 
-### Verify Features
-1. Launch application
-2. Test video playback
-3. Test audio playback
-4. Test device connection (if applicable)
-5. Test multi-monitor support
+## Device control (optional)
 
-## Updating
+MesmerGlass ships with **MesmerIntiface** (a built-in Bluetooth device server). In the GUI it is started automatically on `ws://127.0.0.1:12350`.
 
-### Update Dependencies
+- You do **not** need Intiface Central for the default workflow.
+- If you already use an external Buttplug server (e.g. Intiface Central), MesmerGlass can still interoperate via the Buttplug protocol.
+
+## Media setup (images/videos/fonts)
+
+MesmerGlass loads media via a per-session **Media Bank**.
+
+1. Launch the app
+2. **File → New Session** (or open an existing session)
+3. Go to **Home → Media Bank**
+4. **Add Directory** and classify it as `images`, `videos`, `both`, or `fonts`
+
+These folders are saved into your `.session.json` file.
+
+## Verify your install
+
 ```powershell
-pip install --upgrade -r requirements.txt
+# Quick CLI smoke test (no UI)
+python -m mesmerglass selftest
+
+# Optional: run tests
+python -m mesmerglass test-run fast
 ```
 
-### Update Application
-```powershell
-git pull
-pip install -r requirements.txt
-```
+## Common install issues
+
+### “Nothing renders” / black preview
+
+- Update GPU drivers
+- Ensure OpenGL is available on the machine (RDP/VMs can break this)
+- Try running without VR flags first (`python -m mesmerglass run`)
+
+### Bluetooth device not found
+
+- Confirm the device supports BLE and is in pairing mode
+- On Windows: ensure Bluetooth is enabled and the adapter is present
+- Try the Device tab scan again after toggling Bluetooth

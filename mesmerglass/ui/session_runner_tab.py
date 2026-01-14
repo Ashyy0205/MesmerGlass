@@ -17,7 +17,7 @@ from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, 
     QListWidget, QListWidgetItem, QFileDialog, QGroupBox,
-    QProgressBar, QFrame, QMessageBox, QDialog
+    QProgressBar, QFrame, QMessageBox, QDialog, QSlider
 )
 
 from mesmerglass.session.audio_prefetch import (
@@ -59,6 +59,9 @@ class SessionRunnerTab(QWidget):
         
         # Session data for session mode (when working within a .session.json)
         self.session_data = None
+
+        # Live audio control UI state
+        self._last_cue_idx_for_shepard_ui: Optional[int] = None
         
         # UI update timer (16ms = 60 Hz, matches compositor frame rate)
         self.update_timer = QTimer()
@@ -228,10 +231,41 @@ class SessionRunnerTab(QWidget):
         self.btn_skip_next.setEnabled(False)
         layout.addWidget(self.btn_skip_next)
         
+        layout.addSpacing(20)
+
+        # Live Shepard bed volume (when active)
+        self.shepard_vol_title = QLabel("Shepard:")
+        self.shepard_vol_title.setToolTip("Adjust the synthesized Shepard tone bed volume while the session is running")
+        layout.addWidget(self.shepard_vol_title)
+
+        self.shepard_vol_value = QLabel("--%")
+        self.shepard_vol_value.setMinimumWidth(42)
+        layout.addWidget(self.shepard_vol_value)
+
+        self.shepard_vol_slider = QSlider(Qt.Orientation.Horizontal)
+        self.shepard_vol_slider.setRange(0, 100)
+        self.shepard_vol_slider.setValue(15)
+        self.shepard_vol_slider.setMinimumWidth(140)
+        self.shepard_vol_slider.valueChanged.connect(self._on_shepard_volume_changed)
+        self.shepard_vol_slider.setEnabled(False)
+        layout.addWidget(self.shepard_vol_slider)
+
         layout.addStretch()
         
         group.setLayout(layout)
         return group
+
+    def _on_shepard_volume_changed(self, value: int) -> None:
+        """Live-update Shepard tone bed volume if it is currently active."""
+        self.shepard_vol_value.setText(f"{int(value)}%")
+        if not self.session_runner:
+            return
+        try:
+            from mesmerglass.session.cue import AudioRole
+
+            self.session_runner.set_audio_role_volume(AudioRole.SHEPARD, float(value) / 100.0)
+        except Exception as exc:
+            self.logger.debug("Failed to apply shepard volume: %s", exc)
     
     def _create_cuelist_section(self) -> QGroupBox:
         """Create the cue list display section."""
@@ -772,6 +806,28 @@ class SessionRunnerTab(QWidget):
         # - transition detection → cue changes
         if self.session_runner.is_running():
             self.session_runner.update(dt=0.01667)  # 16.67ms timer interval (60 Hz)
+
+        # Keep Shepard slider state in sync even when paused.
+        try:
+            current_cue_idx = self.session_runner.get_current_cue_index()
+        except Exception:
+            current_cue_idx = -1
+
+        if current_cue_idx != self._last_cue_idx_for_shepard_ui:
+            self._last_cue_idx_for_shepard_ui = current_cue_idx
+            cue_obj = None
+            if 0 <= current_cue_idx < len(self.cuelist.cues):
+                cue_obj = self.cuelist.cues[current_cue_idx]
+
+            enabled = bool(getattr(cue_obj, "shepard_enabled", False)) if cue_obj else False
+            vol = float(getattr(cue_obj, "shepard_volume", 0.15)) if cue_obj else 0.15
+            vol = max(0.0, min(1.0, vol))
+
+            self.shepard_vol_slider.blockSignals(True)
+            self.shepard_vol_slider.setEnabled(enabled)
+            self.shepard_vol_slider.setValue(int(round(vol * 100)))
+            self.shepard_vol_slider.blockSignals(False)
+            self.shepard_vol_value.setText(f"{int(round(vol * 100))}%" if enabled else "--%")
         
         # Only update UI if running
         if not self.session_runner.is_running():

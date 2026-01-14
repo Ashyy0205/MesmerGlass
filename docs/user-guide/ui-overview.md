@@ -1,158 +1,63 @@
 # MesmerGlass UI Overview
 
-## Current Tab Structure (Post-Visual Programs Integration)
+MesmerGlass is a **session-based** desktop overlay app. The main window uses **vertical tabs** and a standard **File menu** for creating/opening/saving `.session.json` files.
 
-### 🎬 **Visual Programs** (PRIMARY TAB - Use This!)
-**What it does**: Full Trance recreation with automatic media/text/spiral coordination
+## Main tabs
 
-**Use this for**:
-- Running complete visual programs (7 types)
-- Automatic image slideshow with spiral overlay
-- Text cycling with multiple layers
-- Video playback with spiral effects
-- Accelerating zoom effects
-- Flash synchronization
+### 🖥️ Display
+Choose where MesmerGlass renders:
 
-**How to use**:
-1. Select visual program from dropdown
-2. Click **Start** to begin
-3. Use **Pause/Resume** to control playback
-4. Watch progress bar and frame counter
+- Monitors (one or more)
+- Wireless VR clients (auto-discovered on your LAN via UDP/5556)
 
-**Status**: ✅ **FULLY FUNCTIONAL** (use this instead of Media/Text tabs)
+If nothing appears when you start a session, this is the first tab to check.
 
----
+### 🏠 Home (Session Runner)
+“Mission control” for actually running your content:
 
-### 🌀 **MesmerLoom** (SPIRAL CONTROLS)
-**What it does**: Controls the spiral overlay parameters
+- Session info (name, cue counts)
+- SessionRunner controls (start/pause/stop/skip)
+- Live preview (mirrors the compositor output)
+- **Media Bank**: add folders containing images/videos/fonts for this session
 
-**Use this for**:
-- Enabling/disabling spiral overlay
-- Adjusting spiral speed, zoom, rotation
-- Changing spiral type (7 variants)
-- Setting spiral opacity
+### 📝 Cuelists
+Browse and edit cue sequences inside the loaded session.
 
-**How to use**:
-1. Check "Enable Spiral" checkbox
-2. Adjust sliders for speed/zoom/rotation
-3. Select spiral type from dropdown
-4. Spiral appears when you click "Launch"
+Use this tab to:
+- Add/edit cues
+- Set cue durations
+- Configure per-cue audio tracks (hypno/background roles)
 
-**Status**: ✅ **FUNCTIONAL** (core spiral system)
+### 🎨 Playbacks
+Browse and edit “playback definitions” inside the loaded session.
 
----
+Playbacks define what gets rendered while cues run:
+- Spiral parameters
+- Media mode (images/videos/both)
+- Text mode and cadence
+- Zoom/acceleration parameters
 
-### 🎵 **Audio** (BACKGROUND MUSIC)
-**What it does**: Plays background music/ambience
+### 🔗 Device
+Optional Bluetooth device control via **MesmerIntiface** (built-in). This tab is for scanning/connecting devices and checking status.
 
-**Use this for**:
-- Loading primary background track
-- Loading secondary overlay loop
-- Adjusting volume levels
+### 📊 Performance
+Frame timing / throughput views intended for debugging smoothness and VR streaming stability.
 
-**Status**: ✅ **FUNCTIONAL** (independent audio system)
+### 🛠️ DevTools
+Placeholder in the current build.
 
----
+## File menu
 
-### 🔗 **Device Sync** (BUTTPLUG.IO)
-**What it does**: Synchronizes haptic devices with visual effects
+- **File → New Session**: start fresh
+- **File → Open Session…**: load an existing `.session.json`
+- **File → Save / Save As…**: persist edits
+- **File → Import/Export Cuelist…**: move cuelists between sessions
 
-**Use this for**:
-- Scanning for Bluetooth devices
-- Connecting vibrators/toys
-- Syncing vibration to flash events
-- Configuring burst patterns
+## Keyboard shortcuts
 
-**Status**: ✅ **FUNCTIONAL** (requires Bluetooth device)
+Global playback controls:
 
----
-
-### 🖥️ **Displays** (MULTI-MONITOR)
-**What it does**: Select which monitors show the overlay
-
-**Use this for**:
-- Choosing primary/secondary displays
-- Multi-monitor setups
-
-**Status**: ✅ **FUNCTIONAL**
-
----
-
-### 📹 **Media** (LEGACY - DEPRECATED)
-**What it does**: Old video overlay system
-
-**Status**: ⚠️ **REPLACED BY VISUAL PROGRAMS**
-- Still functional but superseded
-- Use Visual Programs → Animation instead
-- Will be removed in future update
-
----
-
-### 📝 **Text & FX** (LEGACY - DEPRECATED)  
-**What it does**: Old text overlay system
-
-**Status**: ⚠️ **REPLACED BY VISUAL PROGRAMS**
-- Still functional but superseded  
-- Use Visual Programs → Text Cycling instead
-- Will be removed in future update
-
----
-
-## Quick Start Guide
-
-### For First-Time Users:
-
-1. **Click "MesmerLoom" tab**
-   - Check "Enable Spiral"
-   - Leave defaults
-
-2. **Click "Visual Programs" tab**
-   - Select "Simple Slideshow" from dropdown
-   - Click **Start**
-
-3. **Click "Launch" button** (bottom of window)
-   - Overlay window appears with spiral + images
-   - Visual program runs automatically
-
-4. **Click "Stop" button** to end session
-
-### For Advanced Users:
-
-1. **Load media themes** (requires theme configuration)
-2. **Select complex visual programs** (Text Cycling, Accelerating Zoom)
-3. **Enable Device Sync** for haptic feedback
-4. **Add background audio** for full experience
-
----
-
-## Troubleshooting
-
-### "Visual Programs doesn't work"
-**Cause**: ThemeBank not initialized with media
-**Fix**: Load at least one theme with images/text/videos
-
-### "Media/Text tabs confusing"
-**Solution**: Ignore them! Use **Visual Programs** tab instead
-- Media tab = old system
-- Text tab = old system  
-- Visual Programs = new integrated system
-
-### "Nothing appears when I click Launch"
-**Checklist**:
-1. MesmerLoom → Enable Spiral ✓
-2. Visual Programs → Start clicked ✓
-3. Displays → At least one selected ✓
-4. Launch button clicked ✓
-
----
-
-## Future Plans
-
-- Remove Media tab (replaced by Visual Programs)
-- Remove Text & FX tab (replaced by Visual Programs)
-- Consolidate to 5 tabs:
-  1. **Visual Programs** (main)
-  2. **MesmerLoom** (spiral)
-  3. **Audio** (music)
-  4. **Device Sync** (haptics)
-  5. **Displays** (monitors)
+- `Ctrl+Space`: play/resume
+- `Ctrl+Shift+Space`: pause
+- `Ctrl+Alt+Space`: stop
+- `Ctrl+1`: exit

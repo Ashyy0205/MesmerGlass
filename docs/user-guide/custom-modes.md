@@ -1,79 +1,37 @@
-# Custom Visual Modes
+# Custom “Modes” (Playbacks)
 
-Custom visual modes are **user-created configurations** that define complete visual experiences in MesmerGlass. They are created using the **Visual Mode Creator** tool and can be loaded in the main launcher.
+MesmerGlass no longer uses the old “Visual Mode Creator / Visual Programs” workflow. The equivalent concept in the current UI is a **Playback**.
 
-## Overview
+## What is a Playback?
 
-Custom modes will **replace hardcoded Visual Programs** as the primary way to configure visuals. They provide:
+A playback is a reusable “render recipe” stored inside a session:
 
-- ✅ **Full control** over spiral, media, text, and zoom settings
-- ✅ **Portability** - JSON files can be shared and imported
-- ✅ **Real-time preview** while creating
-- ✅ **1:1 compatibility** - what you see in creator is what runs in launcher
+- Spiral parameters (type/speed/opacity/colors)
+- Media behavior (images/videos/both, cycle speed)
+- Text behavior (mode, sync cadence, opacity/color)
+- Zoom / acceleration parameters
 
-## Creating Custom Modes
+Playbacks live under `session_data["playbacks"]` inside a `.session.json` file.
 
-### 1. Launch Visual Mode Creator
+## Creating a playback
 
-```powershell
-./.venv/bin/python scripts/visual_mode_creator.py
-```
+1. Create or open a session (**File → New Session** / **Open Session…**)
+2. Go to the **Playbacks** tab
+3. Click **New Playback**
+4. Configure the settings, then save
 
-### 2. Configure Settings
+## Using a playback
 
-The Visual Mode Creator provides real-time preview with these controls:
+Playbacks are typically referenced by cues/cuelists. A common workflow is:
 
-**Spiral Settings:**
-- Type: Logarithmic, Quadratic, Linear, Square Root, Inverse, Power, Sawtooth
-- Rotation Speed: -40.0x to +40.0x (negative = reverse)
-- Opacity: 0.0 to 1.0
-- Reverse checkbox for quick direction flip
-- **Note**: Arm/gap colors are NOT saved - they remain global launcher settings
+1. Create a playback
+2. Create a cuelist and add a cue with a duration
+3. Choose which playback is active for that cue
+4. Run via **Home → Session Runner**
 
-**Media Settings:**
-- Mode: Images & Videos, Images Only, Videos Only
-- Cycling Speed: 1-100 (exponential curve: 10s at speed 1, 0.05s at speed 100)
-- Opacity: 0.0 to 1.0
+## File format note
 
-**Text Settings:**
-- Enabled/Disabled
-- Mode: CENTERED_SYNC (changes with media), SUBTEXT (scrolling carousel)
-- Opacity: 0.0 to 1.0
-- Sync Toggle: When enabled, text follows the media cycle; when disabled you can set a manual cadence
-- Manual Text Speed: 1-100 slider that uses the same curve as media speed so matching values keep them aligned
-
-**Zoom Settings:**
-- Mode: No Zoom, Zoom In, Zoom Out, Zoom Pulse
-- Rate: 0.0 to 2.0
-
-### 3. Export Mode
-
-Click **"📦 Export Mode (JSON)"** button:
-- Opens file dialog
-- Defaults to `mesmerglass/modes/` directory
-- Saves as `.json` file
-- Includes all settings except spiral colors
-
-## Loading Custom Modes
-
-### In Launcher
-
-1. Launch MesmerGlass: `./.venv/bin/python run.py`
-2. Go to **🎬 Visual Programs** tab
-3. Scroll to **📦 Custom Modes** section
-4. Click **"📂 Load Custom Mode..."**
-5. Browse to your `.json` mode file
-6. Mode loads and starts immediately
-
-### Mode File Location
-
-**Default directory**: `mesmerglass/modes/`
-
-You can also load from anywhere on your filesystem.
-
-## Mode File Format
-
-Custom modes are JSON files with this structure:
+Sessions are plain JSON. If you want to version-control your configurations, check `.session.json` files into git and edit them via the UI.
 
 ```json
 {

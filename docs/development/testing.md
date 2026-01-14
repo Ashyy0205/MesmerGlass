@@ -6,32 +6,32 @@ This guide covers testing procedures for MesmerGlass components and features. Th
 ## Quick Start
 
 ### Using the Test Runner
-The recommended way to run tests is using the provided test runner script:
+The recommended way to run tests is via the MesmerGlass CLI wrapper:
 
 ```powershell
 # Run all tests
-python run_tests.py all
+python -m mesmerglass test-run all
 
 # Run only fast tests (excludes slow/integration tests)
-python run_tests.py fast
+python -m mesmerglass test-run fast
 
 # Run only unit tests (excludes integration and bluetooth tests)
-python run_tests.py unit
+python -m mesmerglass test-run unit
 
 # Run integration tests
-python run_tests.py integration
+python -m mesmerglass test-run integration
 
 # Run bluetooth-specific tests
-python run_tests.py bluetooth
+python -m mesmerglass test-run bluetooth
 
 # Run slow tests only
-python run_tests.py slow
+python -m mesmerglass test-run slow
 
 # Run with verbose output
-python run_tests.py all --verbose
+python -m mesmerglass test-run all -v
 
 # Run with coverage report
-python run_tests.py all --coverage
+python -m mesmerglass test-run -c
 ```
 
 ### Direct pytest Usage
@@ -138,12 +138,10 @@ The test suite is organized into several categories with specific markers:
 ## Test Infrastructure
 
 ### Test Runner Features
-The `run_tests.py` script provides:
+The `python -m mesmerglass test-run` wrapper provides:
 - **Categorized Execution**: Run specific types of tests based on markers
-- **Virtual Environment Detection**: Automatically uses .venv Python if available
-- **Verbose Output**: Optional detailed test output
-- **Coverage Reports**: Optional code coverage analysis
-- **Timeout Management**: Built-in test timeouts to prevent hanging
+- **Verbose Output**: `-v`
+- **Coverage**: `-c`
 
 ### Custom Markers
 Defined in `pytest.ini`:
