@@ -428,7 +428,7 @@ class TestProtocolPackets:
         # Verify values
         # packet_size field contains size AFTER the size field (total - 4)
         assert packet_size == len(packet) - 4
-        assert magic in ["VRH2", "VRHP"]
+        assert magic == "VRHP"
         assert frame_id_parsed == frame_id
         assert left_size == len(left_data)
         assert right_size == len(right_data)
@@ -450,12 +450,12 @@ class TestProtocolPackets:
     
     @pytest.mark.skipif(not has_nvenc_support(), reason="NVENC not available")
     def test_create_packet_nvenc_magic(self):
-        """Test NVENC packets use VRH2 magic bytes."""
+        """Test NVENC packets use VRH3 magic bytes by default."""
         server = VRStreamingServer(encoder_type=EncoderType.NVENC)
         packet = server.create_packet(b"L", b"R", 0)
         
         magic = packet[4:8].decode('ascii')
-        assert magic == "VRH2"
+        assert magic == "VRH3"
 
 
 # ============================================================================
@@ -495,16 +495,16 @@ class TestServerInitialization:
         assert server.fps == 60
     
     def test_server_encoder_initialization(self):
-        """Test that server initializes encoder correctly."""
+        """Test that server selects encoder type without allocating it until clients connect."""
         server = VRStreamingServer(
             encoder_type=EncoderType.JPEG,
             width=640,
             height=480
         )
-        
-        # Encoder should be created during init
-        assert server.encoder is not None
-        assert server.encoder.get_encoder_type() == EncoderType.JPEG
+
+        # Encoders are created per-client inside handle_client (avoids reserving NVENC early)
+        assert server.encoder is None
+        assert server.encoder_type == EncoderType.JPEG
 
 
 # ============================================================================

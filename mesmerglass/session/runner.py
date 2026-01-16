@@ -787,8 +787,6 @@ class SessionRunner:
                 try:
                     from ..mesmervisor.streaming_server import VRStreamingServer
                     from ..mesmervisor.gpu_utils import EncoderType
-                    import OpenGL.GL as GL
-                    import numpy as np
                     import threading
                     
                     # Use primary compositor for VR streaming
@@ -825,41 +823,31 @@ class SessionRunner:
                     # Start streaming server (TCP 5555)
                     self.vr_streaming_server.start_server()
                     self.logger.info("[session] VR streaming server started on TCP port 5555")
-                    
-                    # Connect compositor's frame_ready signal to cache frames
-                    if hasattr(streaming_compositor, 'frame_ready'):
-                        if self._vr_frame_handler is None:
-                            def on_frame_ready(frame):
-                                """Cache frame from compositor (called from Qt main thread with GL context active)"""
-                                if self._vr_streaming_active and frame is not None and frame.size > 0:
-                                    try:
-                                        with self._vr_frame_lock:
-                                            self._vr_last_frame = frame.copy()
-                                    except Exception as e:  # pragma: no cover - defensive
-                                        self.logger.error(f"[session] VR frame cache error: {e}")
 
-                            self._vr_frame_handler = on_frame_ready
-
-                        if hasattr(streaming_compositor, 'set_vr_capture_enabled'):
+                    # Enable compositor-side capture; it will call us back from the Qt/GL thread.
+                    try:
+                        def on_vr_frame(frame):
+                            if not self._vr_streaming_active or frame is None:
+                                return
                             try:
-                                streaming_compositor.set_vr_capture_enabled(True, max_fps=30)
-                            except Exception:
-                                pass
-                        else:
-                            streaming_compositor._vr_capture_enabled = True
+                                with self._vr_frame_lock:
+                                    self._vr_last_frame = frame.copy()
+                            except Exception as e:  # pragma: no cover - defensive
+                                self.logger.error(f"[session] VR frame cache error: {e}")
+
+                        streaming_compositor.enable_vr_streaming(on_vr_frame)
+                        self.logger.info("[session] VR streaming enabled on LoomCompositor")
+                        self.logger.info(f"[session] VR streaming: compositor size={streaming_compositor.width()}x{streaming_compositor.height()}")
+                    except Exception as e:
+                        self.logger.warning(f"[session] Failed to enable compositor VR capture: {e}")
+
+                    # If VR-only mode (no monitors selected), minimize the compositor window
+                    if not monitor_displays:
                         try:
-                            streaming_compositor.frame_ready.connect(self._vr_frame_handler)
+                            streaming_compositor.showMinimized()
                         except Exception:
                             pass
-                        self.logger.info("[session] VR streaming connected to compositor frame_ready signal")
-                        self.logger.info(f"[session] VR streaming: compositor size={streaming_compositor.width()}x{streaming_compositor.height()}")
-                        
-                        # If VR-only mode (no monitors selected), minimize the compositor window
-                        if not monitor_displays:
-                            streaming_compositor.showMinimized()
-                            self.logger.info("[session] VR-only mode: minimized compositor window")
-                    else:
-                        self.logger.warning("[session] Compositor missing frame_ready signal for VR streaming")
+                        self.logger.info("[session] VR-only mode: minimized compositor window")
                         
                 except Exception as e:
                     self.logger.error(f"[session] Failed to start VR streaming: {e}")
@@ -951,19 +939,11 @@ class SessionRunner:
                 self._vr_streaming_active = False
                 with self._vr_frame_lock:
                     self._vr_last_frame = None
-                if self.compositor and hasattr(self.compositor, 'frame_ready') and self._vr_frame_handler:
+                if self.compositor and hasattr(self.compositor, 'disable_vr_streaming'):
                     try:
-                        self.compositor.frame_ready.disconnect(self._vr_frame_handler)
+                        self.compositor.disable_vr_streaming()
                     except Exception:
                         pass
-                    self._vr_frame_handler = None
-                if self.compositor and hasattr(self.compositor, 'set_vr_capture_enabled'):
-                    try:
-                        self.compositor.set_vr_capture_enabled(False)
-                    except Exception:
-                        pass
-                elif self.compositor and hasattr(self.compositor, '_vr_capture_enabled'):
-                    self.compositor._vr_capture_enabled = False
                 self.vr_streaming_server.stop_server()
                 self.vr_streaming_server = None
                 self.logger.info("[session] VR streaming server stopped")

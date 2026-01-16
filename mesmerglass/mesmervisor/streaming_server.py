@@ -227,8 +227,8 @@ class VRStreamingServer:
         
         Args:
             host: Server host address
-            port: TCP streaming port (8765 for Android client)
-            discovery_port: UDP discovery port (8766 for Android client)
+            port: TCP streaming port (default 5555)
+            discovery_port: UDP discovery port (default 5556)
             encoder_type: Encoder to use (AUTO, NVENC, or JPEG)
             width: Frame width
             height: Frame height

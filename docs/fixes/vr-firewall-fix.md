@@ -1,15 +1,18 @@
 # VR Connection Troubleshooting - Firewall Fix
 
+> Note: This document previously referenced legacy ports/protocol (TCP 8765 / UDP 8766).
+> Current MesmerVisor discovery/streaming uses **UDP 5556** and **TCP 5555**.
+
 ## Problem
 **VR client shows blue screen (waiting for connection)**  
 **Server never receives UDP discovery packets from VR headset**
 
 ## Root Cause
-Windows Firewall is blocking incoming UDP packets on port 8766 (discovery) and possibly TCP on port 8765 (streaming).
+Windows Firewall is blocking incoming UDP packets on port 5556 (discovery) and possibly TCP on port 5555 (streaming).
 
 ## Evidence
-- ✅ VR client broadcasting discovery every 3 seconds: `MESMERGLASS_VR_CLIENT:Pacific:8765`
-- ✅ Server listening on port 8766 (UDP) and 8765 (TCP)
+- ✅ VR client broadcasting discovery every few seconds: `VR_HEADSET_HELLO:<device_name>`
+- ✅ Server listening on port 5556 (UDP) and 5555 (TCP)
 - ✅ Both devices on same network (192.168.1.x)
 - ❌ Server logs show **NO** discovery packets received
 - ❌ VR headset shows blue screen (waiting)
@@ -23,12 +26,12 @@ Windows Firewall is blocking incoming UDP packets on port 8766 (discovery) and p
 3. Run these commands:
    ```powershell
    cd C:\Users\Ash\Desktop\MesmerGlass
-   .\add_firewall_rules.ps1
+   .\scripts\add_firewall_rules.ps1
    ```
 
 This will create two firewall rules:
-- **UDP port 8766**: Allow VR discovery packets (inbound)
-- **TCP port 8765**: Allow VR streaming connections (inbound)
+- **UDP port 5556**: Allow VR discovery packets (inbound)
+- **TCP port 5555**: Allow VR streaming connections (inbound)
 
 ### Step 2: Test VR Connection
 
@@ -51,7 +54,7 @@ adb shell am start -n com.hypnotic.vrreceiver/.MainActivity
 
 **Server logs should show:**
 ```
-[INFO] 🔍 Discovery service started on port 8766
+[INFO] 🔍 Discovery service started on port 5556
 [INFO] 📡 Listening for VR headsets...
 [INFO] 🎮 VR STREAMING SERVER STARTED
 [INFO] 🎯 Discovered VR headset: 192.168.1.223 (Pacific)
@@ -65,7 +68,7 @@ adb shell am start -n com.hypnotic.vrreceiver/.MainActivity
 **VR client logs should show:**
 ```
 Found MesmerGlass server at [SERVER_IP]
-Connected to TCP stream on port 8765
+Connected to TCP stream on port 5555
 ```
 
 ## Verification Commands
@@ -78,8 +81,8 @@ Get-NetFirewallRule -DisplayName "MesmerGlass*" | Select-Object DisplayName, Ena
 ### Check if server is listening on ports:
 ```powershell
 # While vr-test is running, check in another terminal:
-Get-NetUDPEndpoint | Where-Object {$_.LocalPort -eq 8766}
-Get-NetTCPConnection | Where-Object {$_.LocalPort -eq 8765 -and $_.State -eq "Listen"}
+Get-NetUDPEndpoint | Where-Object {$_.LocalPort -eq 5556}
+Get-NetTCPConnection | Where-Object {$_.LocalPort -eq 5555 -and $_.State -eq "Listen"}
 ```
 
 ### Check VR client logs:
@@ -96,16 +99,16 @@ If the script doesn't work, add rules manually:
 1. Press `Win + R`, type `wf.msc`, press Enter
 2. Click **"Inbound Rules"** → **"New Rule..."**
 3. Rule Type: **Port** → Next
-4. Protocol: **UDP**, Specific local ports: **8766** → Next
+4. Protocol: **UDP**, Specific local ports: **5556** → Next
 5. Action: **Allow the connection** → Next
 6. Profile: Check **All** (Domain, Private, Public) → Next
-7. Name: `MesmerGlass VR Discovery (UDP 8766)` → Finish
-8. **Repeat for TCP 8765** (MesmerGlass VR Streaming)
+7. Name: `MesmerGlass VR Discovery (UDP 5556)` → Finish
+8. **Repeat for TCP 5555** (MesmerGlass VR Streaming)
 
 ## Still Not Working?
 
 ### Check network interface binding:
-Server binds to `0.0.0.0:8766` which should listen on all interfaces. Verify with:
+Server binds to `0.0.0.0:5556` which should listen on all interfaces. Verify with:
 ```powershell
 Get-NetIPAddress -AddressFamily IPv4 | Where-Object {$_.InterfaceAlias -notlike "*Loopback*"}
 ```
@@ -119,7 +122,7 @@ From VR headset (via adb shell):
 adb shell ping -c 3 192.168.1.154
 
 # Test if UDP port is open (requires nc/netcat on Android)
-adb shell echo "test" | nc -u 192.168.1.154 8766
+adb shell echo "test" | nc -u 192.168.1.154 5556
 ```
 
 ### Disable Windows Firewall temporarily (TEST ONLY):
@@ -146,16 +149,16 @@ Once you see the checkerboard pattern in VR:
 ## Technical Details
 
 **Discovery Protocol:**
-- VR client broadcasts UDP packet to `255.255.255.255:8766` (broadcast address)
-- Message format: `MESMERGLASS_VR_CLIENT:<device_name>:<tcp_port>`
-- Server receives packet, extracts client IP and port
-- Server initiates TCP connection to client
+- VR client broadcasts UDP packet to `255.255.255.255:5556` (broadcast address)
+- Message format: `VR_HEADSET_HELLO:<device_name>` (optionally `VR_HEADSET_HELLO:<device_name>:<type>`)
+- Server receives packet and replies `VR_SERVER_INFO:<tcp_port>`
+- VR client initiates TCP connection to the server on port `5555`
 
 **Why Firewall Blocks It:**
 - Windows Firewall blocks **all unsolicited incoming connections** by default
 - UDP broadcast from unknown IP (192.168.1.223) → **BLOCKED**
 - Python.exe not in firewall exceptions → **BLOCKED**
-- Need explicit inbound rule for UDP 8766 → **MUST ADD**
+- Need explicit inbound rule for UDP 5556 (discovery) and TCP 5555 (streaming) → **MUST ADD**
 
 **Why This Worked on Other Systems:**
 - Some systems have "Public network" firewall disabled

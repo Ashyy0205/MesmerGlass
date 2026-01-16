@@ -394,7 +394,7 @@ Before distributing APK:
 **Runtime Issues**:
 - Check network connectivity (PC and VR on same network)
 - Verify MesmerVisor server running: `python -m mesmerglass vr-stream`
-- Check firewall settings (allow TCP 8765, UDP 8766)
+- Check firewall settings (allow TCP 5555, UDP 5556)
 
 ---
 

@@ -1776,7 +1776,7 @@ class MainActivity : Activity(), GLSurfaceView.Renderer {
             // Best-effort per-frame codec/decode time sample for H.264.
             // Record only on the left eye to avoid double-counting stereo frames.
             if (!isRight) {
-                val dtMs = (System.nanoTime() - t0) / 1_000_000.0
+                val dtMs = (System.nanoTime() - t0) / 1_000_000L
                 decodeTimes.add(dtMs)
                 if (decodeTimes.size > 240) {
                     decodeTimes.subList(0, decodeTimes.size - 240).clear()

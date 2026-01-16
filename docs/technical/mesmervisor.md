@@ -36,7 +36,7 @@ MesmerVisor is a VR streaming subsystem that captures live-rendered hypnotic vis
 - **Auto-Discovery**: UDP broadcast for automatic headset detection
 - **Low Latency**: 10-20ms end-to-end latency with NVENC
 - **High Quality**: 1920x1080 @ 30-60 FPS with configurable bitrate
-- **Protocol Compatibility**: VRHP protocol with JPEG encoding
+- **Protocol Compatibility**: VRHP (JPEG), VRH2 (legacy H.264), VRH3 (H.264 + fps_milli)
 
 ### System Requirements
 
@@ -66,13 +66,14 @@ MesmerVisor is a VR streaming subsystem that captures live-rendered hypnotic vis
 │  ┌──────────────────────────────────────────────────────┐  │
 │  │  MesmerGlass Application (Qt + OpenGL)               │  │
 │  │  ┌────────────────────────────────────────────────┐  │  │
-│  │  │  LoomCompositor (QOpenGLWidget)                │  │  │
+│  │  │  LoomCompositor (QOpenGLWidget) OR             │  │  │
+│  │  │  LoomWindowCompositor (QOpenGLWindow)          │  │  │
 │  │  │  - Spiral shader rendering                     │  │  │
 │  │  │  - Image/video overlay                         │  │  │
 │  │  │  - Text rendering                              │  │  │
 │  │  │  - VR frame capture hook (optional)           │  │  │
 │  │  └────────────────┬───────────────────────────────┘  │  │
-│  │                   │ glReadPixels() - RGBA           │  │
+│  │                   │ glReadPixels() - RGB(A)          │  │
 │  └───────────────────┼───────────────────────────────────┘  │
 │                      │                                       │
 │  ┌───────────────────▼───────────────────────────────────┐  │
@@ -194,16 +195,19 @@ MesmerVisor is a VR streaming subsystem that captures live-rendered hypnotic vis
 
 ## Protocol Specification
 
-### VRHP (VR Hypnotic Protocol)
+### Wire Protocols (VRHP / VRH2 / VRH3)
 
 #### Discovery Protocol (UDP Port 5556)
 
 **Client → Server (Broadcast)**
 ```
 Format: ASCII string
-Content: "VR_HEADSET_HELLO:<device_name>"
+Content: "VR_HEADSET_HELLO:<device_name>" OR "VR_HEADSET_HELLO:<device_name>:<type>"
 Example: "VR_HEADSET_HELLO:Oculus Quest 2"
+Example: "VR_HEADSET_HELLO:Quest 3:vr"
 ```
+
+`<type>` is optional and currently accepts: `vr`, `tv`, `phone`, `flat`.
 
 **Server → Client (Unicast)**
 ```
@@ -243,6 +247,8 @@ Example: "VR_SERVER_INFO:5555"
 │  ├──────────────────────────────────────────────────┤ │
 │  │ Right Eye Size (4 bytes, big-endian uint32)     │ │
 │  ├──────────────────────────────────────────────────┤ │
+│  │ fps_milli (4 bytes, big-endian uint32) [VRH3 only]│ │
+│  ├──────────────────────────────────────────────────┤ │
 │  │ Left Eye Data (variable, encoded frame)         │ │
 │  ├──────────────────────────────────────────────────┤ │
 │  │ Right Eye Data (variable, encoded frame)        │ │
@@ -261,7 +267,8 @@ Example: "VR_SERVER_INFO:5555"
 | Magic | 4 bytes | ASCII | Protocol identifier |
 | Frame ID | 4 bytes | uint32 (big-endian) | Sequential frame counter |
 | Left Size | 4 bytes | uint32 (big-endian) | Size of left eye data in bytes |
-| Right Size | 4 bytes | uint32 (big-endian) | Size of right eye data in bytes |
+| Right Size | 4 bytes | uint32 (big-endian) | Size of right eye data in bytes (0 may mean “reuse left” for mono) |
+| fps_milli | 4 bytes | uint32 (big-endian) | Only present for `VRH3`: $\text{fps}\times 1000$ (used for client-side pacing) |
 | Left Data | N bytes | Binary | Encoded left eye frame (H.264 or JPEG) |
 | Right Data | M bytes | Binary | Encoded right eye frame (H.264 or JPEG) |
 
@@ -273,6 +280,7 @@ Magic:       0x56524833 ("VRH3")  (default)
 Frame ID:    0x0000007B (123)
 Left Size:   0x00001D21 (7457 bytes)
 Right Size:  0x00001D21 (7457 bytes)
+fps_milli:   0x00007530 (30000)  # 30.000 FPS
 Left Data:   [7457 bytes of H.264 NAL units]
 Right Data:  [7457 bytes of H.264 NAL units]
 ```
@@ -306,11 +314,14 @@ Right Data:  [103456 bytes of JPEG data]
 
 ### OpenGL Frame Capture
 
+MesmerVisor streaming captures frames from the compositor on the **Qt/GL thread**.
+The streaming server runs on a **background thread** and must never call OpenGL.
+
 **Method**: `glReadPixels()` synchronous pixel transfer
 
-**Location**: `LoomCompositor.paintGL()` (after all rendering complete)
+**Location**: compositor render loop (after all rendering complete)
 
-**Code Flow:**
+**Code Flow (conceptual):**
 ```python
 def paintGL(self):
     # 1. Render spiral shader
@@ -322,40 +333,56 @@ def paintGL(self):
     # 3. Render text overlays
     self._render_text_overlays(w_px, h_px)
     
-    # 4. Capture frame for VR (if enabled)
-    if self._vr_streaming_active:
-        self._capture_frame_for_vr(w_px, h_px)
+    # 4. Capture frame for VR/preview (if enabled)
+    if self._vr_capture_enabled or self._preview_capture_enabled:
+        self._capture_frame_for_vr(w_px, h_px)  # emits a numpy RGB frame
 ```
 
-**Capture Implementation:**
+**Capture Implementation (high level):**
 ```python
 def _capture_frame_for_vr(self, w_px: int, h_px: int) -> None:
     from OpenGL import GL
     import numpy as np
     
-    # Read framebuffer (RGBA format)
-    pixels = GL.glReadPixels(0, 0, w_px, h_px, GL.GL_RGBA, GL.GL_UNSIGNED_BYTE)
+    # Read framebuffer (RGB or RGBA depending on compositor)
+    pixels = GL.glReadPixels(0, 0, w_px, h_px, GL.GL_RGB, GL.GL_UNSIGNED_BYTE)
     
     # Convert to numpy array
-    frame_rgba = np.frombuffer(pixels, dtype=np.uint8).reshape(h_px, w_px, 4)
+    frame_rgb = np.frombuffer(pixels, dtype=np.uint8).reshape(h_px, w_px, 3)
     
     # Flip vertically (OpenGL origin is bottom-left)
-    frame_rgba = np.flipud(frame_rgba)
+    frame_rgb = np.flipud(frame_rgb)
     
-    # Convert RGBA to RGB (drop alpha channel)
-    frame_rgb = frame_rgba[:, :, :3].copy()
-    
-    # Pass to encoder callback
-    self._vr_frame_callback(frame_rgb)
+    # Emit frame to attached callback(s) (Qt signal or direct callback)
+    self.frame_ready.emit(frame_rgb)
 ```
+
+### Capture API Contract (Canonical)
+
+Both compositor implementations support the same capture interface:
+
+```python
+compositor.enable_vr_streaming(frame_callback)
+compositor.disable_vr_streaming()
+```
+
+The callback receives a `numpy.ndarray` shaped `(h, w, 3)` in RGB `uint8`.
+
+### Threading Model (Why the cache exists)
+
+- Qt calls `paintGL()` / `paintGL`-equivalent on the GL thread; capture happens there.
+- The streaming server encodes + sends from its own thread/event loop.
+- The supported pattern is: callback stores the *latest* frame into a lock-protected cache, and the server polls via `frame_callback()`.
+
+This prevents crashes/artifacts from accidentally calling OpenGL outside the GL context.
 
 **Performance Characteristics:**
 
 | Resolution | glReadPixels Time | Memory Transfer | FPS Impact |
 |------------|-------------------|-----------------|------------|
-| 1920x1080 | 5-10ms | 8.3 MB | 0 (async) |
-| 2560x1440 | 10-15ms | 14.7 MB | 0 (async) |
-| 3840x2160 | 20-30ms | 33.2 MB | -5 FPS |
+| 1920x1080 | 5-10ms | 6.2 MB | 0 (async) |
+| 2560x1440 | 10-15ms | 11.1 MB | 0 (async) |
+| 3840x2160 | 20-30ms | 24.9 MB | -5 FPS |
 
 **Optimization Notes:**
 - Only activates when `enable_vr_streaming()` called
@@ -506,8 +533,8 @@ av>=10.0.0              # PyAV for NVENC
 | `--discovery-port` | int | `5556` | UDP discovery port |
 | `--encoder` | choice | `auto` | Encoder: `auto`, `nvenc`, `jpeg` |
 | `--fps` | int | `30` | Target frames per second |
-| `--quality` | int | `25` | JPEG quality (1-100, optimized for Oculus Go/Quest, ignored for NVENC) |
-| `--bitrate` | int | `2000000` | H.264 bitrate in bps (ignored for JPEG) |
+| `--quality` | int | `85` | JPEG quality (1-100). Recommended `25` for Oculus Go/Quest; session streaming defaults to `25`. Ignored for NVENC. |
+| `--bitrate` | int | `2000000` | H.264 bitrate in bps (ignored for JPEG). Consider higher values for LAN (e.g. 50–120 Mbps). |
 | `--stereo-offset` | int | `0` | Stereo parallax offset in pixels (0=mono) |
 | `--intensity` | float | `0.75` | Initial spiral intensity (0.0-1.0) |
 | `--duration` | float | `0` | Stream duration in seconds (0=infinite) |
@@ -786,11 +813,40 @@ netstat -an | findstr "5555"
 
 **B. Same Network**
 - PC and VR headset must be on same WiFi
-- No VPN or network isolation
+- No VPN/tunnel or network isolation
+
+**VPN / Tunnel Gotcha (Common on Windows):**
+- If a VPN installs routes that prefer a virtual interface, the headset may discover the server but fail to connect (or connect times out).
+- Symptoms often include source IPs in carrier-grade NAT ranges (e.g. `100.64.0.0/10`) and TCP connect timeouts to your LAN IP (e.g. `192.168.x.x`).
+
+Quick checks:
+```powershell
+ipconfig | findstr IPv4
+route print | findstr 192.168.
+```
 
 **C. Manual IP Entry (fallback)**
 - Note PC IP: `ipconfig`
 - Enter manually in Android app (if supported)
+
+#### 6. Client Connects But No Video / “Flashing” Status
+
+**Symptoms:**
+- The Android client repeatedly changes connection/status colors.
+- Server shows discovery/connection logs, but no frames are displayed.
+
+**Likely Causes & Fixes:**
+
+**A. No frames are being captured**
+- VR streaming requires capture to be enabled on the compositor via `enable_vr_streaming(frame_callback)`.
+- If the server is running but capture is not attached, the server will have nothing to encode/send.
+
+Sanity check (server side):
+- Look for logs indicating capture attached, e.g. `VR streaming enabled (LoomWindowCompositor)`.
+- If you see errors like `object has no attribute 'enable_vr_streaming'`, update to a compositor that implements the capture API.
+
+**B. GL thread vs server thread mismatch**
+- Never call OpenGL from the server thread. Always capture on the GL thread, cache the latest RGB frame, and have the server poll via `frame_callback()`.
 
 ---
 
@@ -1017,7 +1073,7 @@ log_encoder_info()
 
 ### LoomCompositor VR Integration
 
-**Methods:**
+**Methods (works for both compositor types):**
 ```python
 from mesmerglass.mesmerloom import LoomCompositor
 

@@ -2901,12 +2901,12 @@ def cmd_vr_stream(args) -> int:
       0 success
       1 error
     """
-    import asyncio
     import logging
+    import threading
     from PyQt6.QtWidgets import QApplication
     from PyQt6.QtCore import QTimer
-    from mesmerglass.mesmervisor import VRStreamingServer, EncoderType
-    from mesmerglass.mesmervisor.gpu_utils import log_encoder_info
+    from mesmerglass.mesmervisor.streaming_server import VRStreamingServer
+    from mesmerglass.mesmervisor.gpu_utils import EncoderType, log_encoder_info
     from mesmerglass.mesmerloom.compositor import LoomCompositor
     from mesmerglass.mesmerloom.spiral import SpiralDirector
     
@@ -2941,31 +2941,30 @@ def cmd_vr_stream(args) -> int:
     compositor.raise_()  # Bring to front
     compositor.activateWindow()  # Activate window
     
-    # Create VR streaming server
     logger.info("Creating VR streaming server...")
-    
-    # Frame callback to capture compositor frames
-    frame_queue = []
-    
-    def frame_callback(frame):
-        """Callback from compositor with captured frame"""
-        # Store latest frame
-        if len(frame_queue) > 0:
-            frame_queue[0] = frame
-        else:
-            frame_queue.append(frame)
-    
-    # Enable VR streaming on compositor
-    compositor.enable_vr_streaming(frame_callback)
-    
-    # Frame generator for VR server
+
+    # Cache latest frame from Qt/GL thread; server thread polls via frame_callback.
+    last_frame = None
+    frame_lock = threading.Lock()
+
+    def on_vr_frame(frame):
+        nonlocal last_frame
+        if frame is None:
+            return
+        try:
+            with frame_lock:
+                last_frame = frame.copy()
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("VR frame cache error: %s", exc)
+
+    compositor.enable_vr_streaming(on_vr_frame)
+
     def get_frame():
-        """Get latest frame from compositor"""
-        if frame_queue:
-            return frame_queue[0]
-        return None
-    
-    # Create streaming server
+        with frame_lock:
+            if last_frame is None:
+                return None
+            return last_frame.copy()
+
     server = VRStreamingServer(
         host=args.host,
         port=args.port,
@@ -2992,94 +2991,8 @@ def cmd_vr_stream(args) -> int:
     logger.info("(Press Ctrl+C to stop)")
     logger.info("=" * 60)
     
-    # Start discovery service immediately (uses threading, works with Qt)
-    from mesmerglass.mesmervisor.streaming_server import DiscoveryService
-    discovery_service = DiscoveryService(args.discovery_port, args.port)
-    discovery_service.start()
-    
-    # Use QTimer to poll for frames and send to connected clients
-    # This integrates better with Qt event loop than async threading
-    import time
-    server.running = True
-    server.last_frame_time = time.time()
-    server.clients = []
-    
-    # Create server socket for accepting connections
-    import socket
-    server.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.server_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    server.server_socket.bind((args.host, args.port))
-    server.server_socket.listen(5)
-    server.server_socket.setblocking(False)  # Non-blocking for polling
-    logger.info(f"🎯 TCP server listening on {args.host}:{args.port}")
-    
-    # Poll for new connections and send frames using QTimer
-    def poll_server():
-        """Poll for connections and send frames"""
-        # Check for new connections
-        try:
-            client_socket, address = server.server_socket.accept()
-            client_socket.setblocking(False)
-            server.clients.append((client_socket, address))
-            logger.info(f"🎯 Client connected from {address}")
-        except BlockingIOError:
-            pass  # No new connections
-        except Exception as e:
-            logger.error(f"Accept error: {e}")
-        
-        # Send frames to all clients
-        current_time = time.time()
-        if current_time - server.last_frame_time >= (1.0 / args.fps):
-            server.last_frame_time = current_time
-            
-            # Get frame from callback
-            frame = get_frame()
-            if frame is not None:
-                # Encode and send to all clients
-                try:
-                    left_frame = server.encoder.encode(frame)
-                    right_frame = left_frame  # Mono for now
-                    
-                    if left_frame:
-                        # Debug: Check frame sizes
-                        logger.info(f"📐 Frame sizes: left={len(left_frame)} right={len(right_frame)} bytes")
-                        
-                        packet = server.create_packet(left_frame, right_frame, server.frame_id)
-                        logger.info(f"📦 Packet: {len(packet)} bytes (header=16 + frames={len(left_frame)+len(right_frame)})")
-                        
-                        server.frame_id = (server.frame_id + 1) % 4294967295
-                        
-                        # Send to all clients
-                        dead_clients = []
-                        for client_socket, address in server.clients:
-                            try:
-                                client_socket.sendall(packet)
-                            except Exception as e:
-                                logger.warning(f"Client {address} disconnected: {e}")
-                                dead_clients.append((client_socket, address))
-                        
-                        # Remove dead clients
-                        for dead_client in dead_clients:
-                            try:
-                                dead_client[0].close()
-                            except:
-                                pass
-                            server.clients.remove(dead_client)
-                            logger.info(f"Client {dead_client[1]} removed")
-                        
-                        if len(server.clients) > 0:
-                            logger.info(f"📊 Frame {server.frame_id} sent to {len(server.clients)} client(s)")
-                except Exception as e:
-                    logger.error(f"Frame encoding error: {e}")
-    
-    # Initialize frame counter
-    server.frame_id = 0
-    
-    # Start polling timer (faster than frame rate for responsive connections)
-    poll_timer = QTimer()
-    poll_timer.timeout.connect(poll_server)
-    poll_timer.start(10)  # Poll every 10ms
+    # Start the MesmerVisor server in its own asyncio thread.
+    server.start_server()
     
     # Run Qt event loop
     if args.duration > 0:
@@ -3090,17 +3003,9 @@ def cmd_vr_stream(args) -> int:
     except KeyboardInterrupt:
         logger.info("\nShutting down...")
     
-    # Cleanup
-    poll_timer.stop()
-    discovery_service.stop()
-    for client_socket, _ in server.clients:
-        try:
-            client_socket.close()
-        except:
-            pass
     try:
-        server.server_socket.close()
-    except:
+        server.stop_server()
+    except Exception:
         pass
     compositor.disable_vr_streaming()
     

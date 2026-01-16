@@ -149,6 +149,8 @@ class LoomWindowCompositor(QOpenGLWindow):
         # Frame capture flags. VR and Home preview are independent.
         self._vr_capture_enabled = False  # flipped on when VR streaming attaches
         self._preview_capture_enabled = False  # flipped on when Home preview is visible
+        # Optional callback wiring for MesmerVisor streaming.
+        self._vr_frame_callback = None
         # Capture throttling (used by both GUI preview and VR streaming).
         self._capture_interval_s = 1.0 / 15.0
         self._capture_last_t = 0.0
@@ -1163,6 +1165,57 @@ class LoomWindowCompositor(QOpenGLWindow):
         """Enable capture for VR streaming (independent of Home preview)."""
         self._set_capture_interval(max_fps)
         self._vr_capture_enabled = bool(enabled)
+
+    # ---- MesmerVisor VR Streaming Methods (API parity with LoomCompositor) ----
+    def enable_vr_streaming(self, frame_callback) -> None:
+        """Enable VR frame capture and forward frames to the provided callback.
+
+        This mirrors the API used by `LoomCompositor.enable_vr_streaming` so higher-level
+        code (session runner, CLI helpers) can attach to either compositor type.
+        """
+        try:
+            # Disconnect any previous callback.
+            if getattr(self, "_vr_frame_callback", None) is not None:
+                try:
+                    self.frame_ready.disconnect(self._vr_frame_callback)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        self._vr_frame_callback = frame_callback
+        try:
+            if callable(frame_callback):
+                self.frame_ready.connect(frame_callback)
+        except Exception:
+            # Don't fail rendering if the callback is not connectable.
+            pass
+
+        try:
+            self.set_vr_capture_enabled(True, max_fps=30)
+        except Exception:
+            self._vr_capture_enabled = True
+
+        logger.info("[mesmervisor] VR streaming enabled (LoomWindowCompositor)")
+
+    def disable_vr_streaming(self) -> None:
+        """Disable VR frame capture and detach any streaming callback."""
+        try:
+            cb = getattr(self, "_vr_frame_callback", None)
+            if cb is not None:
+                try:
+                    self.frame_ready.disconnect(cb)
+                except Exception:
+                    pass
+        finally:
+            self._vr_frame_callback = None
+
+        try:
+            self.set_vr_capture_enabled(False)
+        except Exception:
+            self._vr_capture_enabled = False
+
+        logger.info("[mesmervisor] VR streaming disabled (LoomWindowCompositor)")
 
     def set_capture_enabled(self, enabled: bool, max_fps: int = 15) -> None:
         """Backward compatible alias: controls Home preview capture."""
