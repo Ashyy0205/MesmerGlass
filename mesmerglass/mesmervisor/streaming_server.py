@@ -254,25 +254,32 @@ class VRStreamingServer:
         # Select encoder
         self.encoder_type = select_encoder(encoder_type)
         logger.info(f"Selected encoder: {self.encoder_type.value.upper()}")
-        
-        # Create encoder
-        if self.encoder_type == EncoderType.NVENC:
-            self.encoder = create_encoder(
-                EncoderType.NVENC,
-                width=self.target_width,
-                height=self.target_height,
-                fps=fps,
-                bitrate=bitrate
-            )
-            self.protocol_magic = b'VRH2'  # VR H.264
-        else:
-            self.encoder = create_encoder(
-                EncoderType.JPEG,
-                width=self.target_width,
-                height=self.target_height,
-                quality=quality
-            )
-            self.protocol_magic = b'VRHP'  # VR Hypnotic Protocol (JPEG)
+
+        # Store encoder configuration. Encoder instances are created per-client in handle_client.
+        # This avoids reserving an NVENC session before any client connects.
+        self.bitrate = int(bitrate)
+        self.quality = int(quality)
+        self.encoder: Optional[FrameEncoder] = None
+
+        # Protocol magic:
+        # - VRHP: JPEG
+        # - VRH2: H.264 (legacy header)
+        # - VRH3: H.264 (extended header includes fps_milli)
+        # Default to VRH3 for H.264 to improve client smoothness (timed playout scheduling).
+        self.protocol_magic = (b"VRH3" if self.encoder_type == EncoderType.NVENC else b"VRHP")
+
+        # Optional: allow forcing VRH2 or VRH3 when using NVENC.
+        protocol_env = (os.environ.get("MESMERGLASS_VRH2_PROTOCOL") or "").strip().lower()
+        if protocol_env in {"vrh2", "vrh3"}:
+            if self.encoder_type == EncoderType.NVENC:
+                self.protocol_magic = (b"VRH3" if protocol_env == "vrh3" else b"VRH2")
+                logger.info("VRH2 protocol override: %s", protocol_env)
+            else:
+                logger.warning(
+                    "MESMERGLASS_VRH2_PROTOCOL=%r ignored (current encoder=%s)",
+                    protocol_env,
+                    self.encoder_type.value,
+                )
         
         # Server state
         self.server_socket: Optional[socket.socket] = None
@@ -354,13 +361,21 @@ class VRStreamingServer:
             self._server_thread.join(timeout=2.0)
             logger.info("VR streaming server stopped")
     
-    def create_packet(self, left_frame: bytes, right_frame: bytes, frame_id: int) -> bytes:
+    def create_packet(
+        self,
+        left_frame: bytes,
+        right_frame: bytes,
+        frame_id: int,
+        protocol_magic: Optional[bytes] = None,
+        fps_milli: Optional[int] = None,
+    ) -> bytes:
         """
         Create network packet with stereo frames
         
         Packet format (ALL PROTOCOLS):
         - Packet size (4 bytes, big-endian int)
-        - Header (16 bytes): magic(4) + frame_id(4) + left_size(4) + right_size(4)
+        - Header (VRHP/VRH2 = 16 bytes): magic(4) + frame_id(4) + left_size(4) + right_size(4)
+        - Header (VRH3 = 20 bytes): magic(4) + frame_id(4) + left_size(4) + right_size(4) + fps_milli(4)
         - Left eye frame data
         - Right eye frame data (optional; right_size may be 0 to indicate "reuse left")
         
@@ -374,9 +389,14 @@ class VRStreamingServer:
         """
         left_size = len(left_frame)
         right_size = len(right_frame)
-        
-        # Create header
-        header = struct.pack('!4sIII', self.protocol_magic, frame_id, left_size, right_size)
+
+        magic = self.protocol_magic if protocol_magic is None else protocol_magic
+        if magic == b"VRH3":
+            # fps_milli is required for VRH3; fall back to server fps if missing.
+            fps_milli_eff = int(fps_milli) if fps_milli is not None else int(float(getattr(self, "fps", 30) or 30) * 1000.0)
+            header = struct.pack('!4sIIII', magic, frame_id, left_size, right_size, fps_milli_eff)
+        else:
+            header = struct.pack('!4sIII', magic, frame_id, left_size, right_size)
         
         # Combine header + frames
         packet_data = header + left_frame + right_frame
@@ -757,14 +777,14 @@ class VRStreamingServer:
                     width=self.target_width,
                     height=self.target_height,
                     fps=self.fps,
-                    bitrate=getattr(self.encoder, "bitrate", 50_000_000),
+                    bitrate=int(getattr(self, "bitrate", 50_000_000) or 50_000_000),
                 )
             else:
                 client_encoder = create_encoder(
                     EncoderType.JPEG,
                     width=self.target_width,
                     height=self.target_height,
-                    quality=getattr(self.encoder, "quality", 25),
+                    quality=int(getattr(self, "quality", 25) or 25),
                 )
 
             # Producer thread continuously refreshes the *latest* encoded frame.
@@ -798,13 +818,13 @@ class VRStreamingServer:
                             width=self.target_width,
                             height=self.target_height,
                             fps=self.fps,
-                            bitrate=getattr(self.encoder, "bitrate", 50_000_000),
+                            bitrate=int(getattr(self, "bitrate", 50_000_000) or 50_000_000),
                         )
                     return create_encoder(
                         EncoderType.JPEG,
                         width=self.target_width,
                         height=self.target_height,
-                        quality=getattr(self.encoder, "quality", 25),
+                        quality=int(getattr(self, "quality", 25) or 25),
                     )
                 except Exception as e:
                     logger.warning("[vrh2-reset] Failed to recreate encoder: %s", e)
@@ -975,7 +995,7 @@ class VRStreamingServer:
                     candidate = Path(token)
                     dump_dir = candidate if candidate.is_absolute() else (Path.cwd() / candidate)
 
-            if dump_enabled and dump_dir is not None and self.protocol_magic == b"VRH2":
+            if dump_enabled and dump_dir is not None and self.protocol_magic in {b"VRH2", b"VRH3"}:
                 try:
                     dump_dir.mkdir(parents=True, exist_ok=True)
                     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1028,7 +1048,7 @@ class VRStreamingServer:
                         await asyncio.sleep(0.05)
 
             control_task: Optional[asyncio.Task] = None
-            if enable_control and self.protocol_magic == b"VRH2":
+            if enable_control and self.protocol_magic in {b"VRH2", b"VRH3"}:
                 try:
                     control_task = asyncio.create_task(_control_reader())
                     logger.info("[vrh2-ctl] control channel enabled (client may send NEED_IDR)")
@@ -1086,7 +1106,7 @@ class VRStreamingServer:
                 # Also optionally log NAL composition for tiny/key access units.
                 # IMPORTANT: do this only for frames we will actually send/dump, so diagnostics
                 # correlate with captured dumps and packet sequence numbers.
-                if self.protocol_magic == b"VRH2":
+                if self.protocol_magic in {b"VRH2", b"VRH3"}:
                     # Receiver-driven keyframe request (preferred over size-based heuristics).
                     if need_idr_from_client and hasattr(client_encoder, "request_idr"):
                         if (frame_id - last_idr_request_frame) >= idr_cooldown_frames:
@@ -1179,7 +1199,7 @@ class VRStreamingServer:
                         pass
 
                 # If we're resyncing after a reset, drop frames until we see an IDR.
-                if need_idr_resync and self.protocol_magic == b"VRH2":
+                if need_idr_resync and self.protocol_magic in {b"VRH2", b"VRH3"}:
                     if _h264_access_unit_contains_idr(left_encoded):
                         need_idr_resync = False
                         logger.warning("[vrh2-reset] IDR resync achieved at frame=%d", frame_id)
@@ -1344,7 +1364,7 @@ class VRStreamingServer:
         logger.warning(f"Encoder: {self.encoder_type.value.upper()}")
         if self.encoder_type == EncoderType.NVENC:
             try:
-                bitrate_mbps = float(getattr(self.encoder, "bitrate", 0)) / 1_000_000.0
+                bitrate_mbps = float(getattr(self, "bitrate", 0) or 0) / 1_000_000.0
                 if bitrate_mbps > 0:
                     logger.warning(f"Bitrate: {bitrate_mbps:.1f} Mbps")
             except Exception:
@@ -1433,7 +1453,8 @@ class VRStreamingServer:
         
         # Close encoder
         if self.encoder:
-            self.encoder.close()
+            if self.encoder is not None:
+                self.encoder.close()
         
         logger.info("Server stopped")
 
