@@ -6,7 +6,7 @@
 1. Python 3.12+ (64-bit)
 2. Git
 3. Visual Studio Code (recommended)
-4. Intiface Central (for device testing)
+4. (Optional) Bluetooth LE hardware + a compatible device (for device testing)
 
 ### System Requirements
 - Windows 10/11
@@ -32,10 +32,9 @@ python -m pip install --upgrade pip wheel
 ### 3. Install Dependencies
 ```powershell
 pip install -r requirements.txt
-pip install -r requirements-dev.txt
 ```
 
-> **Note:** `psutil` now ships with the main requirements list. If you see `ModuleNotFoundError: psutil` when launching the CLI, rerun `pip install -r requirements.txt` inside the active virtual environment to pull the new dependency.
+All runtime + test dependencies are currently bundled in `requirements.txt`.
 
 ### 4. IDE Setup
 
@@ -70,11 +69,9 @@ MesmerGlass/
 │   │   ├── video.py
 │   │   └── pulse.py
 │   ├── ui/
-│   │   ├── launcher.py
-│   │   └── pages/
 │   └── tests/
 ├── docs/
-├── media/
+├── MEDIA/
 ├── requirements.txt
 └── run.py
 ```
@@ -83,26 +80,22 @@ MesmerGlass/
 
 ### Code Quality
 ```powershell
-# Format code
-python -m black mesmerglass
-
-# Lint code
-python -m flake8 mesmerglass
-
-# Type checking
-python -m mypy mesmerglass
+# Optional tooling (not installed by default):
+# python -m pip install black ruff mypy
+# python -m black mesmerglass
+# python -m ruff check mesmerglass
+# python -m mypy mesmerglass
 ```
 
 ### Testing
 ```powershell
-# Run all tests
+# Recommended shortcuts
+python -m mesmerglass test-run fast
+python -m mesmerglass test-run all -v
+python -m mesmerglass test-run -c
+
+# Or run pytest directly
 python -m pytest
-
-# Run with coverage
-python -m pytest --cov=mesmerglass
-
-# Run specific test
-python -m pytest mesmerglass/tests/test_video.py
 ```
 
 ### Documentation
@@ -218,8 +211,8 @@ git checkout -b feature/new-feature
 - Check package installation
 
 #### Device Connection
-- Check Intiface running
-- Verify WebSocket port
+- MesmerIntiface starts automatically inside the GUI (default: `ws://127.0.0.1:12350`)
+- Verify Bluetooth is enabled and the device is in pairing mode
 - Check device paired
 
 #### UI Issues

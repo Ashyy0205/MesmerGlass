@@ -2,19 +2,24 @@
 
 # MesmerGlass
 
-**MesmerGlass** is a sophisticated desktop overlay application that creates hypnotic visual experiences with synchronized device control. Built with PyQt6, it provides real-time video effects (via the **MesmerLoom** visuals engine), text animations, and seamless device synchronization through our pure Python **MesmerIntiface** system.
+**MesmerGlass** is a session-based desktop visual compositor and device-control tool built with **PyQt6 + OpenGL**.
+
+It’s designed around **sessions** (`*.session.json`) that bundle:
+- **Playbacks** (visual/audio “programs”)
+- **Cuelists** (timed sequences of cues)
+- A per-session **Media Bank** (folders for videos/images/fonts/audio)
+
+MesmerGlass also includes built-in Bluetooth device control (MesmerIntiface) and optional VR output/streaming.
 
 ## ✨ Features
 
-- **🎬 MesmerLoom (visuals engine)** - Real-time video compositor & spiral overlay
-- **📝 Text & Visual Effects** - Customizable text animations with hypnotic effects
-- **🎮 Device Control** - Native Bluetooth device control without external dependencies
-- **🎵 Audio Synchronization** - Audio-reactive effects and synchronization
-- **🔧 Developer Tools** - Built-in debugging and testing tools
-- **🖥️ Multi-Display Support** - Span effects across multiple monitors
-- **🎯 Click-Through Interface** - Non-intrusive overlay that doesn't interfere with other applications
-- **🌀 Spiral Overlay** - GPU-driven animated spiral composited over video with live UI controls (intensity, blend, parameters)
-- **🥽 VR Streaming** - Stream to Oculus Go/Quest with optimized JPEG encoding (quality 25, ~60 Mbps, stable 20 FPS)
+- **Session workflow** - Open/create a session and run it from the Home tab
+- **Real-time compositor** - Video + shader effects + spiral overlay + text overlays
+- **Cuelists + cues** - Timed playback control with prefetching
+- **Per-session Media Bank** - Point a session at your own media directories
+- **Device control** - Built-in MesmerIntiface (no Intiface Central required)
+- **Multi-display output** - Render to selected monitors
+- **Wireless VR output** - Stream visuals to Android VR headsets on WiFi (NVENC H.264 when available, JPEG fallback)
 
 ## 🚀 Quick Start
 
@@ -52,6 +57,17 @@
    python -m mesmerglass run
    ```
    Legacy: `python run.py` still works (deprecated; see docs/migration/run-py-deprecation.md).
+
+### First run (what to click)
+
+1. Open the GUI: `python -m mesmerglass run`
+2. Create a session: **File → New Session…** (or open an existing `*.session.json`)
+3. Choose outputs: **Display** tab → select monitors (and optional wireless VR device)
+4. Configure media: **Home** tab → **Media Bank** → add your media folders
+5. Build content:
+   - **Playbacks** tab: create/edit playbacks
+   - **Cuelists** tab: create cues and order them
+6. Run it: **Home** tab → Session Runner → **Start**
 
 ## 🪟 Building a standalone Windows executable
 
@@ -91,9 +107,11 @@ MesmerGlass includes **MesmerIntiface** - a pure Python implementation for direc
 ## 📚 Documentation
 
 ### 📖 **User Guides**
-- [📥 Installation Guide](docs/user-guide/installation.md) - Detailed setup instructions
-- [⚡ Features Overview](docs/user-guide/features.md) - Complete feature walkthrough  
-- [🎮 Device Management](docs/user-guide/device-management.md) - Device setup and control
+- [📥 Installation](docs/user-guide/installation.md)
+- [🧭 UI overview](docs/user-guide/ui-overview.md)
+- [⚡ Quick start](docs/user-guide/quick-start-visual.md)
+- [🎮 Device management](docs/user-guide/device-management.md)
+- [🥽 VR setup](docs/user-guide/vr-setup.md)
 
 ### 🛠️ **Development**
 - [🔧 Development Setup](docs/development/dev-setup.md) - Setup development environment
@@ -104,8 +122,8 @@ MesmerGlass includes **MesmerIntiface** - a pure Python implementation for direc
 - [🎵 Audio Engine](docs/technical/audio-engine.md) - Audio processing system
 - [🎬 Video Engine](docs/technical/video-engine.md) - Video overlay architecture
 - [📡 Device Control](docs/technical/device-control.md) - Communication protocols
-- [🌀 Spiral Overlay](docs/technical/spiral-overlay.md) - MesmerLoom spiral parameters & rendering
-- [🥽 VR Streaming (MesmerVisor)](docs/technical/mesmervisor.md) - VR streaming system with JPEG encoding optimized for Oculus Go/Quest
+- [🌀 Spiral Overlay](docs/technical/spiral-overlay.md)
+- [🥽 VR Streaming (MesmerVisor)](docs/technical/mesmervisor.md)
 - [🛠 CLI Reference](docs/cli.md)
 
 ## 🧪 Testing

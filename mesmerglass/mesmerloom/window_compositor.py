@@ -91,6 +91,10 @@ class LoomWindowCompositor(QOpenGLWindow):
         self._background_texture = None
         self._background_enabled = False
         self._background_zoom = 1.0
+        # Render-time-only multiplier for background/video zoom.
+        # This allows special compositors (e.g., VR streaming) to be slightly zoomed out
+        # without affecting the primary compositor's zoom animations or upload state.
+        self._background_zoom_multiplier = 1.0
         self._background_image_width = 1920
         self._background_image_height = 1080
         self._background_offset = [0.0, 0.0]  # XY drift offset
@@ -865,6 +869,40 @@ class LoomWindowCompositor(QOpenGLWindow):
         """Render the spiral; if VR safe mode is enabled, render to offscreen FBO then blit to window."""
         if not self.initialized or not self.program_id or not self._active:
             return
+
+        # Qt can recreate the underlying GL context (e.g., monitor changes, driver events).
+        # In that case, previously created GL object IDs (including programs) become invalid
+        # for the new context. Guard glUseProgram to avoid GL_INVALID_VALUE spam and try
+        # to rebuild resources on the fly.
+        try:
+            if not GL.glIsProgram(int(self.program_id)):
+                logger.error(
+                    f"[spiral.trace] paintGL: program_id {self.program_id} is not valid; attempting GL reinitialize"
+                )
+                try:
+                    # Best-effort cleanup of the stale handle (may already be invalid).
+                    try:
+                        GL.glDeleteProgram(int(self.program_id))
+                    except Exception:
+                        pass
+                    self.program_id = None
+                    # Rebuild program + geometry + state in the current context.
+                    self.initializeGL()
+                except Exception as exc:
+                    logger.error(f"[spiral.trace] paintGL: GL reinitialize failed: {exc}")
+                    return
+
+                if not self.program_id:
+                    return
+                if not GL.glIsProgram(int(self.program_id)):
+                    logger.error(
+                        f"[spiral.trace] paintGL: program_id still invalid after reinit ({self.program_id}); skipping frame"
+                    )
+                    return
+        except Exception:
+            # If glIsProgram isn't available/throws for any reason, fall back to the existing
+            # behavior (glUseProgram will be attempted below).
+            pass
             
         now_t = time.perf_counter()
         if self._last_paint_t is not None:
@@ -985,19 +1023,26 @@ class LoomWindowCompositor(QOpenGLWindow):
         # Set core uniforms (same as original compositor approach)
         current_time = time.time() - self.t0
         
-        # Use the same resolution logic as director for consistency
-        screen = self.screen()
-        if screen:
-            physical_screen = self._screen_physical_size(screen)
-            if physical_screen:
-                screen_w, screen_h = physical_screen
-            else:
-                screen_size = screen.size()
-                screen_w, screen_h = screen_size.width(), screen_size.height()
-            _set2('uResolution', (float(screen_w), float(screen_h)))
+        # Use the same resolution logic as director for consistency, but allow a virtual override.
+        if getattr(self, "_virtual_screen_size", None):
+            try:
+                vw, vh = self._virtual_screen_size
+                _set2('uResolution', (float(vw), float(vh)))
+            except Exception:
+                _set2('uResolution', (float(w_px), float(h_px)))
         else:
-            # Fallback to window size if screen detection fails
-            _set2('uResolution', (float(w_px), float(h_px)))
+            screen = self.screen()
+            if screen:
+                physical_screen = self._screen_physical_size(screen)
+                if physical_screen:
+                    screen_w, screen_h = physical_screen
+                else:
+                    screen_size = screen.size()
+                    screen_w, screen_h = screen_size.width(), screen_size.height()
+                _set2('uResolution', (float(screen_w), float(screen_h)))
+            else:
+                # Fallback to window size if screen detection fails
+                _set2('uResolution', (float(w_px), float(h_px)))
         
         _set1('uTime', current_time)  # Override director time for consistency (same as original)
         
@@ -1089,7 +1134,9 @@ class LoomWindowCompositor(QOpenGLWindow):
                 if interval > 0.0 and (now - getattr(self, '_capture_last_t', 0.0)) < interval:
                     raise RuntimeError("capture throttled")
                 self._capture_last_t = now
-                # Read pixels from current framebuffer
+
+                # Read pixels from the current framebuffer.
+                # Do NOT crop here: VR uses a dedicated square compositor surface.
                 pixels = GL.glReadPixels(0, 0, w_px, h_px, GL.GL_RGB, GL.GL_UNSIGNED_BYTE)
                 frame = np.frombuffer(pixels, dtype=np.uint8).reshape(h_px, w_px, 3)
                 # Flip vertically (GL origin is bottom-left) and force contiguous memory.
@@ -1454,6 +1501,21 @@ class LoomWindowCompositor(QOpenGLWindow):
     def set_background_zoom(self, zoom: float) -> None:
         """Set background zoom factor."""
         self._background_zoom = max(0.1, min(5.0, zoom))
+
+    def set_background_zoom_multiplier(self, multiplier: float) -> None:
+        """Set a per-compositor multiplier applied to background/video zoom.
+
+        Applied at render time only (via the uZoom uniform), so it won't interfere with
+        the zoom animator or the base zoom recorded on fade layers.
+
+        - multiplier < 1.0 => zoom out (media appears smaller)
+        - multiplier > 1.0 => zoom in
+        """
+        try:
+            value = float(multiplier)
+        except Exception:
+            return
+        self._background_zoom_multiplier = max(0.05, min(20.0, value))
     
     def start_zoom_animation(self, target_zoom: float = 1.5, start_zoom: float = 1.0, duration_frames: int = 48, mode: str = "exponential", rate: float = None) -> None:
         """Start duration-based zoom-in animation.
@@ -2083,6 +2145,9 @@ void main() {
         
         # Use background shader
         GL.glUseProgram(self._background_program)
+
+        zoom_multiplier = float(getattr(self, "_background_zoom_multiplier", 1.0) or 1.0)
+        zoom_multiplier = max(0.05, min(20.0, zoom_multiplier))
         
         # Set common uniforms
         loc = GL.glGetUniformLocation(self._background_program, 'uResolution')
@@ -2117,7 +2182,7 @@ void main() {
 
                 loc = GL.glGetUniformLocation(self._background_program, 'uZoom')
                 if loc >= 0:
-                    GL.glUniform1f(loc, item['zoom'])
+                    GL.glUniform1f(loc, float(item['zoom']) * zoom_multiplier)
 
                 loc = GL.glGetUniformLocation(self._background_program, 'uOffset')
                 if loc >= 0:
@@ -2164,7 +2229,7 @@ void main() {
 
             loc = GL.glGetUniformLocation(self._background_program, 'uZoom')
             if loc >= 0:
-                GL.glUniform1f(loc, self._background_zoom)
+                GL.glUniform1f(loc, float(self._background_zoom) * zoom_multiplier)
 
             loc = GL.glGetUniformLocation(self._background_program, 'uOffset')
             if loc >= 0:
@@ -2203,7 +2268,7 @@ void main() {
             
             loc = GL.glGetUniformLocation(self._background_program, 'uZoom')
             if loc >= 0:
-                GL.glUniform1f(loc, self._background_zoom)
+                GL.glUniform1f(loc, float(self._background_zoom) * zoom_multiplier)
             
             loc = GL.glGetUniformLocation(self._background_program, 'uOffset')
             if loc >= 0:

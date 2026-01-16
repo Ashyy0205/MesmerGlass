@@ -1,223 +1,63 @@
-# MesmerGlass Quick Start - Visual Guide
+# MesmerGlass Quick Start
 
-```
-╔═══════════════════════════════════════════════════════════════╗
-║                    MESMERGLASS LAUNCHER                       ║
-╠═══════════════════════════════════════════════════════════════╣
-║                                                               ║
-║  ┌─────────────────────────────────────────────────────────┐ ║
-║  │ TABS (Click to switch):                                 │ ║
-║  ├─────────────────────────────────────────────────────────┤ ║
-║  │                                                         │ ║
-║  │  🎬 Visual Programs  ← START HERE! (Main tab)          │ ║
-║  │  🌀 MesmerLoom       ← Enable spiral here              │ ║
-║  │  🎵 Audio            ← Background music                │ ║
-║  │  🔗 Device Sync      ← Bluetooth toys (optional)       │ ║
-║  │  🖥️ Displays         ← Choose monitors                 │ ║
-║  │  ─────────────────────────────────────────             │ ║
-║  │  📹 Media (Legacy)   ⚠️ Old - ignore this              │ ║
-║  │  📝 Text (Legacy)    ⚠️ Old - ignore this              │ ║
-║  │                                                         │ ║
-║  └─────────────────────────────────────────────────────────┘ ║
-║                                                               ║
-║  ┌─────────────────────────────────────────────────────────┐ ║
-║  │ LAUNCH / STOP BUTTONS:                                  │ ║
-║  ├─────────────────────────────────────────────────────────┤ ║
-║  │                                                         │ ║
-║  │  [LAUNCH]  [STOP]     Status: Ready                    │ ║
-║  │                                                         │ ║
-║  └─────────────────────────────────────────────────────────┘ ║
-╚═══════════════════════════════════════════════════════════════╝
+This guide gets you from “fresh clone” to “visuals on screen” with the current **session-based** UI.
+
+## 1) Install + launch
+
+From the repo root:
+
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+
+# Start the GUI
+python -m mesmerglass run
+# (or: python run.py)
 ```
 
----
+## 2) Create or open a session
 
-## Step-by-Step Visual Guide
+In the app:
 
-### Step 1: Enable Spiral
-```
-┌─────────────────────────────────┐
-│ 🌀 MesmerLoom Tab               │
-├─────────────────────────────────┤
-│                                 │
-│ ☑️ Enable Spiral  ← CHECK THIS  │
-│                                 │
-│ Speed:  [████░░░░░] 50%        │
-│ Zoom:   [████░░░░░] 50%        │
-│ Type:   [Classic Spiral ▼]     │
-│                                 │
-└─────────────────────────────────┘
-```
+- **File → New Session** (Ctrl+N), or
+- **File → Open Session…** (Ctrl+O) and select a `.session.json`
 
-### Step 2: Select Visual Program
-```
-┌─────────────────────────────────┐
-│ 🎬 Visual Programs Tab          │
-├─────────────────────────────────┤
-│                                 │
-│ Visual Program:                 │
-│ [Simple Slideshow      ▼]       │
-│                                 │
-│ Description:                    │
-│ Basic image slideshow           │
-│ (48 frames/image, 16 images)    │
-│                                 │
-│ [START] [PAUSE] [STOP] [RESET]  │
-│                                 │
-│ Progress: [████░░░░░░] 40%      │
-│ Frame: 320 / 800                │
-│                                 │
-└─────────────────────────────────┘
-```
+Tip: the repo ships example sessions in `mesmerglass/sessions/`.
 
-### Step 3: Launch Overlay
-```
-Bottom of Window:
-┌─────────────────────────────────┐
-│ [LAUNCH] ← CLICK THIS           │
-└─────────────────────────────────┘
+## 3) Pick an output display
 
-Result:
-┌───────────────────────────────────────┐
-│  OVERLAY WINDOW (Fullscreen)         │
-│                                       │
-│      🌀                               │
-│        Spiral spinning...             │
-│          + Images fading in/out       │
-│            + Text overlays            │
-│                                       │
-└───────────────────────────────────────┘
-```
+Go to the **Display** tab and ensure at least one monitor (or VR output) is selected.
 
----
+If nothing seems to render, this is almost always the cause.
 
-## Tab Purposes (At a Glance)
+## 4) Add your media (images/videos/fonts)
 
-| Tab | Icon | Purpose | When to Use |
-|-----|------|---------|-------------|
-| **Visual Programs** | 🎬 | Automated shows | **Always start here!** |
-| **MesmerLoom** | 🌀 | Spiral settings | Enable spiral first |
-| **Audio** | 🎵 | Music tracks | Optional background music |
-| **Device Sync** | 🔗 | Haptic toys | Optional if you have devices |
-| **Displays** | 🖥️ | Monitor selection | Multi-monitor setups |
-| ~~Media~~ | 📹 | ~~Old video system~~ | ⚠️ Replaced by Visual Programs |
-| ~~Text & FX~~ | 📝 | ~~Old text system~~ | ⚠️ Replaced by Visual Programs |
+Go to the **Home** tab → **Media Bank** section:
 
----
+1. Click **Add Directory**
+2. Choose a folder
+3. Label it and choose its type: **images**, **videos**, **both**, or **fonts**
+4. Click **Refresh** to force a rescan
 
-## Visual Programs Types
+Media Bank entries are stored inside the current session file.
 
-```
-┌──────────────────────────────────────────────────────────┐
-│  VISUAL PROGRAM OPTIONS:                                 │
-├──────────────────────────────────────────────────────────┤
-│                                                          │
-│  1. Simple Slideshow      → Images fade in/out          │
-│  2. Text Cycling          → Multi-layer text overlays   │
-│  3. Accelerating Zoom     → Zoom in/out effects         │
-│  4. Slow Flash            → Gentle flash sync           │
-│  5. Flash Text            → Intense flash + text        │
-│  6. Parallel Images       → Multiple images at once     │
-│  7. Animation/Video       → Video playback              │
-│                                                          │
-└──────────────────────────────────────────────────────────┘
-```
+## 5) Create playbacks + cues, then run
 
----
+At a high level:
 
-## Common Workflows
+- **Playbacks** define “what to render” (spiral/media/text/zoom)
+- **Cuelists** define “what happens over time” (durations, audio tracks, which playback is active)
 
-### Beginner Workflow (Recommended)
-```
-1. 🌀 MesmerLoom       → ☑️ Enable Spiral
-2. 🎬 Visual Programs  → Select "Simple Slideshow"
-3. 🎬 Visual Programs  → Click START
-4. Bottom              → Click LAUNCH
-5. Watch!              → Enjoy the show
-6. Bottom              → Click STOP when done
-```
+Suggested first workflow:
 
-### Advanced Workflow
-```
-1. 🌀 MesmerLoom       → ☑️ Enable Spiral + adjust speed/zoom
-2. 🎵 Audio            → Load background music
-3. 🔗 Device Sync      → Connect Bluetooth toy
-4. 🎬 Visual Programs  → Select "Flash Text"
-5. 🎬 Visual Programs  → Click START
-6. Bottom              → Click LAUNCH
-7. Watch + Feel!       → Visual + haptic feedback
-8. 🎬 Visual Programs  → Click PAUSE to freeze
-9. Bottom              → Click STOP when done
-```
+1. **Playbacks** → **New Playback** → configure spiral + media mode
+2. **Cuelists** → add a cue → set duration and optional audio
+3. **Home** → use SessionRunner **Start**
 
-### Content Creation Workflow
-```
-1. 📹 Media (Legacy)   → Load custom videos (temporary)
-2. 📝 Text (Legacy)    → Load text messages (temporary)
-3. 🎬 Visual Programs  → Media now available
-4. 🌀 MesmerLoom       → ☑️ Enable Spiral
-5. 🎬 Visual Programs  → Select program type
-6. Bottom              → Click LAUNCH
-```
+## Common “nothing works” checklist
 
----
-
-## Troubleshooting Visual
-
-### "Visual Programs doesn't start"
-```
-ERROR: "Failed to start visual program"
-
-SOLUTION:
-1. Check MesmerLoom tab
-   → Is "Enable Spiral" checked? ✓
-   
-2. Load media first:
-   → Go to "Media (Legacy)" tab
-   → Choose video files
-   → Return to Visual Programs
-   → Try START again
-```
-
-### "Nothing appears when I click Launch"
-```
-CHECKLIST:
-[ ] MesmerLoom → Enable Spiral = ✓
-[ ] Visual Programs → START clicked = ✓  
-[ ] Displays → At least one monitor selected = ✓
-[ ] LAUNCH button clicked = ✓
-
-If all checked:
-→ Check console for errors
-→ Verify OpenGL available
-→ Try selecting Primary Display only
-```
-
-### "Legacy tabs confusing me"
-```
-IGNORE THESE:
-❌ Media (Legacy)
-❌ Text & FX (Legacy)
-
-USE INSTEAD:
-✅ Visual Programs (does everything)
-```
-
----
-
-## Color Legend
-
-- **🎬 Green icons** = Modern, actively developed
-- **📹 Gray text** = Legacy, will be removed
-- **⚠️ Warning symbol** = Deprecated, avoid
-
----
-
-## That's It!
-
-**Most users only need**:
-1. 🌀 MesmerLoom (enable spiral)
-2. 🎬 Visual Programs (select + start)
-3. LAUNCH button (bottom)
-
-**Everything else is optional!**
+- Display tab: at least one monitor selected
+- Home tab: session loaded and Media Bank has at least one images/videos folder
+- SessionRunner: started (not paused/stopped)

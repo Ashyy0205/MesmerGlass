@@ -2,10 +2,12 @@
 
 ## Overview
 
-MesmerGlass now supports **two VR systems** with easy UI-based setup:
+MesmerGlass supports two VR paths:
 
 ### 1. 🥽 VR Bridge (Direct PC Headset)
-Direct rendering to PC VR headsets via OpenVR/OpenXR
+Head-locked VR output via OpenXR/OpenVR.
+
+This is currently enabled via **CLI flags** when launching the app.
 
 **Supported Headsets:**
 - Meta Quest (with Link/Air Link)
@@ -15,7 +17,9 @@ Direct rendering to PC VR headsets via OpenVR/OpenXR
 - Any SteamVR-compatible headset
 
 ### 2. 📱 VR Streaming (Wireless Android)
-Stream visuals to Android VR devices over WiFi
+Stream visuals to Android VR devices over WiFi.
+
+This is integrated into the GUI via the **Display** tab (it lists discovered wireless headsets).
 
 **Supported Devices:**
 - Meta Quest (via Android client app)
@@ -33,19 +37,15 @@ Stream visuals to Android VR devices over WiFi
    - Launch SteamVR or Oculus app
    - Ensure headset is detected and active
 
-2. **Launch MesmerGlass**
+2. **Launch MesmerGlass with VR enabled**
    ```powershell
-   .\.venv\Scripts\python.exe -m mesmerglass
+   python -m mesmerglass run --vr
    ```
 
-3. **Enable VR Bridge**
-   - Go to **Display** tab
-   - Check: **🥽 VR Bridge (Direct PC Headset)**
-   - Also check your primary monitor (for desktop preview)
+3. **(Optional) Keep a desktop preview**
+   - Also select a monitor in the **Display** tab
 
-4. **Launch Spiral**
-   - Click **Launch** button
-   - Spiral appears on monitor AND in VR headset!
+4. Start a session and run it from **Home** (or use whatever content your session contains).
 
 ### What You'll See
 
@@ -55,13 +55,14 @@ Stream visuals to Android VR devices over WiFi
 
 ### Troubleshooting
 
-**"VR Bridge in mock mode - no headset detected"**
-- Ensure SteamVR is running
-- Check headset is powered on and connected
-- Restart SteamVR if needed
-- Try setting backend: `$env:MESMERGLASS_VR_BACKEND = "openvr"`
+**VR Bridge in mock mode / no headset detected**
+- Ensure SteamVR (or your runtime) is running
+- Check the headset is powered on and connected
+- Try forcing a backend:
+   - `python -m mesmerglass run --vr --vr-backend openvr`
+   - `python -m mesmerglass run --vr --vr-backend openxr`
 
-**"Failed to connect VR bridge"**
+**Failed to connect VR bridge**
 - Update graphics drivers
 - Ensure no other app is using VR exclusively
 - Check Windows firewall isn't blocking VR runtime
@@ -78,7 +79,7 @@ Stream visuals to Android VR devices over WiFi
 
 2. **Launch MesmerGlass** (on PC)
    ```powershell
-   .\.venv\Scripts\python.exe -m mesmerglass
+   python -m mesmerglass run
    ```
    Discovery service starts automatically!
 
@@ -95,7 +96,7 @@ Stream visuals to Android VR devices over WiFi
 5. **Enable Streaming**
    - Check your VR device in the list
    - Also check your primary monitor
-   - Click **Launch** button
+   - Start a session and run it from **Home**
 
 6. **Start Streaming**
    - Frames automatically stream to VR headset
@@ -104,7 +105,7 @@ Stream visuals to Android VR devices over WiFi
 ### What You'll See
 
 - **Desktop Monitor**: Spiral overlay (preview)
-- **VR Headset**: Streamed spiral via H264/HEVC
+- **VR Headset**: Streamed visuals via H.264 (NVENC) or JPEG fallback
 - **Display Tab**: Device listed with IP address
 - **Auto-refresh**: List updates every 2 seconds
 
@@ -119,24 +120,14 @@ Stream visuals to Android VR devices over WiFi
 **"Device found but no stream"**
 - Check WiFi signal strength
 - Reduce other network traffic
-- Verify encoder settings in VR client app
+- Verify the PC is on the same LAN and that ports are open (UDP 5556, TCP 5555)
 - Check logs for streaming errors
 
 ---
 
 ## Using Both Systems Simultaneously
 
-You can use **both VR systems at the same time**:
-
-1. Check **🥽 VR Bridge (Direct PC Headset)**
-2. Check **📱 [Your Wireless Device]**
-3. Check your **primary monitor**
-4. Click **Launch**
-
-Result:
-- Desktop monitor shows spiral
-- Direct PC headset renders spiral (low latency)
-- Wireless Android headset streams spiral (over WiFi)
+You can use **VR Bridge** (CLI `--vr`) and **Wireless VR streaming** (Display tab device selection) at the same time.
 
 ---
 
@@ -147,14 +138,6 @@ Result:
 🖥️ \\.\DISPLAY1  1920x1080  [✓]  ← Primary monitor
 🖥️ \\.\DISPLAY2  2560x1440  [ ]  ← Secondary monitor
 ────────────────────────────────
-```
-
-### VR Bridge Section
-```
-🥽 VR Bridge (Direct PC Headset)  [ ]
-   Tooltip: Direct rendering to PC VR headset (Oculus, Vive, Index, WMR) 
-            via OpenVR/OpenXR.
-            Requires: SteamVR or Oculus software running with headset connected.
 ```
 
 ### Wireless VR Section
@@ -173,21 +156,16 @@ VR Devices (Wireless)
 
 ## Environment Variables (Optional)
 
-### Force-Enable VR Bridge
-If you prefer environment variables over UI checkboxes:
+### Prefer CLI flags
+VR options are easiest to manage via CLI flags:
 
 ```powershell
-# Enable VR Bridge without UI checkbox
-$env:MESMERGLASS_VR = "1"
-
-# Choose backend (optional)
-$env:MESMERGLASS_VR_BACKEND = "openvr"  # or "openxr" or "auto"
-
-# Launch
-.\.venv\Scripts\python.exe -m mesmerglass
+python -m mesmerglass run --vr
+python -m mesmerglass run --vr --vr-backend openvr
+python -m mesmerglass run --vr --vr-mock
+python -m mesmerglass run --vr --vr-safe-mode
+python -m mesmerglass run --vr --vr-minimal
 ```
-
-**Note**: UI checkbox takes precedence over environment variable
 
 ### Other VR Flags
 ```powershell
@@ -232,28 +210,23 @@ $env:MESMERGLASS_VR_BACKEND = "openvr"  # or "openxr"
 
 ### Test VR Bridge
 ```powershell
-# Run diagnostic tool
-.\.venv\Scripts\python.exe scripts\vr_diagnostic.py
-
-# Check for:
-# - "VR Bridge is in MOCK MODE" = no headset detected
-# - "VR BRIDGE IS ACTIVE!" = headset detected
+python -m mesmerglass run --vr --vr-mock
 ```
 
 ### Test VR Streaming
-```powershell
-# Run diagnostic tool (scans for 10 seconds)
-.\.venv\Scripts\python.exe scripts\vr_diagnostic.py
+You can validate the streaming server without launching the full GUI:
 
-# Check for:
-# - "FOUND X VR DEVICE(S)" = discovery working
-# - Device name and IP listed
+```powershell
+# Start a streaming server and wait for clients
+python -m mesmerglass vr-stream --encoder auto --fps 30
+
+# Send a generated test pattern (useful for pipeline debugging)
+python -m mesmerglass vr-test
 ```
 
 ### Run Full Test Suite
 ```powershell
-# Test all VR systems
-.\.venv\Scripts\python.exe scripts\test_vr_integration.py
+python -m mesmerglass vr-selftest
 
 # Test UI integration
 .\.venv\Scripts\python.exe scripts\test_vr_bridge_ui.py

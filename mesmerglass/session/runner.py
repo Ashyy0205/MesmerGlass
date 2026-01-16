@@ -195,6 +195,8 @@ class SessionRunner:
         self._vr_last_frame = None
         self._vr_frame_lock = None
         self._vr_frame_handler = None
+        self._vr_streaming_compositor = None  # compositor instance feeding the stream
+        self._vr_hidden_compositor = None  # dedicated square compositor for VR
 
         # Audio runtime tracking
         self._audio_role_channels: dict[AudioRole, int] = {}
@@ -238,6 +240,30 @@ class SessionRunner:
         """Track work that held up the frame thread so we can attribute spikes."""
         if duration_ms <= 0:
             return
+
+    # ===== Live audio controls =====
+
+    def get_audio_role_channel(self, role: AudioRole) -> Optional[int]:
+        """Return the pygame mixer channel index currently used for an AudioRole."""
+        try:
+            return self._audio_role_channels.get(role)
+        except Exception:
+            return None
+
+    def set_audio_role_volume(self, role: AudioRole, volume: float) -> bool:
+        """Set volume for an active AudioRole immediately.
+
+        This is intended for live UI controls (e.g. adjusting the Shepard bed).
+        """
+        if not self.audio_engine:
+            return False
+        channel = self.get_audio_role_channel(role)
+        if channel is None:
+            return False
+        try:
+            return bool(self.audio_engine.set_volume(channel, float(volume)))
+        except Exception:
+            return False
 
         record = {
             "operation": operation,
@@ -788,9 +814,82 @@ class SessionRunner:
                     from ..mesmervisor.streaming_server import VRStreamingServer
                     from ..mesmervisor.gpu_utils import EncoderType
                     import threading
+                    import os
+                    from PyQt6.QtCore import Qt
+                    from ..mesmerloom.window_compositor import LoomWindowCompositor
                     
-                    # Use primary compositor for VR streaming
-                    streaming_compositor = self.compositor
+                    # Create a dedicated VR-only compositor for streaming.
+                    # The headset's per-eye native is often 1280x1440; allow explicit WxH.
+                    try:
+                        vr_stream_w = int(os.environ.get("MESMERGLASS_VR_STREAM_WIDTH", "0"))
+                    except Exception:
+                        vr_stream_w = 0
+                    try:
+                        vr_stream_h = int(os.environ.get("MESMERGLASS_VR_STREAM_HEIGHT", "0"))
+                    except Exception:
+                        vr_stream_h = 0
+                    if vr_stream_w <= 0 or vr_stream_h <= 0:
+                        try:
+                            vr_stream_side = int(os.environ.get("MESMERGLASS_VR_STREAM_SIDE", "1080"))
+                        except Exception:
+                            vr_stream_side = 1080
+                        if vr_stream_side <= 0:
+                            vr_stream_side = 1080
+                        vr_stream_w = vr_stream_side
+                        vr_stream_h = vr_stream_side
+
+                    if self._vr_hidden_compositor is None:
+                        spiral_director = self.compositor.director if self.compositor else None
+                        if spiral_director is None:
+                            raise RuntimeError("VR streaming requires an active primary compositor")
+                        self._vr_hidden_compositor = LoomWindowCompositor(
+                            director=spiral_director,
+                            text_director=self.visual_director.text_director,
+                            is_primary=False,
+                        )
+                        try:
+                            self.visual_director.register_secondary_compositor(self._vr_hidden_compositor)
+                        except Exception:
+                            pass
+                        try:
+                            text_director = getattr(self.visual_director, "text_director", None)
+                            if text_director and hasattr(text_director, "set_secondary_compositors"):
+                                text_director.set_secondary_compositors(self._secondary_compositors + [self._vr_hidden_compositor])
+                        except Exception:
+                            pass
+
+                    streaming_compositor = self._vr_hidden_compositor
+                    self._vr_streaming_compositor = streaming_compositor
+
+                    # Make the compositor window non-intrusive: offscreen + transparent.
+                    try:
+                        streaming_compositor.resize(vr_stream_w, vr_stream_h)
+                        streaming_compositor.setGeometry(-10000, -10000, vr_stream_w, vr_stream_h)
+                        streaming_compositor.setFlags(streaming_compositor.flags() | Qt.WindowType.Tool)
+                        streaming_compositor.setOpacity(0.0)
+                        if hasattr(streaming_compositor, "set_virtual_screen_size"):
+                            try:
+                                streaming_compositor.set_virtual_screen_size(vr_stream_w, vr_stream_h)
+                            except Exception:
+                                pass
+                        # VR-only media zoom tuning: start slightly zoomed out compared to the
+                        # normal compositor (does not affect the primary window).
+                        # Default is a mild zoom-out; override via env if desired.
+                        vr_zoom_mult_env = (os.environ.get("MESMERGLASS_VR_MEDIA_ZOOM_MULT") or "").strip()
+                        try:
+                            # Mild default zoom-out; tweak via env if needed.
+                            vr_zoom_mult = float(vr_zoom_mult_env) if vr_zoom_mult_env else 0.97
+                        except Exception:
+                            vr_zoom_mult = 0.97
+                        if hasattr(streaming_compositor, "set_background_zoom_multiplier"):
+                            try:
+                                streaming_compositor.set_background_zoom_multiplier(vr_zoom_mult)
+                            except Exception:
+                                pass
+                        streaming_compositor.set_active(True)
+                        streaming_compositor.show()
+                    except Exception:
+                        pass
                     
                     # Create frame cache (populated by Qt signal, consumed by streaming thread)
                     self._vr_streaming_active = True
@@ -810,15 +909,18 @@ class SessionRunner:
                         
                         return None  # No frame available yet
                     
-                    # Create streaming server with frame callback
+                    # Create streaming server with frame callback (square stream for VR)
                     self.vr_streaming_server = VRStreamingServer(
-                        width=1920,
-                        height=1080,
+                        width=vr_stream_w,
+                        height=vr_stream_h,
+                        target_width=vr_stream_w,
+                        target_height=vr_stream_h,
                         fps=30,
                         encoder_type=EncoderType.AUTO,
                         quality=25,  # Optimized for Oculus Go
                         frame_callback=capture_frame
                     )
+                    self.logger.info(f"[session] VR streaming: target_resolution={vr_stream_w}x{vr_stream_h}")
                     
                     # Start streaming server (TCP 5555)
                     self.vr_streaming_server.start_server()
@@ -847,6 +949,7 @@ class SessionRunner:
                             streaming_compositor.showMinimized()
                         except Exception:
                             pass
+                        self.logger.info("[session] VR-only mode: minimized compositor window")
                         self.logger.info("[session] VR-only mode: minimized compositor window")
                         
                 except Exception as e:
@@ -937,16 +1040,38 @@ class SessionRunner:
         if self.vr_streaming_server:
             try:
                 self._vr_streaming_active = False
-                with self._vr_frame_lock:
-                    self._vr_last_frame = None
-                if self.compositor and hasattr(self.compositor, 'disable_vr_streaming'):
+                if self._vr_frame_lock is not None:
+                    with self._vr_frame_lock:
+                        self._vr_last_frame = None
+
+                # Detach compositor capture (best-effort).
+                stream_comp = self._vr_streaming_compositor or self.compositor
+                if stream_comp and hasattr(stream_comp, "disable_vr_streaming"):
                     try:
-                        self.compositor.disable_vr_streaming()
+                        stream_comp.disable_vr_streaming()
                     except Exception:
                         pass
                 self.vr_streaming_server.stop_server()
                 self.vr_streaming_server = None
                 self.logger.info("[session] VR streaming server stopped")
+
+                # Dispose dedicated VR compositor (hidden square instance)
+                if self._vr_hidden_compositor is not None:
+                    try:
+                        self.visual_director.unregister_secondary_compositor(self._vr_hidden_compositor)
+                    except Exception:
+                        pass
+                    try:
+                        self._vr_hidden_compositor.set_active(False)
+                        self._vr_hidden_compositor.hide()
+                    except Exception:
+                        pass
+                    try:
+                        self._vr_hidden_compositor.deleteLater()
+                    except Exception:
+                        pass
+                    self._vr_hidden_compositor = None
+                self._vr_streaming_compositor = None
             except Exception as e:
                 self.logger.error(f"[session] Failed to stop VR streaming: {e}")
         
