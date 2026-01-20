@@ -198,6 +198,10 @@ class AudioEngine:
         self._fading_in = [False] * num_channels   # Fade-in active
         self._fading_out = [False] * num_channels  # Fade-out active
         self._lengths = [0.0] * num_channels       # Cached duration (seconds) for loaded audio
+        # True for channels loaded via load_channel_pcm (synthesized/generated audio).
+        # We treat these differently for volume control because pygame fade-in can
+        # effectively ramp channel volume back toward 1.0 depending on mixer backend.
+        self._generated = [False] * num_channels
         # Shared cache so repeated cues reuse decoded buffers and avoid load stalls
         self._sound_cache: OrderedDict[str, pygame.mixer.Sound] = OrderedDict()
         self._length_cache: dict[str, float] = {}
@@ -652,6 +656,7 @@ class AudioEngine:
         self._sounds[channel] = sound
         self._paths[channel] = file_path
         self._lengths[channel] = length
+        self._generated[channel] = False
         self.logger.debug(f"Loaded audio into channel {channel}: {file_path} (cached={length > 0.0})")
         return True
 
@@ -721,6 +726,7 @@ class AudioEngine:
             sound = pygame.sndarray.make_sound(pcm_for_mixer)
             self._sounds[channel] = sound
             self._paths[channel] = str(tag)
+            self._generated[channel] = True
 
             # Estimate length from mixer sample rate.
             try:
@@ -772,10 +778,23 @@ class AudioEngine:
             loops = -1 if loop else 0
             volume = clamp(volume, 0.0, 1.0)
             fade_ms = max(0, int(fade_ms))
-            
+
+            # For synthesized/generated audio (e.g. Shepard tone bed), prefer applying
+            # volume at the Sound-level as well. Some mixer backends treat fade-in as
+            # ramping toward full channel volume, which can make channel-only volume
+            # scaling appear ineffective.
+            if self._generated[channel]:
+                try:
+                    sound.set_volume(volume)
+                except Exception:
+                    pass
+                play_volume = 1.0
+            else:
+                play_volume = volume
+
             self._channels[channel] = sound.play(loops=loops, fade_ms=fade_ms)
             if self._channels[channel]:
-                self._channels[channel].set_volume(volume)
+                self._channels[channel].set_volume(play_volume)
                 self._volumes[channel] = volume
                 self._looping[channel] = loop
                 self._fading_in[channel] = True
@@ -884,6 +903,23 @@ class AudioEngine:
         
         volume = clamp(volume, 0.0, 1.0)
         self._volumes[channel] = volume
+
+        if self._generated[channel]:
+            sound = self._sounds[channel]
+            if sound:
+                try:
+                    sound.set_volume(volume)
+                except Exception:
+                    pass
+            # Keep the active mixer channel at unity; volume is carried by the Sound.
+            if self._channels[channel] and self._channels[channel].get_busy():
+                try:
+                    self._channels[channel].set_volume(1.0)
+                    return True
+                except Exception as e:
+                    self.logger.error(f"Failed to set volume on channel {channel}: {e}")
+                    return False
+            return False
         
         if self._channels[channel] and self._channels[channel].get_busy():
             try:

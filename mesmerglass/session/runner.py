@@ -1776,6 +1776,13 @@ class SessionRunner:
                             volume = float(getattr(cue, "shepard_volume", 0.15))
                             volume = max(0.0, min(1.0, volume))
 
+                            self.logger.info(
+                                "[session] Shepard cue settings: cue='%s' dir=%s volume=%.3f",
+                                cue.name,
+                                str(direction),
+                                volume,
+                            )
+
                             pcm = generate_shepard_tone_int16_stereo(
                                 duration_s=60.0,
                                 sample_rate=44100,
