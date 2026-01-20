@@ -7,6 +7,38 @@ import sys
 import os
 
 
+def _maybe_reexec_into_venv() -> None:
+    """Ensure we launch the GUI under the project's venv when present.
+
+    On Windows, accidentally running under the Microsoft Store Python can lead to
+    native crashes (e.g., Qt/OpenGL access violations) due to mismatched wheels.
+    """
+    if getattr(sys, "frozen", False):
+        return
+    if os.environ.get("MESMERGLASS_NO_REEXEC", "0") in ("1", "true", "True", "yes"):
+        return
+    if os.environ.get("MESMERGLASS_REEXEC", "0") in ("1",):
+        return
+
+    if os.name != "nt":
+        return
+
+    project_root = Path(__file__).resolve().parent
+    venv_python = project_root / ".venv" / "Scripts" / "python.exe"
+    if not venv_python.exists():
+        return
+
+    exe = str(Path(sys.executable).resolve())
+    exe_lower = exe.lower()
+    venv_lower = str(venv_python).lower()
+    # Already in the intended venv.
+    if exe_lower == venv_lower or "\\.venv\\scripts\\python.exe" in exe_lower:
+        return
+
+    os.environ["MESMERGLASS_REEXEC"] = "1"
+    os.execv(str(venv_python), [str(venv_python), str(project_root / "run.py"), *sys.argv[1:]])
+
+
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     
@@ -28,6 +60,9 @@ def main(argv: list[str] | None = None) -> int:
         from mesmerglass.cli import main as cli_main
 
         return cli_main(args)
+
+    # GUI path: prefer running under the workspace venv if available.
+    _maybe_reexec_into_venv()
     _launch_gui()
     return 0
 

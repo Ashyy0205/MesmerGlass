@@ -29,7 +29,7 @@ else:
     _PSUTIL_IMPORT_ERROR = None
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import TYPE_CHECKING, Optional, Any
+from typing import TYPE_CHECKING, Optional, Any, Callable
 from pathlib import Path
 
 if TYPE_CHECKING:
@@ -98,7 +98,9 @@ class SessionRunner:
         audio_engine: Optional[AudioEngine] = None,
         compositor: Optional[LoomCompositor] = None,
         display_tab = None,  # DisplayTab for monitor selection
-        session_data: Optional[dict] = None  # Session data for accessing playback configs
+        session_data: Optional[dict] = None,  # Session data for accessing playback configs
+        headless: bool = False,  # Offscreen/hidden compositor (no fullscreen windows)
+        time_provider: Optional[Callable[[], float]] = None,  # Override wall-clock time (offline export)
     ):
         """
         Initialize session runner.
@@ -119,8 +121,12 @@ class SessionRunner:
         self.compositor = compositor  # Primary compositor (template)
         self.display_tab = display_tab
         self.session_data = session_data
+        self.headless = bool(headless)
         
         self.logger = logging.getLogger(__name__)
+
+        # Timing source (wall clock by default). Offline export can inject a simulated clock.
+        self._time_provider: Callable[[], float] = time_provider or time.time
         
         # State machine
         self._state = SessionState.STOPPED
@@ -229,6 +235,16 @@ class SessionRunner:
             )
     
     # ===== State Properties =====
+
+    def _now(self) -> float:
+        """Return the current session time.
+
+        This is wall-clock by default, but can be overridden for offline exports.
+        """
+        try:
+            return float(self._time_provider())
+        except Exception:
+            return float(time.time())
 
     def _perf_span(self, name: str, *, category: str = "misc", **metadata: Any):
         tracer = getattr(self, "_perf_tracer", None)
@@ -466,9 +482,6 @@ class SessionRunner:
         allow_eviction: bool,
     ) -> _ReserveOutcome:
         limit = self._audio_buffer_limits.get(role, self._audio_buffer_limits.get(AudioRole.GENERIC, 0.0))
-        if limit <= 0.0:
-            return _ReserveOutcome.STREAM
-
         normalized = self._normalize_audio_path(file_path)
         reservation = self._audio_buffer_reservations.get(normalized)
         if reservation:
@@ -691,7 +704,7 @@ class SessionRunner:
         
         # Initialize session state
         self._state = SessionState.RUNNING
-        self._session_start_time = time.time()
+        self._session_start_time = self._now()
         self._total_paused_time = 0.0
         self._loop_direction = 1
         self._worst_frame_spike = None
@@ -700,262 +713,318 @@ class SessionRunner:
         # Activate compositor(s) on selected display(s)
         if self.compositor:
             from PyQt6.QtGui import QGuiApplication
-            
-            # Get selected displays from DisplayTab
-            selected_displays = []
-            if self.display_tab:
-                selected_displays = self.display_tab.get_selected_displays()
-                self.logger.info(f"[session] DisplayTab returned {len(selected_displays)} selected displays")
-                for i, display in enumerate(selected_displays):
-                    self.logger.info(f"[session]   Display {i}: type={display.get('type')}, data_keys={list(display.keys())}")
-            else:
-                self.logger.warning("[session] No display_tab available!")
-            
-            # Separate monitors and VR clients
-            monitor_displays = [d for d in selected_displays if d.get("type") == "monitor"]
-            vr_clients = [d for d in selected_displays if d.get("type") == "vr"]
-            
-            # Fallback to primary screen if nothing selected
-            if not monitor_displays:
-                primary_screen = QGuiApplication.primaryScreen()
-                self.logger.info("[session] No monitors selected, using primary screen")
-                monitor_displays = [{"type": "monitor", "screen": primary_screen}]
-            
-            self.logger.info(f"[session] Activating compositor on {len(monitor_displays)} monitor(s)")
-            
-            # First monitor: Use primary compositor
-            first_screen = monitor_displays[0].get("screen")
-            if first_screen:
-                applied_geometry = self.compositor.fit_to_screen(first_screen)
-                if applied_geometry is None:
-                    applied_geometry = first_screen.geometry()
-                self.logger.info(
-                    f"[session] [Display 1/{len(monitor_displays)}] Primary compositor on '{first_screen.name()}': "
-                    f"{applied_geometry.width()}x{applied_geometry.height()}"
-                )
-            else:
-                self.compositor.fit_to_screen(None)
-            
-            self.compositor.set_active(True)
-            self.compositor.showFullScreen()
-            
-            # Force window to be fully opaque
-            try:
-                import ctypes
-                hwnd = int(self.compositor.winId())
-                ctypes.windll.user32.SetLayeredWindowAttributes(hwnd, 0, 255, 0x00000002)
-            except Exception:
-                pass
-            
-            # Additional monitors: Create secondary compositors
-            if len(monitor_displays) > 1:
-                from ..mesmerloom.window_compositor import LoomWindowCompositor
-                
-                # Get the spiral director from the primary compositor
-                spiral_director = self.compositor.director
-                
-                for i, display in enumerate(monitor_displays[1:], start=2):
-                    screen = display.get("screen")
-                    if not screen:
-                        continue
-                    
-                    try:
-                        # Create new compositor instance sharing the same directors
-                        # NOTE: text_director is shared for text rendering, but only primary calls update()
-                        secondary_compositor = LoomWindowCompositor(
-                            director=spiral_director,
-                            text_director=self.visual_director.text_director,
-                            is_primary=False  # Don't advance text_director state on secondaries
-                        )
-                        
-                        # Position on target screen
-                        applied_geometry = secondary_compositor.fit_to_screen(screen)
-                        if applied_geometry is None:
-                            applied_geometry = screen.geometry()
-                        self.logger.info(
-                            f"[session] [Display {i}/{len(monitor_displays)}] Secondary compositor on '{screen.name()}': "
-                            f"{applied_geometry.width()}x{applied_geometry.height()}"
-                        )
-                        
-                        # Activate and show
-                        secondary_compositor.set_active(True)
-                        secondary_compositor.showFullScreen()
-                        
-                        # Force fully opaque
-                        try:
-                            import ctypes
-                            hwnd = int(secondary_compositor.winId())
-                            ctypes.windll.user32.SetLayeredWindowAttributes(hwnd, 0, 255, 0x00000002)
-                        except Exception:
-                            pass
-                        
-                        # Track secondary compositor
-                        self._secondary_compositors.append(secondary_compositor)
-                        
-                        # Register with VisualDirector for content mirroring
-                        self.visual_director.register_secondary_compositor(secondary_compositor)
-                        
-                        self.logger.info(f"[session] Secondary compositor {i-1} created and activated")
-                        
-                    except Exception as e:
-                        self.logger.error(f"[session] Failed to create secondary compositor for display {i}: {e}")
-            
-            # Register all secondary compositors with TextDirector (after loop completes)
-            if self.visual_director.text_director and self._secondary_compositors:
-                self.visual_director.text_director.set_secondary_compositors(self._secondary_compositors)
-                self.logger.info(f"[session] Registered {len(self._secondary_compositors)} secondary compositor(s) with TextDirector")
-            
-            self.logger.info(f"[session] Total active compositors: {1 + len(self._secondary_compositors)}")
-            
-            # Start VR streaming if we have VR clients selected
-            if vr_clients and len(vr_clients) > 0:
-                self.logger.info(f"[session] Starting VR streaming for {len(vr_clients)} VR client(s)")
+
+            # Headless mode: keep the compositor hidden/offscreen.
+            # Used for offline rendering/export so nothing appears on any display.
+            if getattr(self, "headless", False):
                 try:
-                    from ..mesmervisor.streaming_server import VRStreamingServer
-                    from ..mesmervisor.gpu_utils import EncoderType
-                    import threading
-                    import os
+                    # Typical export target is 1920x1080, but honor current size.
+                    w = int(getattr(self.compositor, "width", lambda: 1920)())
+                    h = int(getattr(self.compositor, "height", lambda: 1080)())
+                except Exception:
+                    w, h = 1920, 1080
+                try:
                     from PyQt6.QtCore import Qt
-                    from ..mesmerloom.window_compositor import LoomWindowCompositor
-                    
-                    # Create a dedicated VR-only compositor for streaming.
-                    # The headset's per-eye native is often 1280x1440; allow explicit WxH.
-                    try:
-                        vr_stream_w = int(os.environ.get("MESMERGLASS_VR_STREAM_WIDTH", "0"))
-                    except Exception:
-                        vr_stream_w = 0
-                    try:
-                        vr_stream_h = int(os.environ.get("MESMERGLASS_VR_STREAM_HEIGHT", "0"))
-                    except Exception:
-                        vr_stream_h = 0
-                    if vr_stream_w <= 0 or vr_stream_h <= 0:
-                        try:
-                            vr_stream_side = int(os.environ.get("MESMERGLASS_VR_STREAM_SIDE", "1080"))
-                        except Exception:
-                            vr_stream_side = 1080
-                        if vr_stream_side <= 0:
-                            vr_stream_side = 1080
-                        vr_stream_w = vr_stream_side
-                        vr_stream_h = vr_stream_side
-
-                    if self._vr_hidden_compositor is None:
-                        spiral_director = self.compositor.director if self.compositor else None
-                        if spiral_director is None:
-                            raise RuntimeError("VR streaming requires an active primary compositor")
-                        self._vr_hidden_compositor = LoomWindowCompositor(
-                            director=spiral_director,
-                            text_director=self.visual_director.text_director,
-                            is_primary=False,
-                        )
-                        try:
-                            self.visual_director.register_secondary_compositor(self._vr_hidden_compositor)
-                        except Exception:
-                            pass
-                        try:
-                            text_director = getattr(self.visual_director, "text_director", None)
-                            if text_director and hasattr(text_director, "set_secondary_compositors"):
-                                text_director.set_secondary_compositors(self._secondary_compositors + [self._vr_hidden_compositor])
-                        except Exception:
-                            pass
-
-                    streaming_compositor = self._vr_hidden_compositor
-                    self._vr_streaming_compositor = streaming_compositor
 
                     # Make the compositor window non-intrusive: offscreen + transparent.
                     try:
-                        streaming_compositor.resize(vr_stream_w, vr_stream_h)
-                        streaming_compositor.setGeometry(-10000, -10000, vr_stream_w, vr_stream_h)
-                        streaming_compositor.setFlags(streaming_compositor.flags() | Qt.WindowType.Tool)
-                        streaming_compositor.setOpacity(0.0)
-                        if hasattr(streaming_compositor, "set_virtual_screen_size"):
-                            try:
-                                streaming_compositor.set_virtual_screen_size(vr_stream_w, vr_stream_h)
-                            except Exception:
-                                pass
-                        # VR-only media zoom tuning: start slightly zoomed out compared to the
-                        # normal compositor (does not affect the primary window).
-                        # Default is a mild zoom-out; override via env if desired.
-                        vr_zoom_mult_env = (os.environ.get("MESMERGLASS_VR_MEDIA_ZOOM_MULT") or "").strip()
-                        try:
-                            # Mild default zoom-out; tweak via env if needed.
-                            vr_zoom_mult = float(vr_zoom_mult_env) if vr_zoom_mult_env else 0.97
-                        except Exception:
-                            vr_zoom_mult = 0.97
-                        if hasattr(streaming_compositor, "set_background_zoom_multiplier"):
-                            try:
-                                streaming_compositor.set_background_zoom_multiplier(vr_zoom_mult)
-                            except Exception:
-                                pass
-                        streaming_compositor.set_active(True)
-                        streaming_compositor.show()
+                        self.compositor.resize(w, h)
                     except Exception:
                         pass
-                    
-                    # Create frame cache (populated by Qt signal, consumed by streaming thread)
-                    self._vr_streaming_active = True
-                    self._vr_last_frame = None
-                    self._vr_frame_lock = threading.Lock()
-                    
-                    def capture_frame():
-                        """Return cached frame for VR streaming (called from streaming thread)"""
-                        if not self._vr_streaming_active:
-                            return None
-                        
-                        # Return cached frame (NEVER call GL functions from streaming thread)
-                        with self._vr_frame_lock:
-                            if self._vr_last_frame is not None:
-                                frame = self._vr_last_frame.copy()  # Copy to avoid race conditions
-                                return frame
-                        
-                        return None  # No frame available yet
-                    
-                    # Create streaming server with frame callback (square stream for VR)
-                    self.vr_streaming_server = VRStreamingServer(
-                        width=vr_stream_w,
-                        height=vr_stream_h,
-                        target_width=vr_stream_w,
-                        target_height=vr_stream_h,
-                        fps=30,
-                        encoder_type=EncoderType.AUTO,
-                        quality=25,  # Optimized for Oculus Go
-                        frame_callback=capture_frame
-                    )
-                    self.logger.info(f"[session] VR streaming: target_resolution={vr_stream_w}x{vr_stream_h}")
-                    
-                    # Start streaming server (TCP 5555)
-                    self.vr_streaming_server.start_server()
-                    self.logger.info("[session] VR streaming server started on TCP port 5555")
-
-                    # Enable compositor-side capture; it will call us back from the Qt/GL thread.
                     try:
-                        def on_vr_frame(frame):
-                            if not self._vr_streaming_active or frame is None:
-                                return
-                            try:
-                                with self._vr_frame_lock:
-                                    self._vr_last_frame = frame.copy()
-                            except Exception as e:  # pragma: no cover - defensive
-                                self.logger.error(f"[session] VR frame cache error: {e}")
+                        self.compositor.setGeometry(-10000, -10000, w, h)
+                    except Exception:
+                        pass
+                    try:
+                        self.compositor.setFlags(self.compositor.flags() | Qt.WindowType.Tool)
+                    except Exception:
+                        pass
+                    try:
+                        self.compositor.setOpacity(0.0)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
 
-                        streaming_compositor.enable_vr_streaming(on_vr_frame)
-                        self.logger.info("[session] VR streaming enabled on LoomCompositor")
-                        self.logger.info(f"[session] VR streaming: compositor size={streaming_compositor.width()}x{streaming_compositor.height()}")
-                    except Exception as e:
-                        self.logger.warning(f"[session] Failed to enable compositor VR capture: {e}")
+                try:
+                    if hasattr(self.compositor, "set_virtual_screen_size"):
+                        self.compositor.set_virtual_screen_size(w, h)
+                except Exception:
+                    pass
 
-                    # If VR-only mode (no monitors selected), minimize the compositor window
-                    if not monitor_displays:
+                try:
+                    self.compositor.set_active(True)
+                    # Use regular show() so it initializes GL, but stays offscreen/transparent.
+                    self.compositor.show()
+                except Exception:
+                    pass
+
+                self.logger.info("[session] Headless compositor activated (offscreen)")
+
+            else:
+                # Get selected displays from DisplayTab
+                selected_displays = []
+                if self.display_tab:
+                    selected_displays = self.display_tab.get_selected_displays()
+                    self.logger.info(f"[session] DisplayTab returned {len(selected_displays)} selected displays")
+                    for i, display in enumerate(selected_displays):
+                        self.logger.info(
+                            f"[session]   Display {i}: type={display.get('type')}, data_keys={list(display.keys())}"
+                        )
+                else:
+                    self.logger.warning("[session] No display_tab available!")
+
+                # Separate monitors and VR clients
+                monitor_displays = [d for d in selected_displays if d.get("type") == "monitor"]
+                vr_clients = [d for d in selected_displays if d.get("type") == "vr"]
+
+                # Fallback to primary screen if nothing selected
+                if not monitor_displays:
+                    primary_screen = QGuiApplication.primaryScreen()
+                    self.logger.info("[session] No monitors selected, using primary screen")
+                    monitor_displays = [{"type": "monitor", "screen": primary_screen}]
+
+                self.logger.info(f"[session] Activating compositor on {len(monitor_displays)} monitor(s)")
+
+                # First monitor: Use primary compositor
+                first_screen = monitor_displays[0].get("screen")
+                if first_screen:
+                    applied_geometry = self.compositor.fit_to_screen(first_screen)
+                    if applied_geometry is None:
+                        applied_geometry = first_screen.geometry()
+                    self.logger.info(
+                        f"[session] [Display 1/{len(monitor_displays)}] Primary compositor on '{first_screen.name()}': "
+                        f"{applied_geometry.width()}x{applied_geometry.height()}"
+                    )
+                else:
+                    self.compositor.fit_to_screen(None)
+
+                self.compositor.set_active(True)
+                self.compositor.showFullScreen()
+
+                # Force window to be fully opaque
+                try:
+                    import ctypes
+
+                    hwnd = int(self.compositor.winId())
+                    ctypes.windll.user32.SetLayeredWindowAttributes(hwnd, 0, 255, 0x00000002)
+                except Exception:
+                    pass
+
+                # Additional monitors: Create secondary compositors
+                if len(monitor_displays) > 1:
+                    from ..mesmerloom.window_compositor import LoomWindowCompositor
+
+                    # Get the spiral director from the primary compositor
+                    spiral_director = self.compositor.director
+
+                    for i, display in enumerate(monitor_displays[1:], start=2):
+                        screen = display.get("screen")
+                        if not screen:
+                            continue
+
                         try:
-                            streaming_compositor.showMinimized()
+                            # Create new compositor instance sharing the same directors
+                            # NOTE: text_director is shared for text rendering, but only primary calls update()
+                            secondary_compositor = LoomWindowCompositor(
+                                director=spiral_director,
+                                text_director=self.visual_director.text_director,
+                                is_primary=False,  # Don't advance text_director state on secondaries
+                            )
+
+                            # Position on target screen
+                            applied_geometry = secondary_compositor.fit_to_screen(screen)
+                            if applied_geometry is None:
+                                applied_geometry = screen.geometry()
+                            self.logger.info(
+                                f"[session] [Display {i}/{len(monitor_displays)}] Secondary compositor on '{screen.name()}': "
+                                f"{applied_geometry.width()}x{applied_geometry.height()}"
+                            )
+
+                            # Activate and show
+                            secondary_compositor.set_active(True)
+                            secondary_compositor.showFullScreen()
+
+                            # Force fully opaque
+                            try:
+                                import ctypes
+
+                                hwnd = int(secondary_compositor.winId())
+                                ctypes.windll.user32.SetLayeredWindowAttributes(hwnd, 0, 255, 0x00000002)
+                            except Exception:
+                                pass
+
+                            # Track secondary compositor
+                            self._secondary_compositors.append(secondary_compositor)
+
+                            # Register with VisualDirector for content mirroring
+                            self.visual_director.register_secondary_compositor(secondary_compositor)
+
+                            self.logger.info(f"[session] Secondary compositor {i-1} created and activated")
+
+                        except Exception as e:
+                            self.logger.error(f"[session] Failed to create secondary compositor for display {i}: {e}")
+
+                # Register all secondary compositors with TextDirector (after loop completes)
+                if self.visual_director.text_director and self._secondary_compositors:
+                    self.visual_director.text_director.set_secondary_compositors(self._secondary_compositors)
+                    self.logger.info(
+                        f"[session] Registered {len(self._secondary_compositors)} secondary compositor(s) with TextDirector"
+                    )
+
+                self.logger.info(f"[session] Total active compositors: {1 + len(self._secondary_compositors)}")
+
+                # Start VR streaming if we have VR clients selected
+                if vr_clients and len(vr_clients) > 0:
+                    self.logger.info(f"[session] Starting VR streaming for {len(vr_clients)} VR client(s)")
+                    try:
+                        from ..mesmervisor.streaming_server import VRStreamingServer
+                        from ..mesmervisor.gpu_utils import EncoderType
+                        import threading
+                        import os
+                        from PyQt6.QtCore import Qt
+                        from ..mesmerloom.window_compositor import LoomWindowCompositor
+
+                        # Create a dedicated VR-only compositor for streaming.
+                        # The headset's per-eye native is often 1280x1440; allow explicit WxH.
+                        try:
+                            vr_stream_w = int(os.environ.get("MESMERGLASS_VR_STREAM_WIDTH", "0"))
+                        except Exception:
+                            vr_stream_w = 0
+                        try:
+                            vr_stream_h = int(os.environ.get("MESMERGLASS_VR_STREAM_HEIGHT", "0"))
+                        except Exception:
+                            vr_stream_h = 0
+                        if vr_stream_w <= 0 or vr_stream_h <= 0:
+                            try:
+                                vr_stream_side = int(os.environ.get("MESMERGLASS_VR_STREAM_SIDE", "1080"))
+                            except Exception:
+                                vr_stream_side = 1080
+                            if vr_stream_side <= 0:
+                                vr_stream_side = 1080
+                            vr_stream_w = vr_stream_side
+                            vr_stream_h = vr_stream_side
+
+                        if self._vr_hidden_compositor is None:
+                            spiral_director = self.compositor.director if self.compositor else None
+                            if spiral_director is None:
+                                raise RuntimeError("VR streaming requires an active primary compositor")
+                            self._vr_hidden_compositor = LoomWindowCompositor(
+                                director=spiral_director,
+                                text_director=self.visual_director.text_director,
+                                is_primary=False,
+                            )
+                            try:
+                                self.visual_director.register_secondary_compositor(self._vr_hidden_compositor)
+                            except Exception:
+                                pass
+                            try:
+                                text_director = getattr(self.visual_director, "text_director", None)
+                                if text_director and hasattr(text_director, "set_secondary_compositors"):
+                                    text_director.set_secondary_compositors(
+                                        self._secondary_compositors + [self._vr_hidden_compositor]
+                                    )
+                            except Exception:
+                                pass
+
+                        streaming_compositor = self._vr_hidden_compositor
+                        self._vr_streaming_compositor = streaming_compositor
+
+                        # Make the compositor window non-intrusive: offscreen + transparent.
+                        try:
+                            streaming_compositor.resize(vr_stream_w, vr_stream_h)
+                            streaming_compositor.setGeometry(-10000, -10000, vr_stream_w, vr_stream_h)
+                            streaming_compositor.setFlags(streaming_compositor.flags() | Qt.WindowType.Tool)
+                            streaming_compositor.setOpacity(0.0)
+                            if hasattr(streaming_compositor, "set_virtual_screen_size"):
+                                try:
+                                    streaming_compositor.set_virtual_screen_size(vr_stream_w, vr_stream_h)
+                                except Exception:
+                                    pass
+                            # VR-only media zoom tuning
+                            vr_zoom_mult_env = (os.environ.get("MESMERGLASS_VR_MEDIA_ZOOM_MULT") or "").strip()
+                            try:
+                                vr_zoom_mult = float(vr_zoom_mult_env) if vr_zoom_mult_env else 0.97
+                            except Exception:
+                                vr_zoom_mult = 0.97
+                            if hasattr(streaming_compositor, "set_background_zoom_multiplier"):
+                                try:
+                                    streaming_compositor.set_background_zoom_multiplier(vr_zoom_mult)
+                                except Exception:
+                                    pass
+                            streaming_compositor.set_active(True)
+                            streaming_compositor.show()
                         except Exception:
                             pass
-                        self.logger.info("[session] VR-only mode: minimized compositor window")
-                        self.logger.info("[session] VR-only mode: minimized compositor window")
-                        
-                except Exception as e:
-                    self.logger.error(f"[session] Failed to start VR streaming: {e}")
-                    import traceback
-                    traceback.print_exc()
+
+                        # Create frame cache (populated by Qt signal, consumed by streaming thread)
+                        self._vr_streaming_active = True
+                        self._vr_last_frame = None
+                        self._vr_frame_lock = threading.Lock()
+
+                        def capture_frame():
+                            """Return cached frame for VR streaming (called from streaming thread)"""
+                            if not self._vr_streaming_active:
+                                return None
+
+                            # Return cached frame (NEVER call GL functions from streaming thread)
+                            with self._vr_frame_lock:
+                                if self._vr_last_frame is not None:
+                                    frame = self._vr_last_frame.copy()  # Copy to avoid race conditions
+                                    return frame
+
+                            return None  # No frame available yet
+
+                        # Create streaming server with frame callback (square stream for VR)
+                        self.vr_streaming_server = VRStreamingServer(
+                            width=vr_stream_w,
+                            height=vr_stream_h,
+                            target_width=vr_stream_w,
+                            target_height=vr_stream_h,
+                            fps=30,
+                            encoder_type=EncoderType.AUTO,
+                            quality=25,  # Optimized for Oculus Go
+                            frame_callback=capture_frame,
+                        )
+                        self.logger.info(f"[session] VR streaming: target_resolution={vr_stream_w}x{vr_stream_h}")
+
+                        # Start streaming server (TCP 5555)
+                        self.vr_streaming_server.start_server()
+                        self.logger.info("[session] VR streaming server started on TCP port 5555")
+
+                        # Enable compositor-side capture; it will call us back from the Qt/GL thread.
+                        try:
+                            def on_vr_frame(frame):
+                                if not self._vr_streaming_active or frame is None:
+                                    return
+                                try:
+                                    with self._vr_frame_lock:
+                                        self._vr_last_frame = frame.copy()
+                                except Exception as e:  # pragma: no cover - defensive
+                                    self.logger.error(f"[session] VR frame cache error: {e}")
+
+                            streaming_compositor.enable_vr_streaming(on_vr_frame)
+                            self.logger.info("[session] VR streaming enabled on LoomCompositor")
+                            self.logger.info(
+                                f"[session] VR streaming: compositor size={streaming_compositor.width()}x{streaming_compositor.height()}"
+                            )
+                        except Exception as e:
+                            self.logger.warning(f"[session] Failed to enable compositor VR capture: {e}")
+
+                        # If VR-only mode (no monitors selected), minimize the compositor window
+                        if not monitor_displays:
+                            try:
+                                streaming_compositor.showMinimized()
+                            except Exception:
+                                pass
+                            self.logger.info("[session] VR-only mode: minimized compositor window")
+                            self.logger.info("[session] VR-only mode: minimized compositor window")
+
+                    except Exception as e:
+                        self.logger.error(f"[session] Failed to start VR streaming: {e}")
+                        import traceback
+
+                        traceback.print_exc()
         
         # Register cycle callback for cue transitions
         if not self._cue_callback_registered:
@@ -1131,7 +1200,7 @@ class SessionRunner:
             return False
         
         self._state = SessionState.PAUSED
-        self._pause_start_time = time.time()
+        self._pause_start_time = self._now()
         
         self.logger.info("[session] Session paused")
         
@@ -1163,7 +1232,7 @@ class SessionRunner:
         
         # Calculate pause duration
         if self._pause_start_time:
-            pause_duration = time.time() - self._pause_start_time
+            pause_duration = self._now() - self._pause_start_time
             self._total_paused_time += pause_duration
             self._pause_start_time = None
         
@@ -1467,7 +1536,7 @@ class SessionRunner:
         self._prefetched_cues.discard(cue_index)
         self._prefetch_backlog.discard(cue_index)
         self._current_cue_index = cue_index
-        self._cue_start_time = time.time()
+        self._cue_start_time = self._now()
         self._cue_start_cycle = self.visual_director.get_cycle_count()
         self._playback_history.clear()  # Reset history for new cue
         
@@ -1504,7 +1573,7 @@ class SessionRunner:
         
         # Track current playback for time-based switching
         self._current_playback_entry = playback_entry
-        self._playback_start_time = time.time()
+        self._playback_start_time = self._now()
         
         # Determine target duration (random between min and max in seconds)
         import random
@@ -2091,7 +2160,7 @@ class SessionRunner:
             return
         
         # Check if target duration has elapsed
-        elapsed = time.time() - self._playback_start_time
+        elapsed = self._now() - self._playback_start_time
         
         if elapsed >= self._playback_target_duration and not self._playback_switch_pending:
             # Duration reached - mark switch as pending and wait for next cycle boundary
@@ -2174,7 +2243,7 @@ class SessionRunner:
         
         # Update tracking and set new target duration
         self._current_playback_entry = playback_entry
-        self._playback_start_time = time.time()
+        self._playback_start_time = self._now()
         
         import random
         
@@ -2442,7 +2511,7 @@ class SessionRunner:
                 if success:
                     # Initialize fade state
                     self._transition_in_progress = True
-                    self._transition_start_time = time.time()
+                    self._transition_start_time = self._now()
                     self._transition_fade_alpha = 1.0  # Start fully showing old cue
                     
                     # Note: The fade will be updated in update() method
@@ -2467,7 +2536,7 @@ class SessionRunner:
             return
         
         # Calculate fade progress
-        elapsed = time.time() - self._transition_start_time
+        elapsed = self._now() - self._transition_start_time
         fade_duration_s = (self.cuelist.transition_duration_ms or 2000.0) / 1000.0
         
         # Calculate alpha (1.0 = old cue visible, 0.0 = new cue visible)
@@ -2636,11 +2705,11 @@ class SessionRunner:
         if not self._session_start_time:
             return 0.0
         
-        elapsed = time.time() - self._session_start_time - self._total_paused_time
+        elapsed = self._now() - self._session_start_time - self._total_paused_time
         
         # If currently paused, don't count current pause duration
         if self._state == SessionState.PAUSED and self._pause_start_time:
-            elapsed -= (time.time() - self._pause_start_time)
+            elapsed -= (self._now() - self._pause_start_time)
         
         return elapsed
     
@@ -2649,4 +2718,4 @@ class SessionRunner:
         if not self._cue_start_time:
             return 0.0
         
-        return time.time() - self._cue_start_time
+        return self._now() - self._cue_start_time

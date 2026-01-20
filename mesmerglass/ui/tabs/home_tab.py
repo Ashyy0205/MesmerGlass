@@ -15,7 +15,7 @@ from typing import Optional, Dict, Any
 from PyQt6.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QLabel, QGroupBox, QPushButton,
     QListWidget, QListWidgetItem, QSplitter, QWidget, QFileDialog,
-    QMessageBox, QInputDialog
+    QMessageBox, QInputDialog, QProgressDialog
 )
 from PyQt6.QtCore import Qt, QRect
 from PyQt6.QtGui import QImage, QPixmap
@@ -215,8 +215,119 @@ class HomeTab(BaseTab):
         btn_new = QPushButton("➕ New Cuelist")
         btn_new.clicked.connect(self._on_new_cuelist)
         layout.addWidget(btn_new)
+
+        # Export cuelist to MP4
+        btn_export = QPushButton("📼 Export Cuelist → MP4…")
+        btn_export.clicked.connect(self._on_export_cuelist_mp4)
+        btn_export.setToolTip("Render the currently loaded cuelist to an MP4 (60fps, 1920×1080).")
+        layout.addWidget(btn_export)
         
         return group
+
+    def _on_export_cuelist_mp4(self) -> None:
+        """Export the currently loaded cuelist to MP4 (video-only)."""
+        try:
+            runner_tab = getattr(self, "session_runner_tab", None)
+            cuelist = getattr(runner_tab, "cuelist", None)
+            if cuelist is None:
+                QMessageBox.warning(self, "Export MP4", "Load a cuelist first (Session Runner → Load Cuelist).")
+                return
+
+            # Don't export while an interactive session is running.
+            session_runner = getattr(runner_tab, "session_runner", None)
+            if session_runner is not None and getattr(session_runner, "is_running", lambda: False)():
+                QMessageBox.warning(self, "Export MP4", "Stop the current session before exporting.")
+                return
+
+            loop_mode = getattr(cuelist, "loop_mode", None)
+            loop_mode_value = getattr(loop_mode, "value", loop_mode)
+            if str(loop_mode_value).lower() in ("loop", "ping_pong"):
+                QMessageBox.warning(
+                    self,
+                    "Export MP4",
+                    "Looping cuelists are not supported for MP4 export yet (v1).\n\nSet Loop Mode to 'once' and try again.",
+                )
+                return
+
+            default_name = f"{getattr(cuelist, 'name', 'cuelist')}.mp4".replace("/", "-").replace("\\", "-")
+            out_path_str, _ = QFileDialog.getSaveFileName(
+                self,
+                "Export Cuelist to MP4",
+                default_name,
+                "MP4 Video (*.mp4);;All Files (*)",
+            )
+            if not out_path_str:
+                return
+            out_path = Path(out_path_str)
+            if out_path.suffix.lower() != ".mp4":
+                out_path = out_path.with_suffix(".mp4")
+
+            from mesmerglass.export.cuelist_mp4_exporter import CuelistMp4Exporter, Mp4ExportSettings
+
+            settings = Mp4ExportSettings(
+                output_path=out_path,
+                width=1920,
+                height=1080,
+                fps=60,
+                prefer_nvenc=True,
+            )
+
+            progress = QProgressDialog("Preparing export…", "Cancel", 0, 100, self)
+            progress.setWindowTitle("Export MP4")
+            progress.setMinimumDuration(0)
+            progress.setValue(0)
+            progress.setAutoClose(False)
+            progress.setAutoReset(False)
+
+            exporter = CuelistMp4Exporter(
+                cuelist=cuelist,
+                visual_director=getattr(self.main_window, "visual_director", None),
+                text_director=getattr(self.main_window, "text_director", None),
+                spiral_director=getattr(self.main_window, "spiral_director", None),
+                session_data=getattr(self, "session_data", None),
+                settings=settings,
+                parent=self,
+            )
+
+            if exporter._visual_director is None or exporter._text_director is None or exporter._spiral_director is None:
+                QMessageBox.critical(self, "Export MP4", "Missing engines (visual/text/spiral). Cannot export.")
+                return
+
+            self._active_exporter = exporter
+
+            def _on_progress(cur: int, total: int, label: str) -> None:
+                try:
+                    progress.setMaximum(max(1, int(total)))
+                    progress.setValue(int(cur))
+                    progress.setLabelText(f"{label}\n\n{cur}/{total} frames")
+                except Exception:
+                    pass
+
+            def _on_finished(success: bool, message: str) -> None:
+                try:
+                    progress.reset()
+                    progress.close()
+                except Exception:
+                    pass
+                try:
+                    self._active_exporter = None
+                except Exception:
+                    pass
+                if success:
+                    QMessageBox.information(self, "Export MP4", message)
+                else:
+                    QMessageBox.critical(self, "Export MP4", message)
+
+            exporter.progress_changed.connect(_on_progress)
+            exporter.finished.connect(_on_finished)
+            progress.canceled.connect(exporter.cancel)
+
+            exporter.start()
+            progress.show()
+
+        except Exception as exc:
+            self.logger.error("[home] Export MP4 failed: %s", exc, exc_info=True)
+            QMessageBox.critical(self, "Export MP4", f"Export failed: {exc}")
 
     def _create_preview_section(self) -> QGroupBox:
         """Create live preview section."""
