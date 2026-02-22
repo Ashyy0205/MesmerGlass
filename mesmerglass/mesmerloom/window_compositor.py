@@ -16,6 +16,7 @@ from OpenGL import GL
 import numpy as np
 from mesmerglass.logging_utils import BurstSampler
 from mesmerglass.engine.perf import perf_metrics
+from mesmerglass.session import perf_blockers
 
 # Windows-specific imports for forcing window to top
 if sys.platform == "win32":
@@ -73,6 +74,25 @@ class LoomWindowCompositor(QOpenGLWindow):
         # Compositor frame pacing instrumentation
         self._last_paint_t: float | None = None
 
+        # Paint/present attribution (used by SessionRunner frame spike logs)
+        self._paint_start_perf: float | None = None
+        self._paint_end_perf: float | None = None
+        try:
+            self._gl_paint_warn_ms = float(os.environ.get("MESMERGLASS_GL_PAINT_WARN_MS", "20"))
+        except Exception:
+            self._gl_paint_warn_ms = 20.0
+        try:
+            self._gl_present_warn_ms = float(os.environ.get("MESMERGLASS_GL_PRESENT_WARN_MS", "20"))
+        except Exception:
+            self._gl_present_warn_ms = 20.0
+
+        # QOpenGLWindow emits frameSwapped after buffers are presented.
+        # This lets us estimate "present wait" (vsync / DWM / driver stalls).
+        try:
+            self.frameSwapped.connect(self._on_frame_swapped)  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
         # GPU instrumentation (best-effort, compositor-context based)
         self._gpu_timer_supported = False
         self._gpu_query_ids: list[int] = []
@@ -104,6 +124,13 @@ class LoomWindowCompositor(QOpenGLWindow):
         self._last_background_error: Optional[str] = None
         self._last_background_render_frame = -1
         self._last_background_set_timestamp = 0.0
+
+        # Video texture pooling (reduces driver churn when switching rapidly).
+        # Textures are created on-demand and recycled after fade completion.
+        self._owned_video_textures: set[int] = set()
+        self._free_video_textures: list[int] = []
+        self._video_pool_width: int = 0
+        self._video_pool_height: int = 0
 
         # Fade transition support (for smooth image/video changes)
         self._fade_enabled = False
@@ -207,6 +234,26 @@ class LoomWindowCompositor(QOpenGLWindow):
         format.setSamples(0)  # No MSAA to avoid artifacts
         format.setAlphaBufferSize(8)  # Enable alpha buffer for transparency
         format.setSwapBehavior(QSurfaceFormat.SwapBehavior.DoubleBuffer)
+
+        # Allow toggling vsync/present pacing for debugging.
+        # 1 = vsync on (default), 0 = vsync off.
+        try:
+            swap_interval = int(os.environ.get("MESMERGLASS_GL_SWAP_INTERVAL", "1"))
+        except Exception:
+            swap_interval = 1
+
+        # Tearing on VRR-less displays reads as "bad frames"; keep vsync enabled unless
+        # the user explicitly opts into tearing.
+        if swap_interval <= 0 and os.environ.get("MESMERGLASS_GL_ALLOW_TEARING") != "1":
+            logger.warning(
+                "[gl] MESMERGLASS_GL_SWAP_INTERVAL=0 but MESMERGLASS_GL_ALLOW_TEARING!=1; forcing swapInterval=1"
+            )
+            swap_interval = 1
+        swap_interval = 1 if swap_interval >= 1 else 0
+        try:
+            format.setSwapInterval(swap_interval)
+        except Exception:
+            pass
         self.setFormat(format)
 
         # Ensure the native window is created so we can apply styles BEFORE first show/paint
@@ -483,6 +530,10 @@ class LoomWindowCompositor(QOpenGLWindow):
             logger.info(f"[spiral.trace] OpenGL vendor: {vendor}")
             try:
                 logger.info(f"[spiral.trace] Window format alphaBufferSize={self.format().alphaBufferSize()}")
+            except Exception:
+                pass
+            try:
+                logger.warning(f"[spiral.trace] Window format swapInterval={self.format().swapInterval()}")
             except Exception:
                 pass
             
@@ -870,6 +921,17 @@ class LoomWindowCompositor(QOpenGLWindow):
         if not self.initialized or not self.program_id or not self._active:
             return
 
+        self._paint_start_perf = time.perf_counter()
+        try:
+            split_paint = os.environ.get("MESMERGLASS_GL_PAINT_SPLIT") == "1"
+        except Exception:
+            split_paint = False
+        try:
+            paint_section_warn_ms = float(os.environ.get("MESMERGLASS_GL_PAINT_SECTION_WARN_MS", "6"))
+        except Exception:
+            paint_section_warn_ms = 6.0
+        t_section: dict[str, float] = {"t0": self._paint_start_perf}
+
         # Qt can recreate the underlying GL context (e.g., monitor changes, driver events).
         # In that case, previously created GL object IDs (including programs) become invalid
         # for the new context. Guard glUseProgram to avoid GL_INVALID_VALUE spam and try
@@ -942,6 +1004,7 @@ class LoomWindowCompositor(QOpenGLWindow):
         else:
             GL.glClearColor(0.0, 0.0, 0.0, 1.0)  # BLACK background for spiral visibility
         GL.glClear(GL.GL_COLOR_BUFFER_BIT)
+        t_section["clear"] = time.perf_counter()
         
         # Get window size for rendering
         try:
@@ -950,8 +1013,10 @@ class LoomWindowCompositor(QOpenGLWindow):
         except Exception as e:
             self._last_background_error = str(e)
             logger.error(f"[visual] Background render failed: {e}")
+        t_section["background"] = time.perf_counter()
 
         self.update_zoom_animation()
+        t_section["zoom"] = time.perf_counter()
         
         # Use spiral shader program
         GL.glUseProgram(self.program_id)
@@ -982,6 +1047,7 @@ class LoomWindowCompositor(QOpenGLWindow):
         except Exception as e:
             logger.warning(f"[spiral.trace] Director update failed: {e}")
             uniforms = {'uIntensity': 0.5}
+        t_section["director"] = time.perf_counter()
         
         # Set uniforms using the same approach as original compositor
         def _set1(name, val):
@@ -1064,6 +1130,7 @@ class LoomWindowCompositor(QOpenGLWindow):
                     _set1(k, float(v[0]) if v else 0.0)  # fallback to first element
             else: 
                 _set1(k, v)
+        t_section["uniforms"] = time.perf_counter()
         
         # Set QOpenGLWindow-specific defaults for transparency
         _seti('uInternalOpacity', 0)  # Use window transparency mode (not internal blending)
@@ -1086,6 +1153,7 @@ class LoomWindowCompositor(QOpenGLWindow):
         self.vao.bind()
         GL.glDrawElements(GL.GL_TRIANGLES, 6, GL.GL_UNSIGNED_INT, None)
         self.vao.release()
+        t_section["spiral_draw"] = time.perf_counter()
         
         GL.glUseProgram(0)
         
@@ -1103,6 +1171,7 @@ class LoomWindowCompositor(QOpenGLWindow):
             except Exception as e:
                 if self.frame_count <= 3:  # Only log errors on first few frames
                     logger.error(f"[text] Text rendering failed: {e}", exc_info=True)
+        t_section["text"] = time.perf_counter()
         
         # Log performance every 60 frames
         if self._trace and self.frame_count % self._log_interval == 0:
@@ -1121,6 +1190,7 @@ class LoomWindowCompositor(QOpenGLWindow):
                 GL.glBindFramebuffer(GL.GL_DRAW_FRAMEBUFFER, 0)
             except Exception:
                 pass
+        t_section["vr_blit"] = time.perf_counter()
 
         # GPU timing end (exclude readPixels/capture sync work)
         self._gpu_timer_end()
@@ -1147,10 +1217,96 @@ class LoomWindowCompositor(QOpenGLWindow):
         except Exception as e:
             if self.frame_count <= 3:
                 logger.error(f"[VR] Frame capture failed: {e}")
+            t_section["capture"] = time.perf_counter()
 
         # Notify listeners (duplicate/mirror windows) that a new frame is available
         try:
+            self._paint_end_perf = time.perf_counter()
+            if self._paint_start_perf is not None:
+                paint_ms = (self._paint_end_perf - self._paint_start_perf) * 1000.0
+                should_record_sections = bool(split_paint) or paint_ms >= float(self._gl_paint_warn_ms or 0.0)
+                if should_record_sections:
+                    try:
+                        w_px_rec, h_px_rec = int(w_px), int(h_px)
+                    except Exception:
+                        w_px_rec, h_px_rec = 0, 0
+                    try:
+                        perf_blockers.record(
+                            "gl.paint",
+                            paint_ms,
+                            is_primary=bool(getattr(self, "is_primary", True)),
+                            w_px=w_px_rec,
+                            h_px=h_px_rec,
+                        )
+                    except Exception:
+                        pass
+
+                    # Section breakdown (best-effort) so spike attribution can point to a specific stage.
+                    try:
+                        t0 = float(t_section.get("t0", self._paint_start_perf or 0.0))
+                        t_clear = float(t_section.get("clear", t0))
+                        t_background = float(t_section.get("background", t_clear))
+                        t_zoom = float(t_section.get("zoom", t_background))
+                        t_director = float(t_section.get("director", t_zoom))
+                        t_uniforms = float(t_section.get("uniforms", t_director))
+                        t_spiral_draw = float(t_section.get("spiral_draw", t_uniforms))
+                        t_text = float(t_section.get("text", t_spiral_draw))
+                        t_vr_blit = float(t_section.get("vr_blit", t_text))
+                        t_capture = float(t_section.get("capture", t_vr_blit))
+                        t_end = float(self._paint_end_perf)
+
+                        sections: list[tuple[str, float]] = [
+                            ("gl.paint.clear", (t_clear - t0) * 1000.0),
+                            ("gl.paint.background", (t_background - t_clear) * 1000.0),
+                            ("gl.paint.zoom", (t_zoom - t_background) * 1000.0),
+                            ("gl.paint.director", (t_director - t_zoom) * 1000.0),
+                            ("gl.paint.uniforms", (t_uniforms - t_director) * 1000.0),
+                            ("gl.paint.spiral_draw", (t_spiral_draw - t_uniforms) * 1000.0),
+                            ("gl.paint.text", (t_text - t_spiral_draw) * 1000.0),
+                            ("gl.paint.vr_blit", (t_vr_blit - t_text) * 1000.0),
+                            ("gl.paint.capture", (t_capture - t_vr_blit) * 1000.0),
+                            ("gl.paint.tail", (t_end - t_capture) * 1000.0),
+                        ]
+
+                        for op, dur_ms in sections:
+                            if dur_ms >= float(paint_section_warn_ms or 0.0):
+                                try:
+                                    perf_blockers.record(
+                                        op,
+                                        float(dur_ms),
+                                        is_primary=bool(getattr(self, "is_primary", True)),
+                                        w_px=w_px_rec,
+                                        h_px=h_px_rec,
+                                    )
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
             self.frame_drawn.emit()
+        except Exception:
+            pass
+
+    def _on_frame_swapped(self) -> None:
+        """Called after Qt swaps/presents the backbuffer."""
+        end = self._paint_end_perf
+        if end is None:
+            return
+        now = time.perf_counter()
+        present_ms = (now - end) * 1000.0
+        if present_ms < float(self._gl_present_warn_ms or 0.0):
+            return
+        try:
+            w_px, h_px = self._physical_window_size()
+        except Exception:
+            w_px, h_px = 0, 0
+        try:
+            perf_blockers.record(
+                "gl.present",
+                present_ms,
+                is_primary=bool(getattr(self, "is_primary", True)),
+                w_px=int(w_px),
+                h_px=int(h_px),
+            )
         except Exception:
             pass
     
@@ -1467,7 +1623,7 @@ class LoomWindowCompositor(QOpenGLWindow):
         if ctx_acquired:
             try:
                 if self._background_texture is not None and GL.glIsTexture(self._background_texture):
-                    GL.glDeleteTextures([self._background_texture])
+                    self._recycle_video_texture(self._background_texture)
             except Exception as exc:
                 logger.warning(f"[visual] Failed to delete background texture: {exc}")
             finally:
@@ -1492,7 +1648,28 @@ class LoomWindowCompositor(QOpenGLWindow):
         self._fade_duration = value
         self._fade_enabled = value > 0.0
         if not self._fade_enabled:
-            self._fade_queue.clear()
+            # Recycle queued fade textures (must be done on the GL thread/context).
+            previous_ctx = QOpenGLContext.currentContext()
+            previous_surface = previous_ctx.surface() if previous_ctx else None
+            ctx_acquired = False
+            try:
+                self.makeCurrent()
+                ctx_acquired = True
+            except Exception:
+                ctx_acquired = False
+
+            if ctx_acquired:
+                try:
+                    for item in list(self._fade_queue):
+                        self._recycle_video_texture(item.get('texture'))
+                    self._fade_queue.clear()
+                    self._recycle_video_texture(self._fade_old_texture)
+                except Exception:
+                    self._fade_queue.clear()
+                finally:
+                    self._restore_previous_context(previous_ctx, previous_surface)
+            else:
+                self._fade_queue.clear()
             self._fade_active = False
             logger.info("[fade] Disabled (instant transitions)")
         else:
@@ -1663,6 +1840,73 @@ class LoomWindowCompositor(QOpenGLWindow):
         
         # Update background zoom
         self._background_zoom = self._zoom_current
+
+    def _reset_video_texture_pool(self) -> None:
+        """Delete all compositor-owned video textures.
+
+        Must be called with a current GL context.
+        """
+        from OpenGL import GL
+
+        for tex_id in list(self._owned_video_textures):
+            try:
+                if tex_id and GL.glIsTexture(tex_id):
+                    GL.glDeleteTextures([tex_id])
+            except Exception:
+                pass
+        self._owned_video_textures.clear()
+        self._free_video_textures.clear()
+        self._video_pool_width = 0
+        self._video_pool_height = 0
+
+    def _acquire_video_texture(self) -> int:
+        """Acquire a texture id for video uploads (recycled if possible).
+
+        Must be called with a current GL context.
+        """
+        from OpenGL import GL
+
+        while self._free_video_textures:
+            tex_id = int(self._free_video_textures.pop())
+            try:
+                if tex_id and GL.glIsTexture(tex_id):
+                    return tex_id
+            except Exception:
+                continue
+
+        tex_id = int(GL.glGenTextures(1))
+        self._owned_video_textures.add(tex_id)
+        return tex_id
+
+    def _recycle_video_texture(self, texture_id: Optional[int]) -> None:
+        """Recycle a texture into the pool if it's compositor-owned."""
+        if texture_id is None:
+            return
+        try:
+            tex_id = int(texture_id)
+        except Exception:
+            return
+
+        if tex_id == self._background_texture:
+            return
+
+        from OpenGL import GL
+        try:
+            if not GL.glIsTexture(tex_id):
+                return
+        except Exception:
+            return
+
+        if tex_id in self._owned_video_textures:
+            if tex_id not in self._free_video_textures:
+                self._free_video_textures.append(tex_id)
+            return
+
+        # Fallback: non-owned texture ids are deleted immediately.
+        try:
+            GL.glDeleteTextures([tex_id])
+        except Exception:
+            pass
     
     def set_background_video_frame(self, frame_data, width: int, height: int, zoom: float = 1.0, new_video: bool = False) -> None:
         """Update background with video frame (efficient GPU upload).
@@ -1750,12 +1994,19 @@ class LoomWindowCompositor(QOpenGLWindow):
                 # NO DATA FLIP - test if videos are already correct
                 frame_data_flipped = frame_data
                 
+                # If resolution changes, reset our pool to avoid reusing mismatched storage.
+                if (
+                    (self._video_pool_width and self._video_pool_width != width)
+                    or (self._video_pool_height and self._video_pool_height != height)
+                ):
+                    self._reset_video_texture_pool()
+
                 # Create or reuse texture
                 needs_new_texture = (
-                    self._background_texture is None or 
-                    not GL.glIsTexture(self._background_texture) or
-                    self._background_image_width != width or 
-                    self._background_image_height != height
+                    self._background_texture is None
+                    or not GL.glIsTexture(self._background_texture)
+                    or self._background_image_width != width
+                    or self._background_image_height != height
                 )
                 
                 # Trigger fade transition if this is a new video and we have existing content
@@ -1789,21 +2040,56 @@ class LoomWindowCompositor(QOpenGLWindow):
                 upload_mode = "reuse"
                 upload_start = time.perf_counter()
                 prev_unpack_alignment = GL.glGetIntegerv(GL.GL_UNPACK_ALIGNMENT)
+                # Some drivers/backends leave row-length state dirty; force a safe baseline.
+                try:
+                    prev_unpack_row_length = GL.glGetIntegerv(GL.GL_UNPACK_ROW_LENGTH)
+                except Exception:
+                    prev_unpack_row_length = 0
+                try:
+                    prev_unpack_skip_rows = GL.glGetIntegerv(GL.GL_UNPACK_SKIP_ROWS)
+                except Exception:
+                    prev_unpack_skip_rows = 0
+                try:
+                    prev_unpack_skip_pixels = GL.glGetIntegerv(GL.GL_UNPACK_SKIP_PIXELS)
+                except Exception:
+                    prev_unpack_skip_pixels = 0
                 try:
                     GL.glPixelStorei(GL.GL_UNPACK_ALIGNMENT, 1)
+                    try:
+                        GL.glPixelStorei(GL.GL_UNPACK_ROW_LENGTH, 0)
+                        GL.glPixelStorei(GL.GL_UNPACK_SKIP_ROWS, 0)
+                        GL.glPixelStorei(GL.GL_UNPACK_SKIP_PIXELS, 0)
+                    except Exception:
+                        pass
 
+                    # Guard against pathological sizes.
+                    try:
+                        max_tex = int(GL.glGetIntegerv(GL.GL_MAX_TEXTURE_SIZE))
+                    except Exception:
+                        max_tex = 0
+                    if max_tex and (width > max_tex or height > max_tex):
+                        logger.error(
+                            "[video.upload] Frame %dx%d exceeds GL_MAX_TEXTURE_SIZE=%d; dropping",
+                            width,
+                            height,
+                            max_tex,
+                        )
+                        return
+
+                    active_tex = self._background_texture
                     if needs_new_texture:
-                        # Delete old texture if it exists and is NOT currently queued for fade
+                        # If we're not fading the old texture out, recycle it.
                         if (
                             self._background_texture is not None
                             and GL.glIsTexture(self._background_texture)
                             and not old_texture_enqueued_for_fade
                         ):
-                            GL.glDeleteTextures([self._background_texture])
-                        
-                        # Generate new texture
-                        self._background_texture = GL.glGenTextures(1)
-                        GL.glBindTexture(GL.GL_TEXTURE_2D, self._background_texture)
+                            self._recycle_video_texture(self._background_texture)
+
+                        # IMPORTANT: When fading, the old texture stays alive in the fade queue.
+                        # Upload the new clip into a different texture so we don't overwrite it.
+                        active_tex = self._acquire_video_texture()
+                        GL.glBindTexture(GL.GL_TEXTURE_2D, active_tex)
                         
                         # Set texture parameters
                         GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MIN_FILTER, GL.GL_LINEAR)
@@ -1824,23 +2110,70 @@ class LoomWindowCompositor(QOpenGLWindow):
                             frame_data_flipped
                         )
                         upload_mode = "glTexImage2D(new)"
-                        logger.debug(f"Created video texture {self._background_texture} ({width}x{height})")
+                        self._video_pool_width = width
+                        self._video_pool_height = height
+                        logger.debug(f"Created/reused video texture {active_tex} ({width}x{height})")
                     else:
-                        # Reuse existing texture (faster)
-                        GL.glBindTexture(GL.GL_TEXTURE_2D, self._background_texture)
-                        GL.glTexSubImage2D(
-                            GL.GL_TEXTURE_2D,
-                            0,  # Mipmap level
-                            0, 0,  # Offset
-                            width,
-                            height,
-                            GL.GL_RGB,
-                            GL.GL_UNSIGNED_BYTE,
-                            frame_data_flipped
-                        )
-                        upload_mode = "glTexSubImage2D(reuse)"
+                        # Reuse existing texture (faster) but verify backing storage.
+                        GL.glBindTexture(GL.GL_TEXTURE_2D, active_tex)
+                        try:
+                            tex_w = int(GL.glGetTexLevelParameteriv(GL.GL_TEXTURE_2D, 0, GL.GL_TEXTURE_WIDTH))
+                            tex_h = int(GL.glGetTexLevelParameteriv(GL.GL_TEXTURE_2D, 0, GL.GL_TEXTURE_HEIGHT))
+                        except Exception:
+                            tex_w, tex_h = width, height
+                        if tex_w != width or tex_h != height:
+                            GL.glTexImage2D(
+                                GL.GL_TEXTURE_2D,
+                                0,
+                                GL.GL_RGB,
+                                width,
+                                height,
+                                0,
+                                GL.GL_RGB,
+                                GL.GL_UNSIGNED_BYTE,
+                                frame_data_flipped,
+                            )
+                            upload_mode = f"glTexImage2D(realloc {tex_w}x{tex_h})"
+                        else:
+                            try:
+                                GL.glTexSubImage2D(
+                                    GL.GL_TEXTURE_2D,
+                                    0,  # Mipmap level
+                                    0,
+                                    0,  # Offset
+                                    width,
+                                    height,
+                                    GL.GL_RGB,
+                                    GL.GL_UNSIGNED_BYTE,
+                                    frame_data_flipped,
+                                )
+                                upload_mode = "glTexSubImage2D(reuse)"
+                            except Exception:
+                                # Some driver/context-recreation paths can leave a texture name
+                                # "valid" but without storage. Reallocate and keep going.
+                                GL.glTexImage2D(
+                                    GL.GL_TEXTURE_2D,
+                                    0,
+                                    GL.GL_RGB,
+                                    width,
+                                    height,
+                                    0,
+                                    GL.GL_RGB,
+                                    GL.GL_UNSIGNED_BYTE,
+                                    frame_data_flipped,
+                                )
+                                upload_mode = "glTexImage2D(fallback after sub)"
                 finally:
                     GL.glPixelStorei(GL.GL_UNPACK_ALIGNMENT, prev_unpack_alignment)
+                    try:
+                        GL.glPixelStorei(GL.GL_UNPACK_ROW_LENGTH, int(prev_unpack_row_length))
+                        GL.glPixelStorei(GL.GL_UNPACK_SKIP_ROWS, int(prev_unpack_skip_rows))
+                        GL.glPixelStorei(GL.GL_UNPACK_SKIP_PIXELS, int(prev_unpack_skip_pixels))
+                    except Exception:
+                        pass
+
+                # Commit active texture after upload.
+                self._background_texture = active_tex
 
                 upload_ms = (time.perf_counter() - upload_start) * 1000.0
                 if upload_ms >= _VIDEO_UPLOAD_WARN_MS:
@@ -2063,7 +2396,7 @@ void main() {
         # Remove fully faded textures from queue
         # CRITICAL: Delete expired textures before removing from queue (memory leak fix!)
         cleanup_start = time.perf_counter()
-        textures_to_delete = []
+        textures_to_recycle: list[int] = []
         new_queue = []
         for item in self._fade_queue:
             start_frame = _resolve_start_frame(item)
@@ -2071,19 +2404,20 @@ void main() {
             if fade_duration_frames > 0.0 and frames_elapsed < fade_duration_frames:
                 new_queue.append(item)
             else:
-                # Texture has faded out - delete it
-                textures_to_delete.append(item['texture'])
+                # Texture has faded out - recycle it
+                try:
+                    textures_to_recycle.append(int(item['texture']))
+                except Exception:
+                    pass
         
         self._fade_queue = new_queue
         
-        # Delete expired textures
-        for texture_id in textures_to_delete:
+        # Recycle expired textures
+        for texture_id in textures_to_recycle:
             try:
-                if GL.glIsTexture(texture_id):
-                    GL.glDeleteTextures([texture_id])
-                    logger.debug(f"[visual] Deleted expired fade texture {texture_id}")
+                self._recycle_video_texture(texture_id)
             except Exception as e:
-                logger.warning(f"[visual] Failed to delete expired fade texture: {e}")
+                logger.warning(f"[visual] Failed to recycle expired fade texture: {e}")
         cleanup_ms = (time.perf_counter() - cleanup_start) * 1000.0
         if cleanup_ms >= _FADE_CLEANUP_WARN_MS:
             self._record_fade_perf_event("cleanup", cleanup_ms, queue_size=len(self._fade_queue))
@@ -2108,14 +2442,12 @@ void main() {
             # End fade when complete
             if self._fade_progress >= 1.0:
                 self._fade_active = False
-                # CRITICAL: Delete old texture after fade completes (memory leak fix!)
+                # Recycle old texture after fade completes.
                 if self._fade_old_texture is not None:
                     try:
-                        if GL.glIsTexture(self._fade_old_texture):
-                            GL.glDeleteTextures([self._fade_old_texture])
-                            logger.debug(f"[visual] Deleted old texture {self._fade_old_texture} after fade")
+                        self._recycle_video_texture(self._fade_old_texture)
                     except Exception as e:
-                        logger.warning(f"[visual] Failed to delete old fade texture: {e}")
+                        logger.warning(f"[visual] Failed to recycle old fade texture: {e}")
                 self._fade_old_texture = None
                 elapsed_seconds = frames_elapsed / 60.0
                 logger.info(f"[fade] Fade complete after {elapsed_seconds:.2f}s")

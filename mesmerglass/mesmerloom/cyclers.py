@@ -6,6 +6,8 @@ for building complex visual programs with precise frame-level control.
 """
 
 from abc import ABC, abstractmethod
+import os
+import time
 from typing import Callable, List, Optional
 
 
@@ -89,6 +91,31 @@ class ActionCycler(Cycler):
         self.repeat_count = repeat_count
         self._frame = 0
         self._executions = 0
+
+        # Best-effort perf attribution for heavy action callbacks.
+        # This is intentionally lightweight and only records when an action call is slow.
+        try:
+            self._action_warn_ms = float(os.environ.get("MESMERGLASS_CYCLER_ACTION_WARN_MS", "6"))
+        except Exception:
+            self._action_warn_ms = 6.0
+
+        self._action_name = self._resolve_action_name(action)
+
+    @staticmethod
+    def _resolve_action_name(action: Callable[[], None]) -> str:
+        try:
+            # functools.partial
+            target = getattr(action, "func", None) or action
+            name = getattr(target, "__qualname__", None) or getattr(target, "__name__", None)
+            if not name:
+                name = target.__class__.__qualname__
+            name = str(name)
+        except Exception:
+            name = "action"
+        # Keep it compact/stable for logs.
+        if len(name) > 96:
+            name = name[:96] + "…"
+        return name
     
     def advance(self) -> None:
         """Advance by one frame, execute action if at period boundary."""
@@ -98,7 +125,21 @@ class ActionCycler(Cycler):
             if frames_since_offset % self.period == 0:
                 # Check repeat limit
                 if self.repeat_count is None or self._executions < self.repeat_count:
+                    t0 = time.perf_counter()
                     self.action()
+                    dt_ms = (time.perf_counter() - t0) * 1000.0
+                    if dt_ms >= float(self._action_warn_ms or 0.0):
+                        try:
+                            from mesmerglass.session import perf_blockers
+
+                            perf_blockers.record(
+                                "visual.cycler.action",
+                                float(dt_ms),
+                                name=self._action_name,
+                                period=int(self.period),
+                            )
+                        except Exception:
+                            pass
                     self._executions += 1
         
         self._frame += 1

@@ -20,12 +20,23 @@ import time
 from pathlib import Path
 from typing import Optional, Tuple, Callable
 from dataclasses import dataclass
-from collections import deque
+from collections import deque, OrderedDict
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
 VIDEO_IO_LOCK = threading.Lock()
+
+
+def _normalize_path(path: str | Path) -> Path:
+    path_obj = path if isinstance(path, Path) else Path(path)
+    try:
+        return path_obj.resolve()
+    except Exception:
+        try:
+            return path_obj.absolute()
+        except Exception:
+            return path_obj
 
 
 def _read_env_int(name: str, default: int) -> int:
@@ -50,6 +61,188 @@ def _read_env_float(name: str, default: float) -> float:
 
 VIDEO_PREFILL_FRAME_LIMIT = max(0, _read_env_int("MESMERGLASS_VIDEO_PREFILL_FRAMES", 48))
 VIDEO_PREFILL_BUDGET_MS = max(0.0, _read_env_float("MESMERGLASS_VIDEO_PREFILL_MAX_MS", 12.0))
+
+# Decoder reuse cache (helps when cycling among a small set of clips).
+# Keeps cv2.VideoCapture handles open to avoid repeated open/close stalls.
+VIDEO_DECODER_CACHE_MAX = max(0, _read_env_int("MESMERGLASS_VIDEO_DECODER_CACHE", 4))
+_DECODER_CACHE_LOCK = threading.Lock()
+_DECODER_CACHE: "OrderedDict[Path, VideoDecoder]" = OrderedDict()  # type: ignore[name-defined]
+
+# Warmup pacing / backpressure to avoid starving the UI thread during rapid cycling.
+VIDEO_WARMUP_QUEUE_MAX = max(
+    0,
+    _read_env_int(
+        "MESMERGLASS_VIDEO_WARMUP_QUEUE_MAX",
+        max(8, VIDEO_DECODER_CACHE_MAX * 4),
+    ),
+)
+VIDEO_WARMUP_YIELD_S = max(0.0, _read_env_float("MESMERGLASS_VIDEO_WARMUP_YIELD_MS", 1.0) / 1000.0)
+
+# Background warmup: pre-open decoders off the UI thread and place them into the cache.
+_DECODER_WARM_QUEUE: deque[Path] = deque()
+_DECODER_WARM_SET: set[Path] = set()
+_DECODER_WARM_LOCK = threading.Lock()
+_DECODER_WARM_EVENT = threading.Event()
+_DECODER_WARM_THREAD: Optional[threading.Thread] = None
+
+
+def queue_decoder_warmup(path: str | Path, *, priority: bool = False) -> None:
+    """Schedule a decoder open in the background.
+
+    This is a best-effort optimization to reduce stalls when cycling videos
+    quickly (e.g., every ~0.7s). It is safe to call frequently; requests are
+    deduplicated.
+    """
+    if VIDEO_DECODER_CACHE_MAX <= 0:
+        return
+
+    try:
+        path_obj = _normalize_path(path)
+    except Exception:
+        return
+
+    global _DECODER_WARM_THREAD
+    with _DECODER_WARM_LOCK:
+        if priority:
+            # Focus warmup bandwidth on the currently requested clip.
+            # This prevents large media banks from flooding the warmup queue and
+            # starving the actual pending switch.
+            _DECODER_WARM_QUEUE.clear()
+            _DECODER_WARM_SET.clear()
+        if VIDEO_WARMUP_QUEUE_MAX > 0 and len(_DECODER_WARM_QUEUE) >= VIDEO_WARMUP_QUEUE_MAX:
+            return
+        if path_obj in _DECODER_WARM_SET:
+            if priority:
+                try:
+                    _DECODER_WARM_QUEUE.remove(path_obj)
+                    _DECODER_WARM_QUEUE.appendleft(path_obj)
+                except Exception:
+                    pass
+                _DECODER_WARM_EVENT.set()
+            return
+        # If already cached, don't bother.
+        with _DECODER_CACHE_LOCK:
+            if path_obj in _DECODER_CACHE:
+                return
+
+        _DECODER_WARM_SET.add(path_obj)
+        if priority:
+            _DECODER_WARM_QUEUE.appendleft(path_obj)
+        else:
+            _DECODER_WARM_QUEUE.append(path_obj)
+        _DECODER_WARM_EVENT.set()
+
+        if _DECODER_WARM_THREAD is None or not _DECODER_WARM_THREAD.is_alive():
+            _DECODER_WARM_THREAD = threading.Thread(
+                target=_decoder_warmup_worker,
+                name="VideoDecoderWarmup",
+                daemon=True,
+            )
+            _DECODER_WARM_THREAD.start()
+
+
+def _decoder_warmup_worker() -> None:
+    while True:
+        _DECODER_WARM_EVENT.wait()
+
+        while True:
+            with _DECODER_WARM_LOCK:
+                if not _DECODER_WARM_QUEUE:
+                    _DECODER_WARM_EVENT.clear()
+                    break
+                path_obj = _DECODER_WARM_QUEUE.popleft()
+                _DECODER_WARM_SET.discard(path_obj)
+
+            with _DECODER_CACHE_LOCK:
+                if path_obj in _DECODER_CACHE:
+                    continue
+
+            try:
+                decoder = VideoDecoder(path_obj)
+            except Exception:
+                continue
+
+            try:
+                if getattr(decoder, "success", False):
+                    _return_cached_decoder(decoder)
+                else:
+                    decoder.close()
+            except Exception:
+                try:
+                    decoder.close()
+                except Exception:
+                    pass
+
+            # Be polite to the main thread: let Qt and the render loop run.
+            try:
+                if VIDEO_WARMUP_YIELD_S > 0:
+                    time.sleep(VIDEO_WARMUP_YIELD_S)
+                else:
+                    time.sleep(0)
+            except Exception:
+                pass
+
+
+def _checkout_cached_decoder(path: Path) -> Optional["VideoDecoder"]:  # type: ignore[name-defined]
+    if VIDEO_DECODER_CACHE_MAX <= 0:
+        return None
+    try:
+        path = _normalize_path(path)
+    except Exception:
+        pass
+    with _DECODER_CACHE_LOCK:
+        decoder = _DECODER_CACHE.pop(path, None)
+    if decoder is None:
+        return None
+    try:
+        decoder.reset()
+    except Exception:
+        try:
+            decoder.close()
+        except Exception:
+            pass
+        return None
+    return decoder
+
+
+def _return_cached_decoder(decoder: "VideoDecoder") -> None:  # type: ignore[name-defined]
+    if VIDEO_DECODER_CACHE_MAX <= 0:
+        try:
+            decoder.close()
+        except Exception:
+            pass
+        return
+
+    # Only cache streamable video decoders; GIFs are already fully in-memory.
+    if not getattr(decoder, "success", False) or getattr(decoder, "format", "") != "video":
+        try:
+            decoder.close()
+        except Exception:
+            pass
+        return
+
+    path = getattr(decoder, "path", None)
+    if not isinstance(path, Path):
+        try:
+            decoder.close()
+        except Exception:
+            pass
+        return
+
+    try:
+        path = _normalize_path(path)
+    except Exception:
+        pass
+
+    with _DECODER_CACHE_LOCK:
+        _DECODER_CACHE[path] = decoder
+        _DECODER_CACHE.move_to_end(path)
+        while len(_DECODER_CACHE) > VIDEO_DECODER_CACHE_MAX:
+            _, evicted = _DECODER_CACHE.popitem(last=False)
+            try:
+                evicted.close()
+            except Exception:
+                pass
 
 
 @dataclass
@@ -81,7 +274,7 @@ class VideoDecoder:
             FileNotFoundError: If file doesn't exist
             ValueError: If file format unsupported
         """
-        self.path = Path(path)
+        self.path = _normalize_path(path)
         if not self.path.exists():
             raise FileNotFoundError(f"Video file not found: {path}")
         
@@ -353,6 +546,11 @@ class VideoStreamer:
         self._loader_thread: Optional[threading.Thread] = None
         self._loader_running = False
         self._loader_done = threading.Event()
+
+        # Avoid holding the main streamer lock while decoding frames.
+        # When set to "current" or "next", the async loader will not fill that
+        # buffer (so the decoder isn't driven concurrently from multiple threads).
+        self._prefill_active: Optional[str] = None
         
         # Cleanup
         self._old_decoder: Optional[VideoDecoder] = None
@@ -360,7 +558,14 @@ class VideoStreamer:
         
         logger.info(f"[VideoStreamer] Initialized with buffer_size={buffer_size}")
     
-    def load_video(self, path: str | Path, preload: bool = False, *, prefill_frames: Optional[int] = None) -> bool:
+    def load_video(
+        self,
+        path: str | Path,
+        preload: bool = False,
+        *,
+        prefill_frames: Optional[int] = None,
+        allow_async_open: bool = True,
+    ) -> bool:
         """Load video into streamer.
         
         Args:
@@ -373,65 +578,104 @@ class VideoStreamer:
             True if load successful
         """
         try:
-            decoder = VideoDecoder(path)
+            path_obj = _normalize_path(path)
+            decoder = _checkout_cached_decoder(path_obj)
+            if decoder is None:
+                # Opening cv2.VideoCapture can stall for 100ms+ on some systems.
+                # For runtime cycling we prefer to warm up off the UI thread.
+                if allow_async_open:
+                    try:
+                        queue_decoder_warmup(path_obj, priority=True)
+                    except Exception:
+                        pass
+                    return False
+                decoder = VideoDecoder(path_obj)
             
             if not decoder.success:
                 logger.error(f"[VideoStreamer] Failed to decode: {path}")
                 return False
             
             target_buffer = self._next if preload else self._current
+            target_name = "next" if preload else "current"
 
-            max_prefill = self.buffer_size if prefill_frames is None else max(1, min(prefill_frames, self.buffer_size))
+            max_prefill = (
+                self.buffer_size
+                if prefill_frames is None
+                else max(0, min(int(prefill_frames), self.buffer_size))
+            )
             env_prefill_limit = VIDEO_PREFILL_FRAME_LIMIT
             env_limit_active = env_prefill_limit > 0 and env_prefill_limit < max_prefill
             prefill_cap = min(max_prefill, env_prefill_limit) if env_limit_active else max_prefill
-            prefill_cap = max(1, prefill_cap)
+            prefill_cap = max(0, prefill_cap)
             prefill_budget_ms = VIDEO_PREFILL_BUDGET_MS
             prefill_start = time.perf_counter()
             clipped_by_budget = False
 
+            # Swap decoder/buffer state under lock, but decode frames outside the lock.
             with self._lock:
+                self._prefill_active = target_name if prefill_cap > 0 else None
+
                 # Store old decoder for cleanup
                 if target_buffer.decoder is not None:
                     self._old_decoder = target_buffer.decoder
-                
+
                 target_buffer.decoder = decoder
                 target_buffer.frames.clear()
                 target_buffer.begin = 0
                 target_buffer.size = 0
                 target_buffer.end = False
-                
-                # Pre-fill limited number of frames on caller thread to avoid UI stalls
-                while not target_buffer.end and target_buffer.size < prefill_cap:
-                    frame = decoder.next_frame()
-                    if frame is not None:
-                        target_buffer.frames.append(frame)
-                        target_buffer.size += 1
-                    else:
-                        target_buffer.end = True
-                        break
 
+            # Pre-fill limited number of frames on caller thread.
+            # IMPORTANT: Do not hold self._lock while decoding; decoder.next_frame()
+            # can stall (IO/codec) and would block get_current_frame() on the UI thread.
+            if prefill_cap > 0:
+                while True:
                     if prefill_budget_ms > 0:
                         elapsed_ms = (time.perf_counter() - prefill_start) * 1000.0
                         if elapsed_ms >= prefill_budget_ms:
                             clipped_by_budget = True
                             break
-                
-                logger.info(f"[VideoStreamer] Loaded {path.name if isinstance(path, Path) else Path(path).name} - "
-                           f"buffered {target_buffer.size} frames (prefill cap={prefill_cap}), end={target_buffer.end}")
 
-                elapsed_ms = (time.perf_counter() - prefill_start) * 1000.0
-                frame_limit_hit = env_limit_active and not target_buffer.end and target_buffer.size >= prefill_cap
-                if clipped_by_budget or frame_limit_hit:
-                    reason = "budget" if clipped_by_budget else "frame_limit"
-                    logger.warning(
-                        "[visual.perf] video.prefill clipped (%s): %.2fms, frames=%d, limit=%s, budget=%s",
-                        reason,
-                        elapsed_ms,
-                        target_buffer.size,
-                        str(env_prefill_limit) if env_prefill_limit > 0 else "n/a",
-                        f"{prefill_budget_ms:.1f}ms" if prefill_budget_ms > 0 else "disabled",
-                    )
+                    frame = decoder.next_frame()
+
+                    with self._lock:
+                        # If another load replaced the decoder, stop prefill.
+                        if target_buffer.decoder is not decoder:
+                            break
+
+                        if target_buffer.end or target_buffer.size >= prefill_cap:
+                            break
+
+                        if frame is None:
+                            target_buffer.end = True
+                            break
+
+                        target_buffer.frames.append(frame)
+                        target_buffer.size += 1
+
+            with self._lock:
+                if self._prefill_active == target_name:
+                    self._prefill_active = None
+                buffered_frames = int(target_buffer.size)
+                buffered_end = bool(target_buffer.end)
+
+            logger.info(
+                f"[VideoStreamer] Loaded {path_obj.name} - buffered {buffered_frames} frames "
+                f"(prefill cap={prefill_cap}), end={buffered_end}"
+            )
+
+            elapsed_ms = (time.perf_counter() - prefill_start) * 1000.0
+            frame_limit_hit = env_limit_active and (not buffered_end) and buffered_frames >= prefill_cap
+            if clipped_by_budget or frame_limit_hit:
+                reason = "budget" if clipped_by_budget else "frame_limit"
+                logger.warning(
+                    "[visual.perf] video.prefill clipped (%s): %.2fms, frames=%d, limit=%s, budget=%s",
+                    reason,
+                    elapsed_ms,
+                    buffered_frames,
+                    str(env_prefill_limit) if env_prefill_limit > 0 else "n/a",
+                    f"{prefill_budget_ms:.1f}ms" if prefill_budget_ms > 0 else "disabled",
+                )
             
             # Start async loader thread if not running
             if not self._loader_running:
@@ -569,46 +813,76 @@ class VideoStreamer:
         try:
             while self._loader_running:
                 try:
-                    # Cleanup old decoder/frames
+                    # Cleanup old decoder/frames (do heavy work outside lock)
+                    old_decoder: Optional[VideoDecoder] = None
                     with self._lock:
                         if self._old_decoder is not None:
-                            self._old_decoder.close()
+                            old_decoder = self._old_decoder
                             self._old_decoder = None
-                        
+
                         if self._old_frames:
                             self._old_frames.popleft()  # Gradual cleanup
 
-                    if not self._loader_running:
-                        break
-                    
-                    # Fill current buffer if not full
-                    with self._lock:
-                        if (self._current.decoder is not None and 
-                            not self._current.end and 
-                            self._current.size < self.buffer_size):
-                            
-                            frame = self._current.decoder.next_frame()
-                            if frame is not None:
-                                self._current.frames.append(frame)
-                                self._current.size += 1
-                            else:
-                                self._current.end = True
+                    if old_decoder is not None:
+                        _return_cached_decoder(old_decoder)
 
                     if not self._loader_running:
                         break
                     
-                    # Fill next buffer if not full
+                    # Fill current buffer if not full (decode outside lock)
+                    current_decoder: Optional[VideoDecoder] = None
                     with self._lock:
-                        if (self._next.decoder is not None and 
-                            not self._next.end and 
-                            self._next.size < self.buffer_size):
-                            
-                            frame = self._next.decoder.next_frame()
-                            if frame is not None:
-                                self._next.frames.append(frame)
-                                self._next.size += 1
-                            else:
-                                self._next.end = True
+                        if (
+                            self._prefill_active != "current"
+                            and self._current.decoder is not None
+                            and not self._current.end
+                            and self._current.size < self.buffer_size
+                        ):
+                            current_decoder = self._current.decoder
+
+                    if current_decoder is not None:
+                        frame = current_decoder.next_frame()
+                        with self._lock:
+                            if (
+                                self._prefill_active != "current"
+                                and self._current.decoder is current_decoder
+                                and not self._current.end
+                                and self._current.size < self.buffer_size
+                            ):
+                                if frame is not None:
+                                    self._current.frames.append(frame)
+                                    self._current.size += 1
+                                else:
+                                    self._current.end = True
+
+                    if not self._loader_running:
+                        break
+                    
+                    # Fill next buffer if not full (decode outside lock)
+                    next_decoder: Optional[VideoDecoder] = None
+                    with self._lock:
+                        if (
+                            self._prefill_active != "next"
+                            and self._next.decoder is not None
+                            and not self._next.end
+                            and self._next.size < self.buffer_size
+                        ):
+                            next_decoder = self._next.decoder
+
+                    if next_decoder is not None:
+                        frame = next_decoder.next_frame()
+                        with self._lock:
+                            if (
+                                self._prefill_active != "next"
+                                and self._next.decoder is next_decoder
+                                and not self._next.end
+                                and self._next.size < self.buffer_size
+                            ):
+                                if frame is not None:
+                                    self._next.frames.append(frame)
+                                    self._next.size += 1
+                                else:
+                                    self._next.end = True
                     
                     # Sleep to avoid spinning (Trance uses 1ms)
                     time.sleep(0.001)

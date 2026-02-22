@@ -59,7 +59,7 @@ class SimpleVideoStreamer:
             "auto" if prefill_frames is None else prefill_frames,
         )
     
-    def load_video(self, path: str | Path) -> bool:
+    def load_video(self, path: str | Path, *, allow_async_open: bool = True) -> bool:
         """Load video for playback.
         
         Args:
@@ -69,7 +69,12 @@ class SimpleVideoStreamer:
             True if successful
         """
         path = Path(path)
-        result = self._streamer.load_video(path, preload=False, prefill_frames=self._prefill_frames)
+        result = self._streamer.load_video(
+            path,
+            preload=False,
+            prefill_frames=self._prefill_frames,
+            allow_async_open=allow_async_open,
+        )
         
         if result:
             self._current_video_path = path

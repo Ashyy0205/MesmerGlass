@@ -15,7 +15,9 @@ import subprocess
 import time
 import zlib
 from collections import deque
-from typing import Callable, Optional, Protocol
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Callable, Optional, Protocol
 
 from PyQt6.QtCore import Qt, QTimer, QSize
 from PyQt6.QtWidgets import (
@@ -23,6 +25,8 @@ from PyQt6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QFileDialog,
+    QMessageBox,
     QStyle,
     QTabWidget,
     QToolButton,
@@ -47,6 +51,38 @@ from mesmerglass.engine.streaming_telemetry import StreamingClientSnapshot, Stre
 
 class _AudioLike(Protocol):
     def memory_usage_bytes(self) -> dict:
+        ...
+
+
+class _SessionRunnerLike(Protocol):
+    def is_running(self) -> bool:
+        ...
+
+    def get_current_cue_index(self) -> int:
+        ...
+
+    def get_current_cue_name(self) -> Optional[str]:
+        ...
+
+    def get_current_playback_label(self) -> Optional[str]:
+        ...
+
+    def get_current_playback_path(self) -> Optional[str]:
+        ...
+
+
+class _SessionRunnerTabLike(Protocol):
+    session_started: Any
+    session_stopped: Any
+    session_paused: Any
+    session_resumed: Any
+
+    @property
+    def cuelist(self) -> Any:
+        ...
+
+    @property
+    def session_runner(self) -> Any:
         ...
 
 
@@ -101,6 +137,15 @@ class PerformancePage(QWidget):
         self._timer.setInterval(int(refresh_interval_ms))
         self._timer.timeout.connect(self._refresh_all)
         self.destroyed.connect(lambda *_: self._timer.stop())
+
+        # Session-run export capture.
+        self._runner_tab: _SessionRunnerTabLike | None = None
+        self._capture_active = False
+        self._capture_started_wall: float | None = None
+        self._capture_ended_wall: float | None = None
+        self._capture_samples: list[dict[str, Any]] = []
+        self._last_run_samples: list[dict[str, Any]] = []
+        self._last_run_meta: dict[str, Any] = {}
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 10, 10, 10)
@@ -164,6 +209,24 @@ class PerformancePage(QWidget):
         metrics_layout.addWidget(self.lab_warn, 2, 1)
 
         local_layout.addWidget(metrics_box)
+
+        export_box = QGroupBox("Cuelist Run — Export")
+        export_layout = QHBoxLayout(export_box)
+        export_layout.setContentsMargins(8, 8, 8, 8)
+        export_layout.setSpacing(8)
+        self._lab_run_export = QLabel("No completed run captured yet.")
+        self._lab_run_export.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        export_layout.addWidget(self._lab_run_export, 1)
+        self._btn_export_run = QToolButton()
+        self._btn_export_run.setText("Export Run Stats…")
+        self._btn_export_run.setToolTip(
+            "Write a text report for the most recently completed cuelist run,\n"
+            "including FPS/CPU/GPU/RAM/stalls/latency and active playback per sample."
+        )
+        self._btn_export_run.clicked.connect(self._on_export_run_stats)
+        self._btn_export_run.setEnabled(False)
+        export_layout.addWidget(self._btn_export_run, 0)
+        local_layout.addWidget(export_box)
 
         # Local charts focus state: one plot can be maximized at a time.
         self._local_focus: str | None = None
@@ -463,6 +526,238 @@ class PerformancePage(QWidget):
         self._timer.start()
         self._refresh_all()
 
+    def bind_session_runner_tab(self, runner_tab: _SessionRunnerTabLike) -> None:
+        """Bind to SessionRunnerTab lifecycle so we can capture per-run logs."""
+        self._runner_tab = runner_tab
+        try:
+            runner_tab.session_started.connect(self._on_session_started)
+            runner_tab.session_stopped.connect(self._on_session_stopped)
+        except Exception:
+            # Best-effort binding.
+            self._runner_tab = None
+
+    def _on_session_started(self) -> None:
+        self._capture_active = True
+        self._capture_started_wall = time.time()
+        self._capture_ended_wall = None
+        self._capture_samples = []
+        try:
+            cuelist = getattr(self._runner_tab, "cuelist", None) if self._runner_tab else None
+            cuelist_name = str(getattr(cuelist, "name", "")) if cuelist else ""
+        except Exception:
+            cuelist_name = ""
+        self._lab_run_export.setText(f"Capturing run… {cuelist_name}" if cuelist_name else "Capturing run…")
+        self._btn_export_run.setEnabled(False)
+
+    def _on_session_stopped(self) -> None:
+        if self._capture_active:
+            self._capture_active = False
+            self._capture_ended_wall = time.time()
+            self._last_run_samples = list(self._capture_samples)
+
+            cuelist = getattr(self._runner_tab, "cuelist", None) if self._runner_tab else None
+            cuelist_name = str(getattr(cuelist, "name", "")) if cuelist else ""
+            duration_s = None
+            if self._capture_started_wall is not None and self._capture_ended_wall is not None:
+                duration_s = max(0.0, float(self._capture_ended_wall - self._capture_started_wall))
+            self._last_run_meta = {
+                "cuelist": cuelist_name,
+                "started_wall": self._capture_started_wall,
+                "ended_wall": self._capture_ended_wall,
+                "duration_wall_s": duration_s,
+                "sample_count": len(self._last_run_samples),
+                "sample_interval_ms": int(self._timer.interval()),
+            }
+
+            if self._last_run_samples:
+                self._lab_run_export.setText(
+                    f"Last run captured: {cuelist_name} ({len(self._last_run_samples)} samples)"
+                    if cuelist_name
+                    else f"Last run captured ({len(self._last_run_samples)} samples)"
+                )
+                self._btn_export_run.setEnabled(True)
+            else:
+                self._lab_run_export.setText("Run ended, but no samples were captured.")
+                self._btn_export_run.setEnabled(False)
+
+    def _capture_run_sample(self, snap: PerformanceSnapshot) -> None:
+        if not self._capture_active:
+            return
+
+        runner: _SessionRunnerLike | None = None
+        cuelist = None
+        try:
+            if self._runner_tab is not None:
+                runner = getattr(self._runner_tab, "session_runner", None)
+                cuelist = getattr(self._runner_tab, "cuelist", None)
+        except Exception:
+            runner = None
+            cuelist = None
+
+        # Only capture while the runner exists.
+        if runner is None:
+            return
+
+        # Create a stable wall-clock timestamp string for the report.
+        wall = time.time()
+        try:
+            wall_iso = datetime.fromtimestamp(wall).isoformat(timespec="seconds")
+        except Exception:
+            wall_iso = ""
+
+        t_run_s = None
+        if self._capture_started_wall is not None:
+            try:
+                t_run_s = max(0.0, float(wall - self._capture_started_wall))
+            except Exception:
+                t_run_s = None
+
+        cue_idx = None
+        cue_name = None
+        playback_label = None
+        playback_path = None
+        try:
+            cue_idx = int(runner.get_current_cue_index())
+        except Exception:
+            cue_idx = None
+        try:
+            cue_name = runner.get_current_cue_name()
+        except Exception:
+            cue_name = None
+        try:
+            playback_label = runner.get_current_playback_label()
+        except Exception:
+            playback_label = None
+        try:
+            playback_path = runner.get_current_playback_path()
+        except Exception:
+            playback_path = None
+
+        cuelist_name = None
+        try:
+            cuelist_name = str(getattr(cuelist, "name", "")) if cuelist else None
+        except Exception:
+            cuelist_name = None
+
+        rss_mb = None
+        if self._last_proc_rss_bytes is not None:
+            rss_mb = float(self._last_proc_rss_bytes) / (1024.0 * 1024.0)
+
+        sample = {
+            "wall_iso": wall_iso,
+            "t_rel_s": float(time.perf_counter() - self._t0),
+            "t_run_s": float(t_run_s) if t_run_s is not None else None,
+            "cuelist": cuelist_name,
+            "cue_index": cue_idx,
+            "cue_name": cue_name,
+            "playback": playback_label,
+            "playback_path": playback_path,
+            "fps": float(snap.fps or 0.0),
+            "avg_frame_ms": float(snap.avg_frame_ms or 0.0),
+            "max_frame_ms": float(snap.max_frame_ms or 0.0),
+            "gpu_avg_ms": float(snap.gpu_avg_ms or 0.0),
+            "gpu_max_ms": float(snap.gpu_max_ms or 0.0),
+            "gpu_busy_pct": float(snap.gpu_busy_pct or 0.0),
+            "gpu_vram_used_mb": float(snap.gpu_vram_used_mb or 0.0),
+            "gpu_vram_total_mb": float(snap.gpu_vram_total_mb or 0.0),
+            "gpu_util_pct_sys": float(self._get_system_gpu_util_pct() or 0.0),
+            "cpu_pct_proc": float(self._last_proc_cpu_pct or 0.0),
+            "ram_mb_proc": float(rss_mb or 0.0),
+            "stall_count": int(snap.stall_count or 0),
+            "last_stall_ms": float(snap.last_stall_ms or 0.0),
+            "warnings": "; ".join(list(snap.warnings or [])),
+        }
+        self._capture_samples.append(sample)
+
+    def _on_export_run_stats(self) -> None:
+        if not self._last_run_samples:
+            QMessageBox.information(self, "Export Run Stats", "No completed run data to export yet.")
+            return
+
+        cuelist_name = str(self._last_run_meta.get("cuelist") or "cuelist")
+        default_name = f"{cuelist_name}_perf_{time.strftime('%Y%m%d_%H%M%S')}.txt".replace("/", "-").replace("\\\\", "-")
+        out_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Cuelist Run Stats",
+            default_name,
+            "Text File (*.txt);;All Files (*)",
+        )
+        if not out_path:
+            return
+
+        try:
+            lines: list[str] = []
+            lines.append("MesmerGlass — Cuelist Run Performance Report")
+            lines.append(f"Cuelist: {self._last_run_meta.get('cuelist') or ''}")
+            lines.append(f"Samples: {self._last_run_meta.get('sample_count', 0)}")
+            lines.append(f"Sample interval: {self._last_run_meta.get('sample_interval_ms', 0)} ms")
+            dur = self._last_run_meta.get("duration_wall_s")
+            if dur is not None:
+                lines.append(f"Wall duration: {float(dur):.1f} s")
+            lines.append("")
+            lines.append(
+                "\t".join(
+                    [
+                        "wall_time",
+                        "t_rel_s",
+                        "t_run_s",
+                        "cue_index",
+                        "cue_name",
+                        "playback",
+                        "fps",
+                        "avg_frame_ms",
+                        "max_frame_ms",
+                        "cpu_pct_proc",
+                        "ram_mb_proc",
+                        "gpu_util_pct_sys",
+                        "gpu_avg_ms",
+                        "gpu_max_ms",
+                        "gpu_busy_pct",
+                        "gpu_vram_used_mb",
+                        "gpu_vram_total_mb",
+                        "stall_count",
+                        "last_stall_ms",
+                        "warnings",
+                        "playback_path",
+                    ]
+                )
+            )
+
+            for s in self._last_run_samples:
+                t_run_s_val = s.get("t_run_s")
+                lines.append(
+                    "\t".join(
+                        [
+                            str(s.get("wall_iso") or ""),
+                            f"{float(s.get('t_rel_s') or 0.0):.3f}",
+                            (f"{float(t_run_s_val):.3f}" if t_run_s_val is not None else ""),
+                            str(s.get("cue_index") if s.get("cue_index") is not None else ""),
+                            str(s.get("cue_name") or ""),
+                            str(s.get("playback") or ""),
+                            f"{float(s.get('fps') or 0.0):.2f}",
+                            f"{float(s.get('avg_frame_ms') or 0.0):.2f}",
+                            f"{float(s.get('max_frame_ms') or 0.0):.2f}",
+                            f"{float(s.get('cpu_pct_proc') or 0.0):.1f}",
+                            f"{float(s.get('ram_mb_proc') or 0.0):.1f}",
+                            f"{float(s.get('gpu_util_pct_sys') or 0.0):.1f}",
+                            f"{float(s.get('gpu_avg_ms') or 0.0):.2f}",
+                            f"{float(s.get('gpu_max_ms') or 0.0):.2f}",
+                            f"{float(s.get('gpu_busy_pct') or 0.0):.1f}",
+                            f"{float(s.get('gpu_vram_used_mb') or 0.0):.1f}",
+                            f"{float(s.get('gpu_vram_total_mb') or 0.0):.1f}",
+                            str(int(s.get("stall_count") or 0)),
+                            f"{float(s.get('last_stall_ms') or 0.0):.1f}",
+                            str(s.get("warnings") or ""),
+                            str(s.get("playback_path") or ""),
+                        ]
+                    )
+                )
+
+            Path(out_path).write_text("\n".join(lines), encoding="utf-8")
+            QMessageBox.information(self, "Export Run Stats", f"Wrote report:\n{out_path}")
+        except Exception as exc:
+            QMessageBox.critical(self, "Export Run Stats", f"Export failed: {exc}")
+
     def _refresh_all(self) -> None:
         snap = perf_metrics.snapshot()
         self._refresh_perf_section(snap)
@@ -470,6 +765,7 @@ class PerformancePage(QWidget):
         self._refresh_gpu_section(snap)
         self._refresh_streaming_section()
         self._append_series(snap)
+        self._capture_run_sample(snap)
         self._refresh_charts()
 
     def _refresh_perf_section(self, snap: PerformanceSnapshot) -> None:

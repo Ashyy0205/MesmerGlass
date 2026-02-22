@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from functools import lru_cache
 from pathlib import Path
 from threading import Lock
@@ -30,7 +31,18 @@ def _ensure_mixer() -> bool:
             # Keep mixer config consistent with the main AudioEngine so that
             # later synthesized buffers (e.g. Shepard tone bed) match channel
             # depth expectations.
-            pygame.mixer.pre_init(44100, -16, 2, 512)
+            try:
+                default_rate = "48000" if os.name == "nt" else "44100"
+                rate = int(float(os.environ.get("MESMERGLASS_AUDIO_RATE", default_rate)))
+            except Exception:
+                rate = 48000 if os.name == "nt" else 44100
+            rate = max(8000, min(192000, rate))
+            try:
+                buf = int(float(os.environ.get("MESMERGLASS_AUDIO_BUFFER", "8192")))
+            except Exception:
+                buf = 8192
+            buf = max(512, min(32768, buf))
+            pygame.mixer.pre_init(rate, -16, 2, buf)
             pygame.mixer.init()
         return True
     except Exception as exc:  # pragma: no cover - depends on host audio stack

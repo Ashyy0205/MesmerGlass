@@ -28,6 +28,23 @@ try:  # Set a conservative default surface format early (can be disabled via env
             _fmt.setProfile(QSurfaceFormat.OpenGLContextProfile.CoreProfile)
         except Exception:  # pragma: no cover - older Qt
             pass
+
+        # Vsync / present pacing.
+        # 1 = vsync on (default), 0 = vsync off.
+        try:
+            swap_interval = int(os.environ.get("MESMERGLASS_GL_SWAP_INTERVAL", "1"))
+        except Exception:
+            swap_interval = 1
+        if swap_interval <= 0 and os.environ.get("MESMERGLASS_GL_ALLOW_TEARING") != "1":
+            logging.getLogger(__name__).warning(
+                "[gl] MESMERGLASS_GL_SWAP_INTERVAL=0 but MESMERGLASS_GL_ALLOW_TEARING!=1; forcing swapInterval=1"
+            )
+            swap_interval = 1
+        swap_interval = 1 if swap_interval >= 1 else 0
+        try:
+            _fmt.setSwapInterval(swap_interval)
+        except Exception:  # pragma: no cover
+            pass
         QSurfaceFormat.setDefaultFormat(_fmt)
 except Exception:  # pragma: no cover
     pass
@@ -258,6 +275,16 @@ class LoomCompositor(QOpenGLWidget):  # type: ignore[misc]
         self._background_program = None  # Separate shader program for background quad
         self._background_image_width = 1  # Original image width (for aspect ratio)
         self._background_image_height = 1  # Original image height (for aspect ratio)
+
+        # Video texture pooling:
+        # - Video frames are uploaded into textures owned by the compositor.
+        # - On fast video cycling with fades, we must not delete or overwrite textures
+        #   that are still referenced by the fade queue.
+        # - Pool lets us reuse textures and avoid glGen/glDelete churn.
+        self._owned_video_textures: set[int] = set()
+        self._free_video_textures: list[int] = []
+        self._video_pool_width: int = 0
+        self._video_pool_height: int = 0
         
         # Fade transition support (for smooth image/video changes)
         self._fade_enabled = False  # Whether fade transitions are active
@@ -1507,6 +1534,37 @@ class LoomCompositor(QOpenGLWidget):  # type: ignore[misc]
             logging.getLogger(__name__).info("[fade] Disabled (instant media swaps)")
         else:
             logging.getLogger(__name__).info(f"[fade] Enabled (duration={self._fade_duration:.2f}s)")
+
+    def _acquire_video_texture(self) -> int:
+        """Get a compositor-owned texture ID for video uploads."""
+        from OpenGL import GL
+
+        while self._free_video_textures:
+            tex_id = int(self._free_video_textures.pop())
+            try:
+                if tex_id and GL.glIsTexture(tex_id):
+                    return tex_id
+            except Exception:
+                continue
+
+        tex_id = int(GL.glGenTextures(1))
+        self._owned_video_textures.add(tex_id)
+        return tex_id
+
+    def _reset_video_texture_pool(self) -> None:
+        """Delete compositor-owned video textures and clear pool state."""
+        from OpenGL import GL
+
+        for tex_id in list(self._owned_video_textures):
+            try:
+                if tex_id and GL.glIsTexture(tex_id):
+                    GL.glDeleteTextures([tex_id])
+            except Exception:
+                pass
+        self._owned_video_textures.clear()
+        self._free_video_textures.clear()
+        self._video_pool_width = 0
+        self._video_pool_height = 0
     
     def set_background_video_frame(self, frame_data: 'np.ndarray', width: int, height: int, zoom: float = 1.0, new_video: bool = False) -> None:
         """Update background with video frame (efficient GPU upload).
@@ -1551,22 +1609,31 @@ class LoomCompositor(QOpenGLWidget):  # type: ignore[misc]
         # Upload as-is and let vertex shader handle orientation
         frame_data_flipped = frame_data
         
-        # Create texture on first call, reuse on subsequent calls
-        # If resolution changes, recreate texture
+        # If resolution changed, reset the compositor-owned video pool. This prevents
+        # accidental reuse of textures with incompatible storage.
+        if (
+            self._video_pool_width != 0
+            and self._video_pool_height != 0
+            and (self._video_pool_width != width or self._video_pool_height != height)
+        ):
+            self._reset_video_texture_pool()
+
+        active_tex = self._background_texture
         needs_new_texture = (
-            self._background_texture is None or 
-            not GL.glIsTexture(self._background_texture) or
-            self._background_image_width != width or 
-            self._background_image_height != height
+            active_tex is None
+            or not GL.glIsTexture(active_tex)
+            or self._background_image_width != width
+            or self._background_image_height != height
         )
         
-        # Trigger fade transition if this is a new video and we have existing content
-        if new_video and self._fade_enabled and self._background_texture is not None and self._background_enabled:
+        # Trigger fade transition if this is a new video and we have existing content.
+        # IMPORTANT: do NOT delete or overwrite the old texture during fade.
+        if new_video and self._fade_enabled and active_tex is not None and self._background_enabled:
             current_frame = getattr(self, '_frame_counter', 0)
             
             # Add current texture to fade queue for ghosting effect
             self._fade_queue.append({
-                'texture': self._background_texture,
+                'texture': active_tex,
                 'zoom': self._background_zoom,
                 'width': self._background_image_width,
                 'height': self._background_image_height,
@@ -1574,7 +1641,7 @@ class LoomCompositor(QOpenGLWidget):  # type: ignore[misc]
             })
             
             # Also store in old texture for backward compatibility
-            self._fade_old_texture = self._background_texture
+            self._fade_old_texture = active_tex
             self._fade_old_zoom = self._background_zoom
             self._fade_old_width = self._background_image_width
             self._fade_old_height = self._background_image_height
@@ -1582,18 +1649,26 @@ class LoomCompositor(QOpenGLWidget):  # type: ignore[misc]
             self._fade_progress = 0.0
             self._fade_frame_start = current_frame
             logging.getLogger(__name__).info(f"[fade] Starting fade transition for video (duration={self._fade_duration:.2f}s, queue_size={len(self._fade_queue)})")
-            
-            # Force texture recreation so we don't overwrite the old texture during fade
+
+            # Acquire a fresh compositor-owned texture for the new video frames.
+            # Never overwrite a texture still referenced by the fade queue.
+            in_use = {item.get('texture') for item in self._fade_queue}
+            if active_tex is not None:
+                in_use.add(active_tex)
+
+            next_tex = self._acquire_video_texture()
+            while next_tex in in_use:
+                next_tex = self._acquire_video_texture()
+
+            active_tex = next_tex
             needs_new_texture = True
         
+        if active_tex is None or not GL.glIsTexture(active_tex):
+            active_tex = self._acquire_video_texture()
+            needs_new_texture = True
+
         if needs_new_texture:
-            # Delete old texture if it exists
-            if self._background_texture is not None and GL.glIsTexture(self._background_texture):
-                GL.glDeleteTextures([self._background_texture])
-            
-            # Generate new texture
-            self._background_texture = GL.glGenTextures(1)
-            GL.glBindTexture(GL.GL_TEXTURE_2D, self._background_texture)
+            GL.glBindTexture(GL.GL_TEXTURE_2D, active_tex)
             
             # Set texture parameters (Trance uses LINEAR filtering for video)
             GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MIN_FILTER, GL.GL_LINEAR)
@@ -1614,10 +1689,10 @@ class LoomCompositor(QOpenGLWidget):  # type: ignore[misc]
                 frame_data_flipped
             )
             
-            logging.getLogger(__name__).debug(f"Created video texture {self._background_texture} ({width}x{height})")
+            logging.getLogger(__name__).debug(f"Created video texture {active_tex} ({width}x{height})")
         else:
             # Reuse existing texture (much faster!)
-            GL.glBindTexture(GL.GL_TEXTURE_2D, self._background_texture)
+            GL.glBindTexture(GL.GL_TEXTURE_2D, active_tex)
             
             # Update texture data with new frame (glTexSubImage2D is faster than glTexImage2D)
             # Use flipped frame data
@@ -1635,8 +1710,11 @@ class LoomCompositor(QOpenGLWidget):  # type: ignore[misc]
         GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
         
         # Update state
+        self._background_texture = active_tex
         self._background_image_width = max(1, width)
         self._background_image_height = max(1, height)
+        self._video_pool_width = max(1, width)
+        self._video_pool_height = max(1, height)
 
         # Important: video uploads happen every frame. If we overwrite _background_zoom
         # here while a compositor-driven zoom animation is active, the animation will
@@ -1662,11 +1740,28 @@ class LoomCompositor(QOpenGLWidget):  # type: ignore[misc]
         current_frame = getattr(self, '_frame_counter', 0)
         fade_duration_frames = self._fade_duration * 60.0  # Convert seconds to frames (60 FPS)
         
-        # Remove fully faded textures from queue
-        self._fade_queue = [
-            item for item in self._fade_queue
-            if (current_frame - item['start_frame']) < fade_duration_frames
-        ]
+        # Remove fully faded textures from queue.
+        # Recycle compositor-owned video textures so fast cycling doesn't allocate every swap.
+        keep_queue = []
+        expired = []
+        for item in self._fade_queue:
+            if (current_frame - item['start_frame']) < fade_duration_frames:
+                keep_queue.append(item)
+            else:
+                expired.append(item)
+        self._fade_queue = keep_queue
+
+        current_bg = self._background_texture
+        for item in expired:
+            tex_id = item.get('texture')
+            if not tex_id:
+                continue
+            if tex_id == current_bg:
+                continue
+            if tex_id in self._owned_video_textures:
+                # Put it back into the pool for reuse.
+                if tex_id not in self._free_video_textures:
+                    self._free_video_textures.append(int(tex_id))
         
         # Update main fade progress if active
         if self._fade_active:

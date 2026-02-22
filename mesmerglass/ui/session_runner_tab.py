@@ -56,15 +56,13 @@ class SessionRunnerTab(QWidget):
         self.cuelist = None
         self.session_runner = None
         self.cuelist_path = None
+
+        # Legacy placeholder: used by some stop-session cleanup paths.
+        # (The live Shepard control was removed, but callers may still check this.)
+        self._shepard_volume_spin = None
         
         # Session data for session mode (when working within a .session.json)
         self.session_data = None
-
-        # If the loaded cuelist came from session_data, remember its key so we can
-        # refresh Cue objects before starting playback.
-        self._loaded_session_cuelist_key: Optional[str] = None
-
-        # Live audio control UI state
         
         # UI update timer (16ms = 60 Hz, matches compositor frame rate)
         self.update_timer = QTimer()
@@ -234,10 +232,8 @@ class SessionRunnerTab(QWidget):
         self.btn_skip_next.setEnabled(False)
         layout.addWidget(self.btn_skip_next)
         
-        layout.addSpacing(20)
-
         layout.addStretch()
-        
+
         group.setLayout(layout)
         return group
 
@@ -309,7 +305,6 @@ class SessionRunnerTab(QWidget):
 
             self.cuelist_path = Path(file_path)
             self.cuelist = Cuelist.load(self.cuelist_path)
-            self._loaded_session_cuelist_key = None
 
             if not self._finalize_loaded_cuelist("from file"):
                 self.cuelist = None
@@ -335,7 +330,6 @@ class SessionRunnerTab(QWidget):
 
             self.cuelist = Cuelist.from_dict(cuelist_data)
             self.cuelist_path = None
-            self._loaded_session_cuelist_key = str(cuelist_key)
             if self._finalize_loaded_cuelist(f"from session ({cuelist_key})"):
                 return True
             self.cuelist = None
@@ -519,17 +513,6 @@ class SessionRunnerTab(QWidget):
             return False
         
         try:
-            # Refresh from session_data so cue edits made in other tabs (e.g. CueEditor)
-            # are reflected here (including per-cue Shepard volume).
-            if self.session_data and self._loaded_session_cuelist_key:
-                cuelist_data = self.session_data.get("cuelists", {}).get(self._loaded_session_cuelist_key)
-                if isinstance(cuelist_data, dict):
-                    from mesmerglass.session.cuelist import Cuelist
-
-                    self.cuelist = Cuelist.from_dict(cuelist_data)
-                    self._display_cuelist_info()
-                    self._populate_cue_list()
-
             from mesmerglass.session.runner import SessionRunner
             from mesmerglass.session.events import SessionEventType
             import json
@@ -657,6 +640,9 @@ class SessionRunnerTab(QWidget):
         self.label_cycle_count.setText("Cycles: 0")
         
         self.status_label.setText("⏹️ Session stopped")
+
+        if self._shepard_volume_spin is not None:
+            self._shepard_volume_spin.setEnabled(False)
         self.session_stopped.emit()
 
     # === Shortcut Helpers ===
@@ -720,6 +706,9 @@ class SessionRunnerTab(QWidget):
         # Highlight active cue in list
         if 0 <= cue_index < self.cue_list.count():
             self.cue_list.setCurrentRow(cue_index)
+
+        # Sync live Shepard control to cue config (if present).
+        # Shepard volume is controlled by the cue; no live UI sync here.
         
         self.status_label.setText(f"🎬 Started cue: {cue_name}")
     

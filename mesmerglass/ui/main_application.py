@@ -85,8 +85,28 @@ class MainApplication(QMainWindow):
         self._restore_window_state()
         self.logger.info("MainApplication initialized")
 
+        # Optional: open live volume panel for debugging.
+        if os.environ.get("MESMERGLASS_VOLUME_TEST", "0") in ("1", "true", "True", "yes"):
+            QTimer.singleShot(0, self._open_live_volume_panel)
+
         if self.autorun_config:
             QTimer.singleShot(0, self._start_autorun_if_configured)
+
+    def _open_live_volume_panel(self) -> None:
+        try:
+            engine = getattr(self, "audio_engine", None)
+            if not engine:
+                self.logger.warning("Live volume panel requested but audio_engine is missing")
+                return
+            from ..ui.volume_test import create_attached_volume_panel
+
+            panel = create_attached_volume_panel(engine)
+            panel.setParent(None)
+            panel.show()
+            self._live_volume_panel = panel
+            self.logger.info("Live volume panel opened")
+        except Exception as exc:
+            self.logger.warning("Failed to open live volume panel: %s", exc)
     
     def _initialize_engines(self):
         """Initialize all rendering engines and directors.
@@ -140,9 +160,18 @@ class MainApplication(QMainWindow):
 
             # 3.25. Create SimpleVideoStreamer (ThemeBank video playback)
             try:
-                # Prefill only ~0.5s of frames synchronously; async loader fills the rest
-                self.video_streamer = SimpleVideoStreamer(buffer_size=180, prefill_frames=24)
-                self.logger.info("SimpleVideoStreamer initialized for ThemeBank videos")
+                import os
+
+                # NOTE: Synchronous prefill runs on the caller/UI thread and can hitch if
+                # cv2 stalls. Default to 0 for smooth rapid-cycling; async loader fills.
+                prefill_frames = int(os.environ.get("MESMERGLASS_VIDEO_PREFILL_FRAMES_SYNC", "0") or "0")
+                prefill_frames = max(0, prefill_frames)
+
+                self.video_streamer = SimpleVideoStreamer(buffer_size=180, prefill_frames=prefill_frames)
+                self.logger.info(
+                    "SimpleVideoStreamer initialized for ThemeBank videos (prefill_frames=%d)",
+                    prefill_frames,
+                )
             except Exception as streamer_exc:  # pragma: no cover - defensive path
                 self.video_streamer = None
                 self.logger.error(f"Video streamer initialization failed: {streamer_exc}")
@@ -342,6 +371,14 @@ class MainApplication(QMainWindow):
         # Tab 6: Performance monitoring
         self.performance_tab = PerformancePage(parent=self)
         self.tabs.addTab(self.performance_tab, "📊 Performance")
+
+        # Bind performance logging to cuelist session lifecycle.
+        try:
+            runner_tab = getattr(self.home_tab, "session_runner_tab", None)
+            if runner_tab is not None and hasattr(self.performance_tab, "bind_session_runner_tab"):
+                self.performance_tab.bind_session_runner_tab(runner_tab)
+        except Exception:
+            pass
         
         # Tab 7: DevTools (placeholder)
         placeholder = QWidget()

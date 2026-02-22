@@ -29,7 +29,7 @@ else:
     _PSUTIL_IMPORT_ERROR = None
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import TYPE_CHECKING, Optional, Any, Callable
+from typing import TYPE_CHECKING, Optional, Any
 from pathlib import Path
 
 if TYPE_CHECKING:
@@ -98,9 +98,7 @@ class SessionRunner:
         audio_engine: Optional[AudioEngine] = None,
         compositor: Optional[LoomCompositor] = None,
         display_tab = None,  # DisplayTab for monitor selection
-        session_data: Optional[dict] = None,  # Session data for accessing playback configs
-        headless: bool = False,  # Offscreen/hidden compositor (no fullscreen windows)
-        time_provider: Optional[Callable[[], float]] = None,  # Override wall-clock time (offline export)
+        session_data: Optional[dict] = None  # Session data for accessing playback configs
     ):
         """
         Initialize session runner.
@@ -121,12 +119,8 @@ class SessionRunner:
         self.compositor = compositor  # Primary compositor (template)
         self.display_tab = display_tab
         self.session_data = session_data
-        self.headless = bool(headless)
         
         self.logger = logging.getLogger(__name__)
-
-        # Timing source (wall clock by default). Offline export can inject a simulated clock.
-        self._time_provider: Callable[[], float] = time_provider or time.time
         
         # State machine
         self._state = SessionState.STOPPED
@@ -201,8 +195,6 @@ class SessionRunner:
         self._vr_last_frame = None
         self._vr_frame_lock = None
         self._vr_frame_handler = None
-        self._vr_streaming_compositor = None  # compositor instance feeding the stream
-        self._vr_hidden_compositor = None  # dedicated square compositor for VR
 
         # Audio runtime tracking
         self._audio_role_channels: dict[AudioRole, int] = {}
@@ -236,16 +228,6 @@ class SessionRunner:
     
     # ===== State Properties =====
 
-    def _now(self) -> float:
-        """Return the current session time.
-
-        This is wall-clock by default, but can be overridden for offline exports.
-        """
-        try:
-            return float(self._time_provider())
-        except Exception:
-            return float(time.time())
-
     def _perf_span(self, name: str, *, category: str = "misc", **metadata: Any):
         tracer = getattr(self, "_perf_tracer", None)
         if not tracer or not tracer.enabled:
@@ -256,30 +238,6 @@ class SessionRunner:
         """Track work that held up the frame thread so we can attribute spikes."""
         if duration_ms <= 0:
             return
-
-    # ===== Live audio controls =====
-
-    def get_audio_role_channel(self, role: AudioRole) -> Optional[int]:
-        """Return the pygame mixer channel index currently used for an AudioRole."""
-        try:
-            return self._audio_role_channels.get(role)
-        except Exception:
-            return None
-
-    def set_audio_role_volume(self, role: AudioRole, volume: float) -> bool:
-        """Set volume for an active AudioRole immediately.
-
-        This is intended for live UI controls (e.g. adjusting the Shepard bed).
-        """
-        if not self.audio_engine:
-            return False
-        channel = self.get_audio_role_channel(role)
-        if channel is None:
-            return False
-        try:
-            return bool(self.audio_engine.set_volume(channel, float(volume)))
-        except Exception:
-            return False
 
         record = {
             "operation": operation,
@@ -482,6 +440,9 @@ class SessionRunner:
         allow_eviction: bool,
     ) -> _ReserveOutcome:
         limit = self._audio_buffer_limits.get(role, self._audio_buffer_limits.get(AudioRole.GENERIC, 0.0))
+        if limit <= 0.0:
+            return _ReserveOutcome.STREAM
+
         normalized = self._normalize_audio_path(file_path)
         reservation = self._audio_buffer_reservations.get(normalized)
         if reservation:
@@ -673,6 +634,24 @@ class SessionRunner:
     def get_current_cue_index(self) -> int:
         """Get index of current cue (-1 if none)."""
         return self._current_cue_index
+
+    def set_audio_role_volume(self, role: AudioRole, volume: float) -> bool:
+        """Set volume for an active audio role while the session is running.
+
+        This is intended for live tweaks (e.g. adjusting Shepard bed volume)
+        without restarting the cue.
+        """
+        if not self.audio_engine:
+            return False
+        try:
+            vol = max(0.0, min(1.0, float(volume)))
+        except (TypeError, ValueError):
+            return False
+
+        channel = self._audio_role_channels.get(role)
+        if channel is None:
+            return False
+        return bool(self.audio_engine.set_volume(channel, vol))
     
     # ===== Lifecycle Methods =====
     
@@ -704,7 +683,7 @@ class SessionRunner:
         
         # Initialize session state
         self._state = SessionState.RUNNING
-        self._session_start_time = self._now()
+        self._session_start_time = time.time()
         self._total_paused_time = 0.0
         self._loop_direction = 1
         self._worst_frame_spike = None
@@ -713,318 +692,197 @@ class SessionRunner:
         # Activate compositor(s) on selected display(s)
         if self.compositor:
             from PyQt6.QtGui import QGuiApplication
-
-            # Headless mode: keep the compositor hidden/offscreen.
-            # Used for offline rendering/export so nothing appears on any display.
-            if getattr(self, "headless", False):
-                try:
-                    # Typical export target is 1920x1080, but honor current size.
-                    w = int(getattr(self.compositor, "width", lambda: 1920)())
-                    h = int(getattr(self.compositor, "height", lambda: 1080)())
-                except Exception:
-                    w, h = 1920, 1080
-                try:
-                    from PyQt6.QtCore import Qt
-
-                    # Make the compositor window non-intrusive: offscreen + transparent.
-                    try:
-                        self.compositor.resize(w, h)
-                    except Exception:
-                        pass
-                    try:
-                        self.compositor.setGeometry(-10000, -10000, w, h)
-                    except Exception:
-                        pass
-                    try:
-                        self.compositor.setFlags(self.compositor.flags() | Qt.WindowType.Tool)
-                    except Exception:
-                        pass
-                    try:
-                        self.compositor.setOpacity(0.0)
-                    except Exception:
-                        pass
-                except Exception:
-                    pass
-
-                try:
-                    if hasattr(self.compositor, "set_virtual_screen_size"):
-                        self.compositor.set_virtual_screen_size(w, h)
-                except Exception:
-                    pass
-
-                try:
-                    self.compositor.set_active(True)
-                    # Use regular show() so it initializes GL, but stays offscreen/transparent.
-                    self.compositor.show()
-                except Exception:
-                    pass
-
-                self.logger.info("[session] Headless compositor activated (offscreen)")
-
+            
+            # Get selected displays from DisplayTab
+            selected_displays = []
+            if self.display_tab:
+                selected_displays = self.display_tab.get_selected_displays()
+                self.logger.info(f"[session] DisplayTab returned {len(selected_displays)} selected displays")
+                for i, display in enumerate(selected_displays):
+                    self.logger.info(f"[session]   Display {i}: type={display.get('type')}, data_keys={list(display.keys())}")
             else:
-                # Get selected displays from DisplayTab
-                selected_displays = []
-                if self.display_tab:
-                    selected_displays = self.display_tab.get_selected_displays()
-                    self.logger.info(f"[session] DisplayTab returned {len(selected_displays)} selected displays")
-                    for i, display in enumerate(selected_displays):
-                        self.logger.info(
-                            f"[session]   Display {i}: type={display.get('type')}, data_keys={list(display.keys())}"
-                        )
-                else:
-                    self.logger.warning("[session] No display_tab available!")
-
-                # Separate monitors and VR clients
-                monitor_displays = [d for d in selected_displays if d.get("type") == "monitor"]
-                vr_clients = [d for d in selected_displays if d.get("type") == "vr"]
-
-                # Fallback to primary screen if nothing selected
-                if not monitor_displays:
-                    primary_screen = QGuiApplication.primaryScreen()
-                    self.logger.info("[session] No monitors selected, using primary screen")
-                    monitor_displays = [{"type": "monitor", "screen": primary_screen}]
-
-                self.logger.info(f"[session] Activating compositor on {len(monitor_displays)} monitor(s)")
-
-                # First monitor: Use primary compositor
-                first_screen = monitor_displays[0].get("screen")
-                if first_screen:
-                    applied_geometry = self.compositor.fit_to_screen(first_screen)
-                    if applied_geometry is None:
-                        applied_geometry = first_screen.geometry()
-                    self.logger.info(
-                        f"[session] [Display 1/{len(monitor_displays)}] Primary compositor on '{first_screen.name()}': "
-                        f"{applied_geometry.width()}x{applied_geometry.height()}"
-                    )
-                else:
-                    self.compositor.fit_to_screen(None)
-
-                self.compositor.set_active(True)
-                self.compositor.showFullScreen()
-
-                # Force window to be fully opaque
-                try:
-                    import ctypes
-
-                    hwnd = int(self.compositor.winId())
-                    ctypes.windll.user32.SetLayeredWindowAttributes(hwnd, 0, 255, 0x00000002)
-                except Exception:
-                    pass
-
-                # Additional monitors: Create secondary compositors
-                if len(monitor_displays) > 1:
-                    from ..mesmerloom.window_compositor import LoomWindowCompositor
-
-                    # Get the spiral director from the primary compositor
-                    spiral_director = self.compositor.director
-
-                    for i, display in enumerate(monitor_displays[1:], start=2):
-                        screen = display.get("screen")
-                        if not screen:
-                            continue
-
-                        try:
-                            # Create new compositor instance sharing the same directors
-                            # NOTE: text_director is shared for text rendering, but only primary calls update()
-                            secondary_compositor = LoomWindowCompositor(
-                                director=spiral_director,
-                                text_director=self.visual_director.text_director,
-                                is_primary=False,  # Don't advance text_director state on secondaries
-                            )
-
-                            # Position on target screen
-                            applied_geometry = secondary_compositor.fit_to_screen(screen)
-                            if applied_geometry is None:
-                                applied_geometry = screen.geometry()
-                            self.logger.info(
-                                f"[session] [Display {i}/{len(monitor_displays)}] Secondary compositor on '{screen.name()}': "
-                                f"{applied_geometry.width()}x{applied_geometry.height()}"
-                            )
-
-                            # Activate and show
-                            secondary_compositor.set_active(True)
-                            secondary_compositor.showFullScreen()
-
-                            # Force fully opaque
-                            try:
-                                import ctypes
-
-                                hwnd = int(secondary_compositor.winId())
-                                ctypes.windll.user32.SetLayeredWindowAttributes(hwnd, 0, 255, 0x00000002)
-                            except Exception:
-                                pass
-
-                            # Track secondary compositor
-                            self._secondary_compositors.append(secondary_compositor)
-
-                            # Register with VisualDirector for content mirroring
-                            self.visual_director.register_secondary_compositor(secondary_compositor)
-
-                            self.logger.info(f"[session] Secondary compositor {i-1} created and activated")
-
-                        except Exception as e:
-                            self.logger.error(f"[session] Failed to create secondary compositor for display {i}: {e}")
-
-                # Register all secondary compositors with TextDirector (after loop completes)
-                if self.visual_director.text_director and self._secondary_compositors:
-                    self.visual_director.text_director.set_secondary_compositors(self._secondary_compositors)
-                    self.logger.info(
-                        f"[session] Registered {len(self._secondary_compositors)} secondary compositor(s) with TextDirector"
-                    )
-
-                self.logger.info(f"[session] Total active compositors: {1 + len(self._secondary_compositors)}")
-
-                # Start VR streaming if we have VR clients selected
-                if vr_clients and len(vr_clients) > 0:
-                    self.logger.info(f"[session] Starting VR streaming for {len(vr_clients)} VR client(s)")
+                self.logger.warning("[session] No display_tab available!")
+            
+            # Separate monitors and VR clients
+            monitor_displays = [d for d in selected_displays if d.get("type") == "monitor"]
+            vr_clients = [d for d in selected_displays if d.get("type") == "vr"]
+            
+            # Fallback to primary screen if nothing selected
+            if not monitor_displays:
+                primary_screen = QGuiApplication.primaryScreen()
+                self.logger.info("[session] No monitors selected, using primary screen")
+                monitor_displays = [{"type": "monitor", "screen": primary_screen}]
+            
+            self.logger.info(f"[session] Activating compositor on {len(monitor_displays)} monitor(s)")
+            
+            # First monitor: Use primary compositor
+            first_screen = monitor_displays[0].get("screen")
+            if first_screen:
+                applied_geometry = self.compositor.fit_to_screen(first_screen)
+                if applied_geometry is None:
+                    applied_geometry = first_screen.geometry()
+                self.logger.info(
+                    f"[session] [Display 1/{len(monitor_displays)}] Primary compositor on '{first_screen.name()}': "
+                    f"{applied_geometry.width()}x{applied_geometry.height()}"
+                )
+            else:
+                self.compositor.fit_to_screen(None)
+            
+            self.compositor.set_active(True)
+            self.compositor.showFullScreen()
+            
+            # Force window to be fully opaque
+            try:
+                import ctypes
+                hwnd = int(self.compositor.winId())
+                ctypes.windll.user32.SetLayeredWindowAttributes(hwnd, 0, 255, 0x00000002)
+            except Exception:
+                pass
+            
+            # Additional monitors: Create secondary compositors
+            if len(monitor_displays) > 1:
+                from ..mesmerloom.window_compositor import LoomWindowCompositor
+                
+                # Get the spiral director from the primary compositor
+                spiral_director = self.compositor.director
+                
+                for i, display in enumerate(monitor_displays[1:], start=2):
+                    screen = display.get("screen")
+                    if not screen:
+                        continue
+                    
                     try:
-                        from ..mesmervisor.streaming_server import VRStreamingServer
-                        from ..mesmervisor.gpu_utils import EncoderType
-                        import threading
-                        import os
-                        from PyQt6.QtCore import Qt
-                        from ..mesmerloom.window_compositor import LoomWindowCompositor
-
-                        # Create a dedicated VR-only compositor for streaming.
-                        # The headset's per-eye native is often 1280x1440; allow explicit WxH.
+                        # Create new compositor instance sharing the same directors
+                        # NOTE: text_director is shared for text rendering, but only primary calls update()
+                        secondary_compositor = LoomWindowCompositor(
+                            director=spiral_director,
+                            text_director=self.visual_director.text_director,
+                            is_primary=False  # Don't advance text_director state on secondaries
+                        )
+                        
+                        # Position on target screen
+                        applied_geometry = secondary_compositor.fit_to_screen(screen)
+                        if applied_geometry is None:
+                            applied_geometry = screen.geometry()
+                        self.logger.info(
+                            f"[session] [Display {i}/{len(monitor_displays)}] Secondary compositor on '{screen.name()}': "
+                            f"{applied_geometry.width()}x{applied_geometry.height()}"
+                        )
+                        
+                        # Activate and show
+                        secondary_compositor.set_active(True)
+                        secondary_compositor.showFullScreen()
+                        
+                        # Force fully opaque
                         try:
-                            vr_stream_w = int(os.environ.get("MESMERGLASS_VR_STREAM_WIDTH", "0"))
-                        except Exception:
-                            vr_stream_w = 0
-                        try:
-                            vr_stream_h = int(os.environ.get("MESMERGLASS_VR_STREAM_HEIGHT", "0"))
-                        except Exception:
-                            vr_stream_h = 0
-                        if vr_stream_w <= 0 or vr_stream_h <= 0:
-                            try:
-                                vr_stream_side = int(os.environ.get("MESMERGLASS_VR_STREAM_SIDE", "1080"))
-                            except Exception:
-                                vr_stream_side = 1080
-                            if vr_stream_side <= 0:
-                                vr_stream_side = 1080
-                            vr_stream_w = vr_stream_side
-                            vr_stream_h = vr_stream_side
-
-                        if self._vr_hidden_compositor is None:
-                            spiral_director = self.compositor.director if self.compositor else None
-                            if spiral_director is None:
-                                raise RuntimeError("VR streaming requires an active primary compositor")
-                            self._vr_hidden_compositor = LoomWindowCompositor(
-                                director=spiral_director,
-                                text_director=self.visual_director.text_director,
-                                is_primary=False,
-                            )
-                            try:
-                                self.visual_director.register_secondary_compositor(self._vr_hidden_compositor)
-                            except Exception:
-                                pass
-                            try:
-                                text_director = getattr(self.visual_director, "text_director", None)
-                                if text_director and hasattr(text_director, "set_secondary_compositors"):
-                                    text_director.set_secondary_compositors(
-                                        self._secondary_compositors + [self._vr_hidden_compositor]
-                                    )
-                            except Exception:
-                                pass
-
-                        streaming_compositor = self._vr_hidden_compositor
-                        self._vr_streaming_compositor = streaming_compositor
-
-                        # Make the compositor window non-intrusive: offscreen + transparent.
-                        try:
-                            streaming_compositor.resize(vr_stream_w, vr_stream_h)
-                            streaming_compositor.setGeometry(-10000, -10000, vr_stream_w, vr_stream_h)
-                            streaming_compositor.setFlags(streaming_compositor.flags() | Qt.WindowType.Tool)
-                            streaming_compositor.setOpacity(0.0)
-                            if hasattr(streaming_compositor, "set_virtual_screen_size"):
-                                try:
-                                    streaming_compositor.set_virtual_screen_size(vr_stream_w, vr_stream_h)
-                                except Exception:
-                                    pass
-                            # VR-only media zoom tuning
-                            vr_zoom_mult_env = (os.environ.get("MESMERGLASS_VR_MEDIA_ZOOM_MULT") or "").strip()
-                            try:
-                                vr_zoom_mult = float(vr_zoom_mult_env) if vr_zoom_mult_env else 0.97
-                            except Exception:
-                                vr_zoom_mult = 0.97
-                            if hasattr(streaming_compositor, "set_background_zoom_multiplier"):
-                                try:
-                                    streaming_compositor.set_background_zoom_multiplier(vr_zoom_mult)
-                                except Exception:
-                                    pass
-                            streaming_compositor.set_active(True)
-                            streaming_compositor.show()
+                            import ctypes
+                            hwnd = int(secondary_compositor.winId())
+                            ctypes.windll.user32.SetLayeredWindowAttributes(hwnd, 0, 255, 0x00000002)
                         except Exception:
                             pass
+                        
+                        # Track secondary compositor
+                        self._secondary_compositors.append(secondary_compositor)
+                        
+                        # Register with VisualDirector for content mirroring
+                        self.visual_director.register_secondary_compositor(secondary_compositor)
+                        
+                        self.logger.info(f"[session] Secondary compositor {i-1} created and activated")
+                        
+                    except Exception as e:
+                        self.logger.error(f"[session] Failed to create secondary compositor for display {i}: {e}")
+            
+            # Register all secondary compositors with TextDirector (after loop completes)
+            if self.visual_director.text_director and self._secondary_compositors:
+                self.visual_director.text_director.set_secondary_compositors(self._secondary_compositors)
+                self.logger.info(f"[session] Registered {len(self._secondary_compositors)} secondary compositor(s) with TextDirector")
+            
+            self.logger.info(f"[session] Total active compositors: {1 + len(self._secondary_compositors)}")
+            
+            # Start VR streaming if we have VR clients selected
+            if vr_clients and len(vr_clients) > 0:
+                self.logger.info(f"[session] Starting VR streaming for {len(vr_clients)} VR client(s)")
+                try:
+                    from ..mesmervisor.streaming_server import VRStreamingServer
+                    from ..mesmervisor.gpu_utils import EncoderType
+                    import OpenGL.GL as GL
+                    import numpy as np
+                    import threading
+                    
+                    # Use primary compositor for VR streaming
+                    streaming_compositor = self.compositor
+                    
+                    # Create frame cache (populated by Qt signal, consumed by streaming thread)
+                    self._vr_streaming_active = True
+                    self._vr_last_frame = None
+                    self._vr_frame_lock = threading.Lock()
+                    
+                    def capture_frame():
+                        """Return cached frame for VR streaming (called from streaming thread)"""
+                        if not self._vr_streaming_active:
+                            return None
+                        
+                        # Return cached frame (NEVER call GL functions from streaming thread)
+                        with self._vr_frame_lock:
+                            if self._vr_last_frame is not None:
+                                frame = self._vr_last_frame.copy()  # Copy to avoid race conditions
+                                return frame
+                        
+                        return None  # No frame available yet
+                    
+                    # Create streaming server with frame callback
+                    self.vr_streaming_server = VRStreamingServer(
+                        width=1920,
+                        height=1080,
+                        fps=30,
+                        encoder_type=EncoderType.AUTO,
+                        quality=25,  # Optimized for Oculus Go
+                        frame_callback=capture_frame
+                    )
+                    
+                    # Start streaming server (TCP 5555)
+                    self.vr_streaming_server.start_server()
+                    self.logger.info("[session] VR streaming server started on TCP port 5555")
+                    
+                    # Connect compositor's frame_ready signal to cache frames
+                    if hasattr(streaming_compositor, 'frame_ready'):
+                        if self._vr_frame_handler is None:
+                            def on_frame_ready(frame):
+                                """Cache frame from compositor (called from Qt main thread with GL context active)"""
+                                if self._vr_streaming_active and frame is not None and frame.size > 0:
+                                    try:
+                                        with self._vr_frame_lock:
+                                            self._vr_last_frame = frame.copy()
+                                    except Exception as e:  # pragma: no cover - defensive
+                                        self.logger.error(f"[session] VR frame cache error: {e}")
 
-                        # Create frame cache (populated by Qt signal, consumed by streaming thread)
-                        self._vr_streaming_active = True
-                        self._vr_last_frame = None
-                        self._vr_frame_lock = threading.Lock()
+                            self._vr_frame_handler = on_frame_ready
 
-                        def capture_frame():
-                            """Return cached frame for VR streaming (called from streaming thread)"""
-                            if not self._vr_streaming_active:
-                                return None
-
-                            # Return cached frame (NEVER call GL functions from streaming thread)
-                            with self._vr_frame_lock:
-                                if self._vr_last_frame is not None:
-                                    frame = self._vr_last_frame.copy()  # Copy to avoid race conditions
-                                    return frame
-
-                            return None  # No frame available yet
-
-                        # Create streaming server with frame callback (square stream for VR)
-                        self.vr_streaming_server = VRStreamingServer(
-                            width=vr_stream_w,
-                            height=vr_stream_h,
-                            target_width=vr_stream_w,
-                            target_height=vr_stream_h,
-                            fps=30,
-                            encoder_type=EncoderType.AUTO,
-                            quality=25,  # Optimized for Oculus Go
-                            frame_callback=capture_frame,
-                        )
-                        self.logger.info(f"[session] VR streaming: target_resolution={vr_stream_w}x{vr_stream_h}")
-
-                        # Start streaming server (TCP 5555)
-                        self.vr_streaming_server.start_server()
-                        self.logger.info("[session] VR streaming server started on TCP port 5555")
-
-                        # Enable compositor-side capture; it will call us back from the Qt/GL thread.
-                        try:
-                            def on_vr_frame(frame):
-                                if not self._vr_streaming_active or frame is None:
-                                    return
-                                try:
-                                    with self._vr_frame_lock:
-                                        self._vr_last_frame = frame.copy()
-                                except Exception as e:  # pragma: no cover - defensive
-                                    self.logger.error(f"[session] VR frame cache error: {e}")
-
-                            streaming_compositor.enable_vr_streaming(on_vr_frame)
-                            self.logger.info("[session] VR streaming enabled on LoomCompositor")
-                            self.logger.info(
-                                f"[session] VR streaming: compositor size={streaming_compositor.width()}x{streaming_compositor.height()}"
-                            )
-                        except Exception as e:
-                            self.logger.warning(f"[session] Failed to enable compositor VR capture: {e}")
-
-                        # If VR-only mode (no monitors selected), minimize the compositor window
-                        if not monitor_displays:
+                        if hasattr(streaming_compositor, 'set_vr_capture_enabled'):
                             try:
-                                streaming_compositor.showMinimized()
+                                streaming_compositor.set_vr_capture_enabled(True, max_fps=30)
                             except Exception:
                                 pass
+                        else:
+                            streaming_compositor._vr_capture_enabled = True
+                        try:
+                            streaming_compositor.frame_ready.connect(self._vr_frame_handler)
+                        except Exception:
+                            pass
+                        self.logger.info("[session] VR streaming connected to compositor frame_ready signal")
+                        self.logger.info(f"[session] VR streaming: compositor size={streaming_compositor.width()}x{streaming_compositor.height()}")
+                        
+                        # If VR-only mode (no monitors selected), minimize the compositor window
+                        if not monitor_displays:
+                            streaming_compositor.showMinimized()
                             self.logger.info("[session] VR-only mode: minimized compositor window")
-                            self.logger.info("[session] VR-only mode: minimized compositor window")
-
-                    except Exception as e:
-                        self.logger.error(f"[session] Failed to start VR streaming: {e}")
-                        import traceback
-
-                        traceback.print_exc()
+                    else:
+                        self.logger.warning("[session] Compositor missing frame_ready signal for VR streaming")
+                        
+                except Exception as e:
+                    self.logger.error(f"[session] Failed to start VR streaming: {e}")
+                    import traceback
+                    traceback.print_exc()
         
         # Register cycle callback for cue transitions
         if not self._cue_callback_registered:
@@ -1109,38 +967,24 @@ class SessionRunner:
         if self.vr_streaming_server:
             try:
                 self._vr_streaming_active = False
-                if self._vr_frame_lock is not None:
-                    with self._vr_frame_lock:
-                        self._vr_last_frame = None
-
-                # Detach compositor capture (best-effort).
-                stream_comp = self._vr_streaming_compositor or self.compositor
-                if stream_comp and hasattr(stream_comp, "disable_vr_streaming"):
+                with self._vr_frame_lock:
+                    self._vr_last_frame = None
+                if self.compositor and hasattr(self.compositor, 'frame_ready') and self._vr_frame_handler:
                     try:
-                        stream_comp.disable_vr_streaming()
+                        self.compositor.frame_ready.disconnect(self._vr_frame_handler)
                     except Exception:
                         pass
+                    self._vr_frame_handler = None
+                if self.compositor and hasattr(self.compositor, 'set_vr_capture_enabled'):
+                    try:
+                        self.compositor.set_vr_capture_enabled(False)
+                    except Exception:
+                        pass
+                elif self.compositor and hasattr(self.compositor, '_vr_capture_enabled'):
+                    self.compositor._vr_capture_enabled = False
                 self.vr_streaming_server.stop_server()
                 self.vr_streaming_server = None
                 self.logger.info("[session] VR streaming server stopped")
-
-                # Dispose dedicated VR compositor (hidden square instance)
-                if self._vr_hidden_compositor is not None:
-                    try:
-                        self.visual_director.unregister_secondary_compositor(self._vr_hidden_compositor)
-                    except Exception:
-                        pass
-                    try:
-                        self._vr_hidden_compositor.set_active(False)
-                        self._vr_hidden_compositor.hide()
-                    except Exception:
-                        pass
-                    try:
-                        self._vr_hidden_compositor.deleteLater()
-                    except Exception:
-                        pass
-                    self._vr_hidden_compositor = None
-                self._vr_streaming_compositor = None
             except Exception as e:
                 self.logger.error(f"[session] Failed to stop VR streaming: {e}")
         
@@ -1200,7 +1044,7 @@ class SessionRunner:
             return False
         
         self._state = SessionState.PAUSED
-        self._pause_start_time = self._now()
+        self._pause_start_time = time.time()
         
         self.logger.info("[session] Session paused")
         
@@ -1232,7 +1076,7 @@ class SessionRunner:
         
         # Calculate pause duration
         if self._pause_start_time:
-            pause_duration = self._now() - self._pause_start_time
+            pause_duration = time.time() - self._pause_start_time
             self._total_paused_time += pause_duration
             self._pause_start_time = None
         
@@ -1536,7 +1380,7 @@ class SessionRunner:
         self._prefetched_cues.discard(cue_index)
         self._prefetch_backlog.discard(cue_index)
         self._current_cue_index = cue_index
-        self._cue_start_time = self._now()
+        self._cue_start_time = time.time()
         self._cue_start_cycle = self.visual_director.get_cycle_count()
         self._playback_history.clear()  # Reset history for new cue
         
@@ -1573,7 +1417,7 @@ class SessionRunner:
         
         # Track current playback for time-based switching
         self._current_playback_entry = playback_entry
-        self._playback_start_time = self._now()
+        self._playback_start_time = time.time()
         
         # Determine target duration (random between min and max in seconds)
         import random
@@ -1651,8 +1495,32 @@ class SessionRunner:
                     if track.role not in (AudioRole.HYPNO, AudioRole.BACKGROUND):
                         ordered_tracks.append((track.role, track))
 
-                channel_index = 0
                 max_channels = self.audio_engine.num_channels
+                used_channels: set[int] = set()
+                fixed_role_channels: dict[AudioRole, int] = {
+                    AudioRole.HYPNO: 0,
+                    AudioRole.BACKGROUND: 1,
+                }
+                reserved_shepard_channel = 2 if shepard_enabled else None
+
+                def _allocate_channel(role: AudioRole) -> int | None:
+                    # Fixed mapping for primary roles so UI and debugging stay consistent.
+                    if role in fixed_role_channels:
+                        ch = fixed_role_channels[role]
+                        if 0 <= ch < max_channels and ch not in used_channels:
+                            return ch
+                        return None
+
+                    # Secondary roles only use channels beyond the fixed ones.
+                    for ch in range(max_channels):
+                        if ch in used_channels:
+                            continue
+                        if ch in fixed_role_channels.values():
+                            continue
+                        if reserved_shepard_channel is not None and ch == reserved_shepard_channel:
+                            continue
+                        return ch
+                    return None
 
                 def _start_stream_track(role: AudioRole, track: Any, loop_flag: bool, reason: str) -> bool:
                     if self._active_stream_role is not None:
@@ -1745,7 +1613,75 @@ class SessionRunner:
                     else:
                         reason_hint = "threshold or forced" if preferred_stream else ""
 
+                    # NOTE: pygame.mixer.music can only stream ONE track at a time.
+                    # If multiple roles are flagged for streaming (e.g. two MP3s),
+                    # the later one would stop/replace the earlier one. Prefer
+                    # decoding the second into a Sound so layering still works.
+                    stream_busy = bool(self._active_stream_role is not None or self._pending_streams)
+                    must_stream = bool(budget_forces_stream)
+                    was_forced = False
+                    try:
+                        was_forced = bool(getattr(self.audio_engine, "was_stream_forced", lambda _p: False)(file_path))
+                    except Exception:
+                        was_forced = False
+                    must_stream = must_stream or was_forced
+                    if preferred_stream and stream_busy and self._active_stream_role != role:
+                        if must_stream:
+                            # Can't layer two streaming tracks. If we must stream,
+                            # only replace an existing BACKGROUND stream with HYPNO.
+                            if role == AudioRole.HYPNO and self._active_stream_role == AudioRole.BACKGROUND:
+                                self.logger.warning(
+                                    "[session] Streaming busy; prioritizing HYPNO over BACKGROUND (%s)",
+                                    Path(file_path).name,
+                                )
+                            else:
+                                self.logger.warning(
+                                    "[session] Skipping %s audio: only one streamed track supported (file=%s)",
+                                    role.value,
+                                    Path(file_path).name,
+                                )
+                                if buffer_outcome == _ReserveOutcome.RESERVED:
+                                    self._release_audio_buffer_for_path(file_path)
+                                continue
+                        else:
+                            self.logger.info(
+                                "[session] Streaming busy; decoding %s into Sound for layering (file=%s)",
+                                role.value,
+                                Path(file_path).name,
+                            )
+                            preferred_stream = False
+
                     if preferred_stream:
+                        # Prefer per-channel streaming when available (multi-stream capable).
+                        stream_on_channel = getattr(self.audio_engine, "stream_channel", None)
+                        if callable(stream_on_channel):
+                            stream_channel = _allocate_channel(role)
+                            if stream_channel is None:
+                                self.logger.warning(
+                                    "[session] No free mixer channel for %s per-channel streaming; falling back to legacy streaming",
+                                    role.value,
+                                )
+                            else:
+                                if stream_on_channel(
+                                    stream_channel,
+                                    file_path,
+                                    volume=track.volume,
+                                    fade_ms=track.fade_in_ms,
+                                    loop=loop_flag,
+                                ):
+                                    used_channels.add(stream_channel)
+                                    self._audio_role_channels[role] = stream_channel
+                                    if buffer_outcome == _ReserveOutcome.RESERVED:
+                                        self._release_audio_buffer_for_path(file_path)
+                                    self.logger.info(
+                                        "[session] Streaming %s audio on ch=%d: %s",
+                                        role.value,
+                                        stream_channel,
+                                        Path(file_path).name,
+                                    )
+                                    continue
+
+                        # Legacy fallback: single global streaming track.
                         if budget_forces_stream:
                             reason = "buffer limit"
                         elif not prefetch_ready and buffer_outcome == _ReserveOutcome.RESERVED:
@@ -1772,7 +1708,8 @@ class SessionRunner:
                         # Could not reserve buffer and streaming failed, nothing else to try
                         continue
 
-                    if channel_index >= max_channels:
+                    channel = _allocate_channel(role)
+                    if channel is None:
                         self.logger.warning(
                             "[session] No free audio channels remain for %s track (max=%d)",
                             role.value,
@@ -1781,22 +1718,93 @@ class SessionRunner:
                         self._release_audio_buffer_for_path(file_path)
                         continue
 
-                    if not self.audio_engine.load_channel(channel_index, file_path):
+                    if not self.audio_engine.load_channel(channel, file_path):
                         self._release_audio_buffer_for_path(file_path)
-                        if (self.audio_engine.should_stream(file_path) or budget_forces_stream) and _start_stream_track(
-                            role,
-                            track,
-                            loop_flag,
-                            "load failure fallback",
+                        stream_busy_now = bool(self._active_stream_role is not None or self._pending_streams)
+
+                        # Special salvage: if HYPNO is currently streaming and BACKGROUND
+                        # failed to decode to a Sound, try swapping who streams so we can
+                        # still layer both tracks.
+                        if (
+                            role == AudioRole.BACKGROUND
+                            and stream_busy_now
+                            and self._active_stream_role == AudioRole.HYPNO
+                            and hypno_track
+                            and getattr(hypno_track, "file_path", None)
                         ):
-                            continue
+                            try:
+                                hypno_path = str(hypno_track.file_path)
+                            except Exception:
+                                hypno_path = ""
+                            if hypno_path:
+                                self.logger.warning(
+                                    "[session] BACKGROUND decode failed; attempting swap: stream BACKGROUND + decode HYPNO (%s)",
+                                    Path(hypno_path).name,
+                                )
+                                try:
+                                    self.audio_engine.stop_streaming_track(fade_ms=0)
+                                except Exception:
+                                    pass
+                                self._active_stream_role = None
+
+                                if _start_stream_track(
+                                    AudioRole.BACKGROUND,
+                                    track,
+                                    loop_flag,
+                                    "swap (background needs stream)",
+                                ):
+                                    # Now try to load HYPNO into the first available channel.
+                                    # NOTE: HYPNO is pinned to channel 0 in fixed mapping.
+                                    swap_buffer_outcome = self._reserve_audio_buffer(
+                                        cue_index=cue_index,
+                                        role=AudioRole.HYPNO,
+                                        file_path=hypno_path,
+                                        cue_duration=cue.duration_seconds,
+                                        active=True,
+                                        allow_eviction=True,
+                                    )
+                                    if swap_buffer_outcome == _ReserveOutcome.RESERVED:
+                                        hypno_ch = fixed_role_channels.get(AudioRole.HYPNO, 0)
+                                        if 0 <= hypno_ch < max_channels and hypno_ch not in used_channels and self.audio_engine.load_channel(hypno_ch, hypno_path):
+                                            if self.audio_engine.fade_in_and_play(
+                                                channel=hypno_ch,
+                                                fade_ms=hypno_track.fade_in_ms,
+                                                volume=hypno_track.volume,
+                                                loop=hypno_track.loop,
+                                            ):
+                                                self._audio_role_channels[AudioRole.HYPNO] = hypno_ch
+                                                used_channels.add(hypno_ch)
+                                                length = self.audio_engine.get_channel_length(hypno_ch)
+                                                if length:
+                                                    self._active_hypno_duration = length
+                                                self.logger.info(
+                                                    "[session] Swap success: HYPNO Sound (ch=%d) + BACKGROUND streaming",
+                                                    hypno_ch,
+                                                )
+                                                continue
+                                        # If we reserved a buffer for HYPNO but failed to use it, release.
+                                        self._release_audio_buffer_for_path(hypno_path)
+
+                        allow_stream_fallback = (
+                            (not stream_busy_now)
+                            or (self._active_stream_role == role)
+                            or (role == AudioRole.HYPNO and self._active_stream_role == AudioRole.BACKGROUND)
+                        )
+                        if allow_stream_fallback and (self.audio_engine.should_stream(file_path) or budget_forces_stream):
+                            if _start_stream_track(
+                                role,
+                                track,
+                                loop_flag,
+                                "load failure fallback",
+                            ):
+                                continue
                         self.logger.warning(
                             f"[session] Failed to load {role.value} audio track: {track.file_path}"
                         )
                         continue
 
                     if not self.audio_engine.fade_in_and_play(
-                        channel=channel_index,
+                        channel=channel,
                         fade_ms=track.fade_in_ms,
                         volume=track.volume,
                         loop=loop_flag
@@ -1804,13 +1812,14 @@ class SessionRunner:
                         self._release_audio_buffer_for_path(file_path)
                         self.logger.warning(
                             "[session] Failed to start playback on channel %d for %s",
-                            channel_index,
+                            channel,
                             track.file_path,
                         )
                         continue
 
-                    self._audio_role_channels[role] = channel_index
-                    length = self.audio_engine.get_channel_length(channel_index)
+                    used_channels.add(channel)
+                    self._audio_role_channels[role] = channel
+                    length = self.audio_engine.get_channel_length(channel)
                     if role == AudioRole.HYPNO and length:
                         self._active_hypno_duration = length
                         self.logger.info(
@@ -1820,14 +1829,12 @@ class SessionRunner:
                     self.logger.debug(
                         "[session] Started %s audio (ch=%d): %s (fade=%dms, vol=%.2f, loop=%s)",
                         role.value,
-                        channel_index,
+                        channel,
                         track.file_path.name,
                         int(track.fade_in_ms),
                         track.volume,
                         loop_flag,
                     )
-
-                    channel_index += 1
 
                 # Shepard tone bed (generated, no file).
                 if shepard_enabled:
@@ -1844,13 +1851,6 @@ class SessionRunner:
                             direction = getattr(cue, "shepard_direction", "ascending")
                             volume = float(getattr(cue, "shepard_volume", 0.15))
                             volume = max(0.0, min(1.0, volume))
-
-                            self.logger.info(
-                                "[session] Shepard cue settings: cue='%s' dir=%s volume=%.3f",
-                                cue.name,
-                                str(direction),
-                                volume,
-                            )
 
                             pcm = generate_shepard_tone_int16_stereo(
                                 duration_s=60.0,
@@ -2160,7 +2160,7 @@ class SessionRunner:
             return
         
         # Check if target duration has elapsed
-        elapsed = self._now() - self._playback_start_time
+        elapsed = time.time() - self._playback_start_time
         
         if elapsed >= self._playback_target_duration and not self._playback_switch_pending:
             # Duration reached - mark switch as pending and wait for next cycle boundary
@@ -2243,7 +2243,7 @@ class SessionRunner:
         
         # Update tracking and set new target duration
         self._current_playback_entry = playback_entry
-        self._playback_start_time = self._now()
+        self._playback_start_time = time.time()
         
         import random
         
@@ -2511,7 +2511,7 @@ class SessionRunner:
                 if success:
                     # Initialize fade state
                     self._transition_in_progress = True
-                    self._transition_start_time = self._now()
+                    self._transition_start_time = time.time()
                     self._transition_fade_alpha = 1.0  # Start fully showing old cue
                     
                     # Note: The fade will be updated in update() method
@@ -2536,7 +2536,7 @@ class SessionRunner:
             return
         
         # Calculate fade progress
-        elapsed = self._now() - self._transition_start_time
+        elapsed = time.time() - self._transition_start_time
         fade_duration_s = (self.cuelist.transition_duration_ms or 2000.0) / 1000.0
         
         # Calculate alpha (1.0 = old cue visible, 0.0 = new cue visible)
@@ -2705,11 +2705,11 @@ class SessionRunner:
         if not self._session_start_time:
             return 0.0
         
-        elapsed = self._now() - self._session_start_time - self._total_paused_time
+        elapsed = time.time() - self._session_start_time - self._total_paused_time
         
         # If currently paused, don't count current pause duration
         if self._state == SessionState.PAUSED and self._pause_start_time:
-            elapsed -= (self._now() - self._pause_start_time)
+            elapsed -= (time.time() - self._pause_start_time)
         
         return elapsed
     
@@ -2718,4 +2718,4 @@ class SessionRunner:
         if not self._cue_start_time:
             return 0.0
         
-        return self._now() - self._cue_start_time
+        return time.time() - self._cue_start_time

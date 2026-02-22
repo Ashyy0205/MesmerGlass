@@ -17,6 +17,32 @@ from typing import Any
 
 def clamp(x, a, b): return max(a, min(b, x))
 
+
+def _preferred_mixer_rate() -> int:
+    """Return preferred mixer sample rate (Hz).
+
+    Some Windows audio stacks behave poorly at 44100Hz (time-stretching / pitch shift).
+    Allow overriding via MESMERGLASS_AUDIO_RATE (e.g. 48000).
+    """
+    default_rate = "48000" if os.name == "nt" else "44100"
+    try:
+        v = int(float(os.environ.get("MESMERGLASS_AUDIO_RATE", default_rate)))
+    except Exception:
+        v = int(float(default_rate))
+    return max(8000, min(192000, v))
+
+
+def _preferred_mixer_buffer() -> int:
+    """Return SDL mixer buffer size in samples.
+
+    Larger buffers reduce underruns on systems with heavy frame spikes.
+    """
+    try:
+        v = int(float(os.environ.get("MESMERGLASS_AUDIO_BUFFER", "8192")))
+    except Exception:
+        v = 8192
+    return max(512, min(32768, v))
+
 class Audio2:
     """
     - Audio 1: tries Sound; on failure falls back to streamed music (pygame.mixer.music)
@@ -25,10 +51,12 @@ class Audio2:
     def __init__(self):
         self.init_ok = False
         try:
-            pygame.mixer.pre_init(44100, -16, 2, 512)
+            rate = _preferred_mixer_rate()
+            buf = _preferred_mixer_buffer()
+            pygame.mixer.pre_init(rate, -16, 2, buf)
             pygame.mixer.init()
             self.init_ok = True
-            logging.getLogger(__name__).info("pygame mixer initialized")
+            logging.getLogger(__name__).info("pygame mixer initialized (rate=%s buffer=%s)", rate, buf)
         except Exception as e:
             logging.getLogger(__name__).error("audio init failed: %s", e)
             return
@@ -181,10 +209,53 @@ class AudioEngine:
         
         # Initialize pygame mixer if not already initialized
         try:
-            if not pygame.mixer.get_init():
-                pygame.mixer.pre_init(44100, -16, 2, 512)
+            # Ensure a stable mixer output format. On some Windows setups SDL may
+            # open the device in surround mode (e.g. 8 channels). Our streaming and
+            # generated audio are designed for mono/stereo; surround output can lead
+            # to distorted/static playback if the downstream expects different layouts.
+            os.environ.setdefault("SDL_AUDIO_CHANNELS", "2")
+
+            preferred_rate = _preferred_mixer_rate()
+            os.environ.setdefault("SDL_AUDIO_FREQUENCY", str(preferred_rate))
+
+            init = pygame.mixer.get_init()
+            if init:
+                try:
+                    _rate, _fmt, out_ch = init
+                    _rate = int(_rate or 0)
+                    out_ch = int(out_ch or 2)
+                except Exception:
+                    _rate = 0
+                    out_ch = 2
+                # Force a stable stereo output. Mono output can cause streamed
+                # interleaved buffers to be interpreted at the wrong frame count,
+                # which sounds like "slow motion".
+                if out_ch != 2 or (_rate and _rate != preferred_rate):
+                    try:
+                        pygame.mixer.quit()
+                    except Exception:
+                        pass
+                    init = None
+
+            if not init:
+                rate = preferred_rate
+                buf = _preferred_mixer_buffer()
+                pygame.mixer.pre_init(rate, -16, 2, buf)
                 pygame.mixer.init()
             self.init_ok = True
+            try:
+                existing = int(pygame.mixer.get_num_channels() or 0)
+                target = max(existing, int(num_channels))
+                pygame.mixer.set_num_channels(target)
+            except Exception:
+                pass
+            try:
+                # Use WARNING so it shows up in default console logs.
+                self.logger.warning("[audio] pygame mixer init=%s", pygame.mixer.get_init())
+                self.logger.warning("[audio] requested mixer rate=%s (MESMERGLASS_AUDIO_RATE)", _preferred_mixer_rate())
+                self.logger.warning("[audio] requested mixer buffer=%s (MESMERGLASS_AUDIO_BUFFER)", _preferred_mixer_buffer())
+            except Exception:
+                pass
             self.logger.info(f"AudioEngine initialized with {num_channels} channels")
         except Exception as e:
             self.logger.error(f"AudioEngine init failed: {e}")
@@ -223,12 +294,788 @@ class AudioEngine:
         self._stream_executor: Optional[ThreadPoolExecutor] = None
         self._paused = False
 
+        # Per-channel streaming (multi-track) state.
+        self._stream_stop_events: list[Optional[threading.Event]] = [None] * num_channels
+        self._stream_threads: list[Optional[threading.Thread]] = [None] * num_channels
+        self._stream_paths_ch: list[Optional[str]] = [None] * num_channels
+        self._stream_loop_ch: list[bool] = [False] * num_channels
+
     def _normalize_path(self, file_path: str) -> str:
         """Return absolute string path for caching consistency."""
         try:
             return str(Path(file_path).resolve())
         except Exception:
             return str(file_path)
+
+    def _get_mixer_params(self) -> tuple[int, int, int]:
+        init = pygame.mixer.get_init()
+        if not init:
+            return 44100, -16, 2
+        rate, fmt, channels = init
+        return int(rate or 44100), int(fmt or -16), int(channels or 2)
+
+    def _mixer_format_bytes_and_dtype(self, mixer_fmt: int) -> tuple[int, Any, str]:
+        """Return (bytes_per_sample, numpy_dtype, av_format) for the active mixer.
+
+        pygame/SDL may report audio formats as bit counts (-16) or as SDL AUDIO_*
+        constants (e.g. 32800 for AUDIO_S32SYS). If we guess wrong, raw buffers
+        get interpreted at the wrong sample width and sound "chipmunk" fast.
+        """
+        # Try SDL constants first when available.
+        try:
+            fmt = int(mixer_fmt)
+        except Exception:
+            fmt = -16
+
+        constants: list[tuple[str, int, int, Any, str]] = []
+        for name, bps, dtype, avfmt in (
+            ("AUDIO_U8", 1, np.uint8, "u8"),
+            ("AUDIO_S8", 1, np.int8, "s8"),
+            ("AUDIO_U16SYS", 2, np.uint16, "u16"),
+            ("AUDIO_S16SYS", 2, np.int16, "s16"),
+            ("AUDIO_S32SYS", 4, np.int32, "s32"),
+            ("AUDIO_F32SYS", 4, np.float32, "flt"),
+        ):
+            if hasattr(pygame, name):
+                constants.append((name, int(getattr(pygame, name)), bps, dtype, avfmt))
+
+        for _name, value, bps, dtype, avfmt in constants:
+            if fmt == value:
+                return int(bps), dtype, avfmt
+
+        # Fallback: treat as signed bit depth (pygame often returns -16).
+        bits = int(abs(fmt) or 16)
+        if bits in (8, 16, 32):
+            bps = max(1, bits // 8)
+            if bps == 1:
+                return 1, np.int8, "s8"
+            if bps == 4:
+                return 4, np.int32, "s32"
+            return 2, np.int16, "s16"
+
+        # Safe default
+        return 2, np.int16, "s16"
+
+    def _get_fixed_channel(self, channel: int) -> Optional['pygame.mixer.Channel']:
+        if not self.init_ok or not 0 <= channel < self.num_channels:
+            return None
+        try:
+            return pygame.mixer.Channel(int(channel))
+        except Exception:
+            return None
+
+    def _stop_stream_thread(self, channel: int) -> None:
+        if not 0 <= channel < self.num_channels:
+            return
+        ev = self._stream_stop_events[channel]
+        th = self._stream_threads[channel]
+        if ev is not None:
+            ev.set()
+        if th is not None and th.is_alive():
+            try:
+                th.join(timeout=0.25)
+            except Exception:
+                pass
+        self._stream_stop_events[channel] = None
+        self._stream_threads[channel] = None
+        self._stream_paths_ch[channel] = None
+        self._stream_loop_ch[channel] = False
+
+    def is_streaming_channel(self, channel: int) -> bool:
+        if not 0 <= channel < self.num_channels:
+            return False
+        th = self._stream_threads[channel]
+        return bool(th is not None and th.is_alive())
+
+    def stream_channel(
+        self,
+        channel: int,
+        file_path: str,
+        *,
+        volume: float = 1.0,
+        fade_ms: float = 0,
+        loop: bool = False,
+    ) -> bool:
+        """Stream a file into a specific mixer channel (multi-stream capable).
+
+        Uses PyAV to decode small PCM chunks and queues them into
+        pygame.mixer.Channel(channel).
+        """
+        if not self.init_ok or not 0 <= channel < self.num_channels:
+            return False
+        if not self._validate_streamable_path(file_path):
+            self.logger.error("Streaming track missing or inaccessible: %s", file_path)
+            return False
+
+        # Stop any existing playback/streaming on this channel.
+        self.stop_channel(channel)
+        self._stop_stream_thread(channel)
+
+        stop_event = threading.Event()
+        self._stream_stop_events[channel] = stop_event
+        normalized = self._normalize_path(file_path)
+        self._stream_paths_ch[channel] = normalized
+        self._stream_loop_ch[channel] = bool(loop)
+
+        volume = clamp(volume, 0.0, 1.0)
+        self._volumes[channel] = volume
+        self._looping[channel] = bool(loop)
+        self._generated[channel] = False
+        self._paths[channel] = file_path
+
+        pygame_channel = self._get_fixed_channel(channel)
+        if pygame_channel is None:
+            return False
+        try:
+            pygame_channel.set_volume(volume)
+        except Exception:
+            pass
+        self._channels[channel] = pygame_channel
+
+        fade_ms = max(0, int(fade_ms))
+
+        def _worker() -> None:
+            try:
+                import av  # type: ignore
+            except Exception as exc:
+                self.logger.error("PyAV not available for streaming decode: %s", exc)
+                return
+
+            from collections import deque
+
+            rate, mixer_fmt, channels = self._get_mixer_params()
+            # If the output device is configured for surround (e.g. 8 channels),
+            # we still decode/resample to stereo and then up-mix to the output
+            # channel count by padding extra channels with silence.
+            layout = "stereo" if channels >= 2 else "mono"
+            src_channels = 2 if channels >= 2 else 1
+
+            bytes_per_sample, target_dtype, av_format = self._mixer_format_bytes_and_dtype(mixer_fmt)
+            try:
+                # WARNING so it appears in default logs; emitted once per stream start.
+                self.logger.warning(
+                    "[audio.stream] ch=%d mixer(rate=%d fmt=%s channels=%d) -> %s/%s",
+                    channel,
+                    rate,
+                    str(mixer_fmt),
+                    channels,
+                    av_format,
+                    getattr(target_dtype, "__name__", str(target_dtype)),
+                )
+            except Exception:
+                pass
+
+            def _to_pcm_array(frame: Any) -> Optional[np.ndarray]:
+                """Convert an AudioFrame to packed interleaved PCM ndarray.
+
+                pygame.mixer.Sound(buffer=...) assumes the buffer matches the mixer's
+                sample rate and channel count. If we accidentally pass only one plane
+                of planar audio while the mixer is stereo, playback becomes ~2x speed
+                and higher pitch.
+                """
+                try:
+                    arr = frame.to_ndarray()
+                except Exception:
+                    return None
+
+                if arr is None:
+                    return None
+
+                # Ensure target dtype
+                if getattr(arr, "dtype", None) is not None and arr.dtype != target_dtype:
+                    try:
+                        arr = np.asarray(arr)
+                        if np.issubdtype(arr.dtype, np.floating):
+                            arr = np.clip(arr, -1.0, 1.0)
+                            if target_dtype == np.int8:
+                                arr = (arr * 127.0).astype(np.int8)
+                            elif target_dtype == np.int32:
+                                arr = (arr * 2147483647.0).astype(np.int32)
+                            else:
+                                arr = (arr * 32767.0).astype(np.int16)
+                        else:
+                            arr = arr.astype(target_dtype)
+                    except Exception:
+                        return None
+
+                # Normalize shape to (samples, channels)
+                try:
+                    frame_samples = int(getattr(frame, "samples", 0) or 0)
+                except Exception:
+                    frame_samples = 0
+                frame_channels = 0
+                try:
+                    layout_obj = getattr(frame, "layout", None)
+                    frame_channels = int(getattr(layout_obj, "channels", 0) or 0)
+                except Exception:
+                    frame_channels = 0
+                if not frame_channels:
+                    try:
+                        frame_channels = int(getattr(frame, "channels", 0) or 0)
+                    except Exception:
+                        frame_channels = 0
+                if not frame_channels:
+                    frame_channels = int(src_channels or 1)
+
+                def _reshape_flat(flat: np.ndarray) -> np.ndarray:
+                    # Use explicit (samples, channels) when possible.
+                    if frame_samples > 0 and frame_channels > 0 and int(flat.size) == int(frame_samples) * int(frame_channels):
+                        return flat.reshape(int(frame_samples), int(frame_channels))
+                    if frame_channels > 1 and int(flat.size) % int(frame_channels) == 0:
+                        return flat.reshape(int(flat.size) // int(frame_channels), int(frame_channels))
+                    return flat.reshape(-1, 1)
+
+                if arr.ndim == 1:
+                    arr = _reshape_flat(arr)
+                elif arr.ndim == 2:
+                    # Prefer exact matching using frame.samples / channel count.
+                    try:
+                        sh0, sh1 = int(arr.shape[0]), int(arr.shape[1])
+                    except Exception:
+                        sh0, sh1 = 0, 0
+
+                    if frame_samples > 0 and frame_channels > 0:
+                        # Typical planar: (channels, samples)
+                        if sh0 == frame_channels and sh1 == frame_samples:
+                            arr = arr.T
+                        # Typical packed: (samples, channels)
+                        elif sh0 == frame_samples and sh1 == frame_channels:
+                            pass
+                        # Some backends return packed audio as (1, samples*channels) or (samples*channels, 1)
+                        elif (sh0 == 1 and sh1 == frame_samples * frame_channels) or (sh1 == 1 and sh0 == frame_samples * frame_channels):
+                            try:
+                                flat = np.reshape(arr, (-1,))
+                                arr = flat.reshape(int(frame_samples), int(frame_channels))
+                            except Exception:
+                                arr = _reshape_flat(np.reshape(arr, (-1,)))
+                        elif sh0 == 1 or sh1 == 1:
+                            arr = _reshape_flat(np.reshape(arr, (-1,)))
+                        else:
+                            # Fallback heuristic: if first dim looks like channels.
+                            if sh0 <= 8 and sh1 > 32 and sh0 < sh1:
+                                arr = arr.T
+                    else:
+                        # No metadata: fallback heuristic.
+                        try:
+                            if int(arr.shape[0]) <= 8 and int(arr.shape[1]) > 32 and int(arr.shape[0]) < int(arr.shape[1]):
+                                arr = arr.T
+                        except Exception:
+                            pass
+                else:
+                    try:
+                        arr = _reshape_flat(np.reshape(arr, (-1,)))
+                    except Exception:
+                        return None
+
+                # Final sanity: must be (samples, channels)
+                if arr.ndim != 2:
+                    try:
+                        arr = np.reshape(arr, (-1, 1))
+                    except Exception:
+                        return None
+
+                # Match resampler output (mono/stereo)
+                if src_channels == 1:
+                    if arr.shape[1] >= 2:
+                        arr = (arr[:, 0].astype(np.int32) + arr[:, 1].astype(np.int32)) // 2
+                        arr = arr.astype(target_dtype).reshape(-1, 1)
+                    elif arr.shape[1] != 1:
+                        arr = arr.reshape(-1, 1)
+                else:
+                    if arr.shape[1] == 1:
+                        arr = np.repeat(arr, 2, axis=1)
+                    elif arr.shape[1] > 2:
+                        arr = arr[:, :2]
+
+                # Match mixer channel count (mono / stereo / surround)
+                if channels == 1:
+                    if arr.shape[1] >= 2:
+                        # simple downmix
+                        arr = (arr[:, 0].astype(np.int32) + arr[:, 1].astype(np.int32)) // 2
+                        arr = arr.astype(target_dtype).reshape(-1, 1)
+                    elif arr.shape[1] != 1:
+                        arr = arr.reshape(-1, 1)
+                elif channels == 2:
+                    if arr.shape[1] == 1:
+                        arr = np.repeat(arr, 2, axis=1)
+                    elif arr.shape[1] > 2:
+                        arr = arr[:, :2]
+                else:
+                    # Upmix/downmix to N-channel output by padding/truncating.
+                    if arr.shape[1] == channels:
+                        pass
+                    elif arr.shape[1] == 1:
+                        # replicate mono to all output channels
+                        arr = np.repeat(arr, int(channels), axis=1)
+                    elif arr.shape[1] == 2:
+                        # place stereo in the first two channels; silence the rest
+                        out_arr = np.zeros((arr.shape[0], int(channels)), dtype=arr.dtype)
+                        out_arr[:, 0:2] = arr[:, 0:2]
+                        arr = out_arr
+                    elif arr.shape[1] > channels:
+                        arr = arr[:, :int(channels)]
+                    else:
+                        # pad remaining channels with silence
+                        pad = int(channels) - int(arr.shape[1])
+                        if pad > 0:
+                            arr = np.pad(arr, ((0, 0), (0, pad)), mode="constant")
+
+                return np.ascontiguousarray(arr, dtype=target_dtype)
+
+            try:
+                resampler = av.audio.resampler.AudioResampler(
+                    format=av_format,
+                    layout=layout,
+                    rate=rate,
+                )
+            except Exception as exc:
+                self.logger.error("Failed to configure audio resampler: %s", exc)
+                return
+
+            # Chunks: pygame only supports a single queued Sound per channel.
+            # If the main thread holds the GIL for ~100-200ms (common during video
+            # warmup and ThemeBank image work), this streamer thread can miss the
+            # small window where it needs to queue the *next* chunk.
+            # Longer chunks make that window much less frequent.
+            chunk_frames = max(2048, int(rate * 2.0))
+            logged_chunk_stats = False
+            expected_chunk_s = float(chunk_frames) / float(rate or 44100)
+
+            def _sound_generator() -> Iterable['pygame.mixer.Sound']:
+                """Yield Sound chunks indefinitely (or once if loop=False)."""
+                carry_parts: list[np.ndarray] = []
+                carry_frames = 0
+                logged_make_sound_error = False
+                logged_stream_info = False
+                logged_first_in = False
+                want_first_out = False
+
+                def _push_samples(arr: np.ndarray) -> Iterable[np.ndarray]:
+                    nonlocal carry_frames
+                    if arr.size == 0 or arr.ndim != 2:
+                        return []
+                    carry_parts.append(arr)
+                    carry_frames += int(arr.shape[0])
+
+                    chunks: list[np.ndarray] = []
+                    while carry_frames >= chunk_frames:
+                        needed = int(chunk_frames)
+                        take_parts: list[np.ndarray] = []
+                        while needed > 0 and carry_parts:
+                            part = carry_parts[0]
+                            part_frames = int(part.shape[0])
+                            if part_frames <= needed:
+                                take_parts.append(part)
+                                carry_parts.pop(0)
+                                needed -= part_frames
+                            else:
+                                take_parts.append(part[:needed])
+                                carry_parts[0] = part[needed:]
+                                needed = 0
+
+                        if take_parts:
+                            try:
+                                chunk_arr = np.concatenate(take_parts, axis=0)
+                            except Exception:
+                                chunk_arr = take_parts[0]
+                            chunks.append(chunk_arr)
+                            carry_frames -= int(chunk_arr.shape[0])
+                        else:
+                            break
+                    return chunks
+
+                def _open_container() -> Any:
+                    return av.open(normalized)
+
+                while not stop_event.is_set():
+                    try:
+                        container = _open_container()
+                    except Exception as exc:
+                        self.logger.error("Failed to open audio for streaming: %s", exc)
+                        return
+
+                    try:
+                        stream = None
+                        for s in container.streams:
+                            if getattr(s, "type", None) == "audio":
+                                stream = s
+                                break
+                        if stream is None:
+                            self.logger.error("No audio stream found in: %s", normalized)
+                            return
+
+                        if not logged_stream_info:
+                            logged_stream_info = True
+                            try:
+                                in_sr = None
+                                in_layout = None
+                                try:
+                                    cc = getattr(stream, "codec_context", None)
+                                    in_sr = getattr(cc, "sample_rate", None)
+                                except Exception:
+                                    in_sr = None
+                                try:
+                                    in_layout = getattr(getattr(stream, "layout", None), "name", None)
+                                except Exception:
+                                    in_layout = None
+                                self.logger.warning(
+                                    "[audio.stream] ch=%d input(sr=%s layout=%s) target(sr=%d layout=%s)",
+                                    channel,
+                                    str(in_sr),
+                                    str(in_layout),
+                                    int(rate),
+                                    str(layout),
+                                )
+                            except Exception:
+                                pass
+
+                        # Prefer container.decode(stream) to avoid format-specific
+                        # demux/packet edge cases.
+                        decoded_any = False
+                        decode_fallback_used = False
+                        try:
+                            frame_iter = container.decode(audio=0)
+                        except Exception as exc:
+                            decode_fallback_used = True
+                            try:
+                                self.logger.warning(
+                                    "[audio.stream] ch=%d decode(audio=0) unavailable (%s); falling back to decode(stream)",
+                                    channel,
+                                    str(exc),
+                                )
+                            except Exception:
+                                pass
+                            frame_iter = container.decode(stream)
+
+                        for frame in frame_iter:
+                            if stop_event.is_set():
+                                break
+                            decoded_any = True
+
+                            if not logged_first_in:
+                                logged_first_in = True
+                                want_first_out = True
+                                try:
+                                    self.logger.warning(
+                                        "[audio.stream] ch=%d first_frame in(sr=%s samples=%s)",
+                                        channel,
+                                        str(getattr(frame, "sample_rate", None)),
+                                        str(getattr(frame, "samples", None)),
+                                    )
+                                except Exception:
+                                    pass
+                            try:
+                                out_frames = resampler.resample(frame)
+                            except Exception as exc:
+                                # Resampler errors should not kill the whole stream.
+                                self.logger.debug("Streaming resample error: %s", exc)
+                                continue
+
+                            if out_frames is None:
+                                continue
+                            # PyAV has changed return types across versions: it may
+                            # return a list of frames or a single AudioFrame.
+                            if not isinstance(out_frames, (list, tuple)):
+                                out_frames = [out_frames]
+
+                            for out in out_frames:
+                                if stop_event.is_set():
+                                    break
+                                if want_first_out:
+                                    # Log output details once (paired with first input frame).
+                                    try:
+                                        self.logger.warning(
+                                            "[audio.stream] ch=%d first_frame out(sr=%s samples=%s)",
+                                            channel,
+                                            str(getattr(out, "sample_rate", None)),
+                                            str(getattr(out, "samples", None)),
+                                        )
+                                    except Exception:
+                                        pass
+                                    want_first_out = False
+                                arr = _to_pcm_array(out)
+                                if arr is None or arr.size == 0:
+                                    continue
+                                for chunk_arr in _push_samples(arr):
+                                    if stop_event.is_set():
+                                        break
+                                    try:
+                                        yield pygame.sndarray.make_sound(chunk_arr)
+                                    except Exception as exc:
+                                        if not logged_make_sound_error:
+                                            logged_make_sound_error = True
+                                            try:
+                                                self.logger.warning(
+                                                    "[audio.stream] ch=%d make_sound failed: %s (shape=%s dtype=%s)",
+                                                    channel,
+                                                    str(exc),
+                                                    getattr(chunk_arr, "shape", None),
+                                                    getattr(getattr(chunk_arr, "dtype", None), "name", None),
+                                                )
+                                            except Exception:
+                                                pass
+                                        continue
+
+                        if not decoded_any:
+                            self.logger.warning(
+                                "[audio.stream] ch=%d decoded no frames from %s",
+                                channel,
+                                os.path.basename(normalized),
+                            )
+
+                        if not loop:
+                            break
+                    except Exception as exc:
+                        self.logger.warning(
+                            "Streaming decode error for %s: %s",
+                            os.path.basename(normalized),
+                            exc,
+                        )
+                        if not loop:
+                            break
+                    finally:
+                        try:
+                            container.close()
+                        except Exception:
+                            pass
+
+                    if not loop:
+                        break
+
+            # Decode ahead into a small buffer so visuals can hitch without underruns.
+            # Longer backlog helps survive heavy visual hitches and CPU spikes.
+            # (Gaps between chunks can feel like "slow motion" playback.)
+            buffer_max = 16
+            prefill_min = 4
+            buffer: 'deque[pygame.mixer.Sound]' = deque()
+            gen = _sound_generator()
+            gen_done = False
+
+            def _fill_buffer() -> None:
+                nonlocal gen_done, logged_chunk_stats
+                while not stop_event.is_set() and not gen_done and len(buffer) < buffer_max:
+                    try:
+                        snd = next(gen)
+                    except StopIteration:
+                        gen_done = True
+                        break
+                    except Exception:
+                        continue
+                    if snd is None:
+                        continue
+                    if not logged_chunk_stats:
+                        logged_chunk_stats = True
+                        try:
+                            self.logger.warning(
+                                "[audio.stream] ch=%d first_chunk len=%.3fs expected=%.3fs (rate=%d chunk_frames=%d)",
+                                channel,
+                                float(snd.get_length() or 0.0),
+                                expected_chunk_s,
+                                int(rate),
+                                int(chunk_frames),
+                            )
+                        except Exception:
+                            pass
+                    buffer.append(snd)
+
+            # Prefill before starting playback.
+            prefill_started = time.perf_counter()
+            warned_prefill = False
+            while not stop_event.is_set() and not gen_done and len(buffer) < prefill_min:
+                _fill_buffer()
+                if not warned_prefill and len(buffer) == 0 and (time.perf_counter() - prefill_started) > 1.0:
+                    warned_prefill = True
+                    try:
+                        self.logger.warning(
+                            "[audio.stream] ch=%d prefill stalled (no chunks yet) file=%s",
+                            channel,
+                            os.path.basename(normalized),
+                        )
+                    except Exception:
+                        pass
+                if len(buffer) < prefill_min:
+                    time.sleep(0.005)
+
+            first_chunk = True
+            # Keep strong refs to avoid any backend edge cases where queued/play
+            # sounds could be GC'd early.
+            current_playing: Optional['pygame.mixer.Sound'] = None
+            current_queued: Optional['pygame.mixer.Sound'] = None
+            current_playing_start_ts = 0.0
+            current_playing_len = 0.0
+            last_play_ts = time.perf_counter()
+            last_underrun_log_ts = 0.0
+            underrun_count = 0
+            queue_fail_logged = False
+            restart_count = 0
+            stats_last_log_ts = time.perf_counter()
+            while not stop_event.is_set():
+                _fill_buffer()
+
+                try:
+                    busy = pygame_channel.get_busy()
+                    queued = pygame_channel.get_queue() is not None
+                except Exception:
+                    busy = False
+                    queued = False
+
+                if not busy:
+                    if buffer:
+                        snd = buffer.popleft()
+                        try:
+                            pygame_channel.play(
+                                snd,
+                                loops=0,
+                                fade_ms=(fade_ms if first_chunk else 0),
+                            )
+                            current_playing = snd
+                            current_playing_start_ts = time.perf_counter()
+                            try:
+                                current_playing_len = float(snd.get_length() or 0.0)
+                            except Exception:
+                                current_playing_len = 0.0
+                            last_play_ts = time.perf_counter()
+                        except Exception:
+                            pass
+
+                        if not first_chunk:
+                            restart_count += 1
+                        # Re-apply channel volume after starting playback.
+                        try:
+                            pygame_channel.set_volume(float(self._volumes[channel]))
+                        except Exception:
+                            pass
+                        # Immediately queue the next chunk if available so we always
+                        # have a full chunk of safety margin.
+                        try:
+                            if buffer and pygame_channel.get_queue() is None:
+                                nxt = buffer.popleft()
+                                pygame_channel.queue(nxt)
+                                current_queued = nxt
+                        except Exception as exc:
+                            if not queue_fail_logged:
+                                queue_fail_logged = True
+                                try:
+                                    self.logger.warning(
+                                        "[audio.stream] ch=%d queue() failed: %s",
+                                        channel,
+                                        str(exc),
+                                    )
+                                except Exception:
+                                    pass
+                        try:
+                            if not pygame_channel.get_busy():
+                                self.logger.warning(
+                                    "[audio.stream] ch=%d play() did not start (busy=%s queued=%s)",
+                                    channel,
+                                    str(False),
+                                    str(pygame_channel.get_queue() is not None),
+                                )
+                        except Exception:
+                            pass
+                        first_chunk = False
+                    elif gen_done:
+                        break
+                    else:
+                        # We have not decoded enough to start yet (or we fell behind).
+                        underrun_count += 1
+                        now = time.perf_counter()
+                        if (now - last_underrun_log_ts) > 1.0:
+                            last_underrun_log_ts = now
+                            try:
+                                self.logger.warning(
+                                    "[audio.stream] ch=%d underrun: busy=False buffer=%d gen_done=%s (since_last_play=%.2fs)",
+                                    channel,
+                                    int(len(buffer)),
+                                    str(gen_done),
+                                    float(now - last_play_ts),
+                                )
+                            except Exception:
+                                pass
+                else:
+                    if not queued and buffer:
+                        try:
+                            nxt = buffer.popleft()
+                            pygame_channel.queue(nxt)
+                            current_queued = nxt
+                        except Exception as exc:
+                            if not queue_fail_logged:
+                                queue_fail_logged = True
+                                try:
+                                    self.logger.warning(
+                                        "[audio.stream] ch=%d queue() failed: %s",
+                                        channel,
+                                        str(exc),
+                                    )
+                                except Exception:
+                                    pass
+                        try:
+                            pygame_channel.set_volume(float(self._volumes[channel]))
+                        except Exception:
+                            pass
+
+                # If queue drained, drop the strong ref so we don't pin memory.
+                if busy and not queued:
+                    current_queued = None
+
+                # Diagnose true time-stretch: if chunk boundaries take much longer
+                # than the chunk length, playback is running "slow" (independent of
+                # decode/queue health).
+                try:
+                    playing_now = pygame_channel.get_sound()
+                except Exception:
+                    playing_now = None
+                if playing_now is not None and current_playing is not None and playing_now is not current_playing:
+                    now = time.perf_counter()
+                    elapsed = now - float(current_playing_start_ts or now)
+                    expected = float(current_playing_len or 0.0)
+                    if expected > 0.25:
+                        ratio = elapsed / expected if expected > 0 else 1.0
+                        if ratio >= 1.25 or ratio <= 0.75:
+                            try:
+                                self.logger.warning(
+                                    "[audio.stream] ch=%d timing drift: chunk_elapsed=%.3fs chunk_len=%.3fs (ratio=%.2f)",
+                                    channel,
+                                    float(elapsed),
+                                    float(expected),
+                                    float(ratio),
+                                )
+                            except Exception:
+                                pass
+                    current_playing = playing_now
+                    current_playing_start_ts = now
+                    try:
+                        current_playing_len = float(playing_now.get_length() or 0.0)
+                    except Exception:
+                        current_playing_len = 0.0
+
+                now = time.perf_counter()
+                if (now - stats_last_log_ts) >= 5.0:
+                    stats_last_log_ts = now
+                    try:
+                        self.logger.warning(
+                            "[audio.stream] ch=%d stats: buffer=%d restarts=%d underruns=%d busy=%s queued=%s",
+                            channel,
+                            int(len(buffer)),
+                            int(restart_count),
+                            int(underrun_count),
+                            str(bool(busy)),
+                            str(bool(queued)),
+                        )
+                    except Exception:
+                        pass
+
+                time.sleep(0.001)
+
+            try:
+                pygame_channel.stop()
+            except Exception:
+                pass
+
+        thread = threading.Thread(target=_worker, name=f"audio-stream-ch{channel}", daemon=True)
+        self._stream_threads[channel] = thread
+        thread.start()
+        return True
 
     def _add_to_cache(self, normalized: str, sound: 'pygame.mixer.Sound', length: float) -> None:
         """LRU insert for decoded sound buffers (thread-safe)."""
@@ -549,8 +1396,27 @@ class AudioEngine:
             self._streaming_path = None
         return True
 
+    def set_streaming_volume(self, volume: float) -> bool:
+        """Set pygame.mixer.music volume (for the streaming track).
+
+        Returns True if the call succeeded.
+        """
+        if not self.init_ok:
+            return False
+        try:
+            pygame.mixer.music.set_volume(clamp(volume, 0.0, 1.0))
+            return True
+        except Exception as exc:
+            self.logger.debug("Failed to set streaming volume: %s", exc)
+            return False
+
     def is_streaming_active(self) -> bool:
-        return bool(self._streaming_active)
+        if self._streaming_active:
+            return True
+        for ch in range(self.num_channels):
+            if self.is_streaming_channel(ch):
+                return True
+        return False
 
     def preload_sound(self, file_path: str) -> bool:
         """Decode audio ahead of time so later channel loads avoid I/O stalls."""
@@ -645,6 +1511,7 @@ class AudioEngine:
         
         # Stop any existing playback on this channel
         self.stop_channel(channel)
+        self._stop_stream_thread(channel)
         
         sound, length = self._get_or_load_sound(file_path)
         if not sound:
@@ -768,10 +1635,16 @@ class AudioEngine:
         if not sound:
             self.logger.warning(f"No audio loaded on channel {channel}, cannot play")
             return False
-        
-        # Stop existing playback if any
-        if self._channels[channel]:
-            self._channels[channel].stop()
+
+        # Stop any streaming thread (if active) and stop the fixed channel.
+        self._stop_stream_thread(channel)
+        pygame_channel = self._get_fixed_channel(channel)
+        if pygame_channel is None:
+            return False
+        try:
+            pygame_channel.stop()
+        except Exception:
+            pass
         
         # Start playback with fade-in
         try:
@@ -792,7 +1665,8 @@ class AudioEngine:
             else:
                 play_volume = volume
 
-            self._channels[channel] = sound.play(loops=loops, fade_ms=fade_ms)
+            pygame_channel.play(sound, loops=loops, fade_ms=fade_ms)
+            self._channels[channel] = pygame_channel
             if self._channels[channel]:
                 self._channels[channel].set_volume(play_volume)
                 self._volumes[channel] = volume
@@ -821,6 +1695,9 @@ class AudioEngine:
         """
         if not self.init_ok or not 0 <= channel < self.num_channels:
             return False
+
+        # Stop streaming thread so no more chunks are queued.
+        self._stop_stream_thread(channel)
         
         pygame_channel = self._channels[channel]
         if not pygame_channel or not pygame_channel.get_busy():
@@ -867,10 +1744,14 @@ class AudioEngine:
         """
         if not 0 <= channel < self.num_channels:
             return False
+
+        # Stop streaming thread first (if any).
+        self._stop_stream_thread(channel)
         
-        if self._channels[channel]:
+        pygame_channel = self._get_fixed_channel(channel)
+        if pygame_channel:
             try:
-                self._channels[channel].stop()
+                pygame_channel.stop()
             except Exception as e:
                 self.logger.error(f"Error stopping channel {channel}: {e}")
         
@@ -904,6 +1785,8 @@ class AudioEngine:
         volume = clamp(volume, 0.0, 1.0)
         self._volumes[channel] = volume
 
+        pygame_channel = self._channels[channel] or self._get_fixed_channel(channel)
+
         if self._generated[channel]:
             sound = self._sounds[channel]
             if sound:
@@ -912,18 +1795,18 @@ class AudioEngine:
                 except Exception:
                     pass
             # Keep the active mixer channel at unity; volume is carried by the Sound.
-            if self._channels[channel] and self._channels[channel].get_busy():
+            if pygame_channel and pygame_channel.get_busy():
                 try:
-                    self._channels[channel].set_volume(1.0)
+                    pygame_channel.set_volume(1.0)
                     return True
                 except Exception as e:
                     self.logger.error(f"Failed to set volume on channel {channel}: {e}")
                     return False
             return False
-        
-        if self._channels[channel] and self._channels[channel].get_busy():
+
+        if pygame_channel and pygame_channel.get_busy():
             try:
-                self._channels[channel].set_volume(volume)
+                pygame_channel.set_volume(volume)
                 return True
             except Exception as e:
                 self.logger.error(f"Failed to set volume on channel {channel}: {e}")
@@ -944,7 +1827,7 @@ class AudioEngine:
         if not 0 <= channel < self.num_channels:
             return False
         
-        pygame_channel = self._channels[channel]
+        pygame_channel = self._channels[channel] or self._get_fixed_channel(channel)
         return pygame_channel is not None and pygame_channel.get_busy()
     
     def is_fading_in(self, channel: int) -> bool:
@@ -973,7 +1856,7 @@ class AudioEngine:
 
         any_paused = False
         for channel in range(self.num_channels):
-            pygame_channel = self._channels[channel]
+            pygame_channel = self._channels[channel] or self._get_fixed_channel(channel)
             if pygame_channel and pygame_channel.get_busy():
                 try:
                     pygame_channel.pause()
@@ -999,7 +1882,7 @@ class AudioEngine:
 
         any_resumed = False
         for channel in range(self.num_channels):
-            pygame_channel = self._channels[channel]
+            pygame_channel = self._channels[channel] or self._get_fixed_channel(channel)
             if pygame_channel:
                 try:
                     pygame_channel.unpause()

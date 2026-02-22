@@ -37,6 +37,10 @@ platform-tools-*.zip
 # One-off local diagnostics
 scripts/find_token_error.py
 
+# Generated performance reports
+Main_perf_*.txt
+*_perf_*.txt
+
 # Jupyter
 .ipynb_checkpoints/
 

@@ -41,13 +41,20 @@ def _maybe_reexec_into_venv() -> None:
 
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
+    force_gui = False
     
     # Check for --debug flag BEFORE any imports that use logging
     if "--debug" in args:
         os.environ["MESMERGLASS_DEBUG"] = "1"
         args.remove("--debug")
+
+    # Special GUI test harness: show a live volume panel inside the normal app.
+    if "--volume-test" in args:
+        args.remove("--volume-test")
+        os.environ["MESMERGLASS_VOLUME_TEST"] = "1"
+        force_gui = True
     
-    if args:
+    if args and not force_gui:
         candidate = Path(args[0])
         if candidate.exists() and candidate.is_file():
             if len(args) == 1:

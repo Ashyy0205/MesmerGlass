@@ -12,6 +12,7 @@ from __future__ import annotations
 from typing import Optional, Callable, Any, TYPE_CHECKING
 from pathlib import Path
 import logging
+import os
 from time import perf_counter
 from contextlib import contextmanager
 
@@ -78,6 +79,14 @@ class VisualDirector:
         self._video_audio_volume: float = 1.0
         self._active_video_audio_path: Optional[str] = None
         self._last_video_path: Optional[Path] = None
+        self._pending_video_path: Optional[Path] = None
+        self._pending_video_since_ts: Optional[float] = None
+        try:
+            self._pending_video_lock_ms = float(os.environ.get("MESMERGLASS_VIDEO_PENDING_LOCK_MS", "900"))
+        except Exception:
+            self._pending_video_lock_ms = 900.0
+        self._pending_video_lock_ms = max(0.0, self._pending_video_lock_ms)
+        self._last_uploaded_video_frame_key: Optional[tuple] = None
         self._video_audio_disabled_notice_sent = False
         
         self.logger = logging.getLogger(__name__)
@@ -94,6 +103,8 @@ class VisualDirector:
         self._video_frame_miss_logged = False
         self._video_first_upload_logged = False
         self._perf_sampler = BurstSampler(interval_s=2.0)
+        self._video_defer_sampler = BurstSampler(interval_s=2.0)
+        self._video_defer_count = 0
         self._video_zoom_duration_override: Optional[int] = None
         self._last_video_zoom_restart_frame: Optional[int] = None
         self._image_zoom_duration_override: Optional[int] = None
@@ -155,6 +166,12 @@ class VisualDirector:
 
         duration_ms = duration_s * 1000.0
         if duration_ms >= warn_ms:
+            try:
+                from mesmerglass.session import perf_blockers
+
+                perf_blockers.record(label, duration_ms)
+            except Exception:
+                pass
             self.logger.warning("[visual.perf] %s took %.1fms", label, duration_ms)
             return
         if duration_ms >= info_ms and self._perf_sampler.record():
@@ -465,6 +482,31 @@ class VisualDirector:
                         video_tick_start = perf_counter()
                         slow_threshold = 0.05  # 50ms per stage
 
+                        # If a video switch was deferred (decoder warmup), retry it here.
+                        # This keeps the selection logic responsive without stalling the UI thread.
+                        if self._pending_video_path is not None:
+                            pending = self._pending_video_path
+                            try:
+                                if self.video_streamer.load_video(pending, allow_async_open=True):
+                                    self.logger.info("[visual] Loaded warmed video: %s", pending.name)
+                                    self._log_themebank_media_snapshot(image_path=str(pending))
+                                    self._pending_video_path = None
+                                    self._pending_video_since_ts = None
+                                    self._video_defer_count = 0
+                                    self._last_video_path = pending
+                                    self._video_first_frame = True
+
+                                    if self.text_director and hasattr(self.text_director, 'on_media_change'):
+                                        self.text_director.on_media_change()
+
+                                    if self.current_visual and hasattr(self.current_visual, '_cycle_marker'):
+                                        self.current_visual._cycle_marker += 1
+
+                                    if self._video_audio_enabled:
+                                        self._start_video_audio(pending)
+                            except Exception:
+                                pass
+
                         update_start = perf_counter()
                         # Advance video playback
                         # IMPORTANT: Use the *actual* tick rate here.
@@ -522,7 +564,17 @@ class VisualDirector:
                                     self._video_first_frame,
                                 )
                         if frame:
-                            upload_start = perf_counter()
+                            # Dedupe uploads: SimpleVideoStreamer advances ~15fps by design,
+                            # but the compositor can tick at ~60fps. Uploading identical frames
+                            # every tick burns GPU/driver time (glTexSubImage2D) and tanks FPS.
+                            frame_key = (
+                                str(self._last_video_path) if self._last_video_path else "",
+                                int(frame.width),
+                                int(frame.height),
+                                float(frame.timestamp),
+                            )
+                            is_first_frame = self._video_first_frame
+
                             # Reset miss diagnostics once a frame arrives
                             if self._video_frame_miss_logged and self._video_frame_miss_count > 0:
                                 self.logger.info(
@@ -540,53 +592,57 @@ class VisualDirector:
                                 )
                                 self._video_first_upload_logged = True
 
-                            # Upload video frame as background on all compositors.
-                            # This will overwrite any static image background.
-                            is_first_frame = self._video_first_frame
-                            for comp in self._get_all_compositors():
-                                try:
-                                    current_zoom = getattr(comp, '_background_zoom', 1.0)
-                                    # Keep the current zoom on the first frame to avoid a visible
-                                    # "snap back" when switching media.
-                                    frame_zoom = current_zoom
-                                    comp.set_background_video_frame(
-                                        frame.data,
-                                        width=frame.width,
-                                        height=frame.height,
-                                        zoom=frame_zoom,
-                                        new_video=is_first_frame,  # Trigger fade on first frame
+                            should_upload = is_first_frame or (self._last_uploaded_video_frame_key != frame_key)
+                            if should_upload:
+                                upload_start = perf_counter()
+
+                                # Upload video frame as background on all compositors.
+                                # This will overwrite any static image background.
+                                for comp in self._get_all_compositors():
+                                    try:
+                                        current_zoom = getattr(comp, '_background_zoom', 1.0)
+                                        # Keep the current zoom on the first frame to avoid a visible
+                                        # "snap back" when switching media.
+                                        frame_zoom = current_zoom
+                                        comp.set_background_video_frame(
+                                            frame.data,
+                                            width=frame.width,
+                                            height=frame.height,
+                                            zoom=frame_zoom,
+                                            new_video=is_first_frame,  # Trigger fade on first frame
+                                        )
+                                    except Exception as exc:
+                                        self.logger.debug("[visual.video] Failed to upload frame to compositor: %s", exc)
+
+                                # Restart zoom only once the new video frame is actually visible to avoid pre-cycle stalls
+                                if is_first_frame:
+                                    duration_override = self._capture_video_zoom_duration()
+                                    self._restart_video_zoom_animation(
+                                        start_zoom=frame_zoom,
+                                        duration_override=duration_override,
                                     )
-                                except Exception as exc:
-                                    self.logger.debug("[visual.video] Failed to upload frame to compositor: %s", exc)
 
-                            # Restart zoom only once the new video frame is actually visible to avoid pre-cycle stalls
-                            if is_first_frame:
-                                duration_override = self._capture_video_zoom_duration()
-                                self._restart_video_zoom_animation(
-                                    start_zoom=frame_zoom,
-                                    duration_override=duration_override,
-                                )
+                                # Clear first frame flag after upload
+                                self._video_first_frame = False
+                                self._last_uploaded_video_frame_key = frame_key
 
-                            # Clear first frame flag after upload
-                            self._video_first_frame = False
+                                upload_duration = perf_counter() - upload_start
+                                total_duration = perf_counter() - video_tick_start
 
-                            upload_duration = perf_counter() - upload_start
-                            total_duration = perf_counter() - video_tick_start
+                                if upload_duration > slow_threshold:
+                                    self.logger.warning(
+                                        "[visual.perf] Video frame upload took %.1fms",
+                                        upload_duration * 1000.0,
+                                    )
 
-                            if upload_duration > slow_threshold:
-                                self.logger.warning(
-                                    "[visual.perf] Video frame upload took %.1fms",
-                                    upload_duration * 1000.0,
-                                )
-
-                            if total_duration > 0.1:
-                                self.logger.warning(
-                                    "[visual.perf] Entire video tick took %.1fms (update=%.1fms fetch=%.1fms upload=%.1fms)",
-                                    total_duration * 1000.0,
-                                    update_duration * 1000.0,
-                                    fetch_duration * 1000.0,
-                                    upload_duration * 1000.0,
-                                )
+                                if total_duration > 0.1:
+                                    self.logger.warning(
+                                        "[visual.perf] Entire video tick took %.1fms (update=%.1fms fetch=%.1fms upload=%.1fms)",
+                                        total_duration * 1000.0,
+                                        update_duration * 1000.0,
+                                        fetch_duration * 1000.0,
+                                        upload_duration * 1000.0,
+                                    )
                         else:
                             self._video_frame_miss_count += 1
                             if (
@@ -1222,6 +1278,7 @@ class VisualDirector:
         self._video_frame_miss_count = 0
         self._video_frame_miss_logged = False
         self._video_first_upload_logged = False
+        self._last_uploaded_video_frame_key = None
 
         with self._perf_section("video.load", warn_ms=40.0, info_ms=25.0):
             try:
@@ -1241,14 +1298,53 @@ class VisualDirector:
                 if not isinstance(path, Path):
                     path = Path(path)
 
-                self._stop_video_audio(fade_ms=150)
-                self._last_video_path = path
+                # If a video switch is already pending (decoder warmup), don't keep
+                # calling load_video() from here. Instead coalesce to the latest request
+                # and let the normal per-tick retry apply it once warmed.
+                if self._pending_video_path is not None:
+                    if path != self._pending_video_path:
+                        try:
+                            from ..content.video import queue_decoder_warmup
 
-                success = self.video_streamer.load_video(path)
+                            queue_decoder_warmup(path, priority=True)
+                        except Exception:
+                            pass
+                        self._pending_video_path = path
+                        self._pending_video_since_ts = perf_counter()
+                    return
+
+                # Best-effort: warm up decoders for the next couple of clips so
+                # switching every ~0.7s doesn't stall on cv2 open.
+                try:
+                    from ..content.video import queue_decoder_warmup
+
+                    video_paths = self._get_video_paths()
+                    if video_paths:
+                        try:
+                            idx = next(
+                                (i for i, p in enumerate(video_paths) if Path(p) == path),
+                                None,
+                            )
+                        except Exception:
+                            idx = None
+
+                        if idx is not None and self._pending_video_path is None:
+                            for offset in (1, 2):
+                                queue_decoder_warmup(video_paths[(idx + offset) % len(video_paths)])
+                except Exception:
+                    pass
+
+                self._stop_video_audio(fade_ms=150)
+
+                success = self.video_streamer.load_video(path, allow_async_open=True)
                     
                 if success:
                     self.logger.info(f"[visual] Loaded video: {path.name}")
                     self._log_themebank_media_snapshot(image_path=str(path))
+
+                    self._pending_video_path = None
+                    self._pending_video_since_ts = None
+                    self._last_video_path = path
                     
                     # Mark that next frame is first frame of new video (for fade transition)
                     self._video_first_frame = True
@@ -1265,8 +1361,17 @@ class VisualDirector:
                     if self._video_audio_enabled:
                         self._start_video_audio(path)
                 else:
-                    self.logger.warning(f"[visual] Failed to load video: {path.name}")
-                    self._last_video_path = None
+                    # Most common reason: decoder open is warming up in the background.
+                    self._pending_video_path = path
+                    self._pending_video_since_ts = perf_counter()
+                    self._video_defer_count += 1
+                    if self._video_defer_sampler.record():
+                        self.logger.warning(
+                            "[visual] Video load deferred (warming decoder): %s (defer_count=%d)",
+                            path.name,
+                            self._video_defer_count,
+                        )
+                        self._video_defer_count = 0
                     self._active_video_audio_path = None
                 
             except Exception as e:
